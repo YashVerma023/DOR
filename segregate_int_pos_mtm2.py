@@ -489,6 +489,168 @@ def pivot_rows(comp):
     return out
 
 
+# ====================== SLIPPAGE (SL-HIT / SQ-OFF ACCOUNTS) ======================
+def slippage_rows(comp):
+    """Per SL-hit (squared-off) account: how the realized loss compares with
+    the account's configured MAX LOSS.
+
+        Slippage   = |compiled Realized P&L| - MAX LOSS
+        Slippage % = Slippage / MAX LOSS x 100      (blank when MAX LOSS is 0)
+
+    Positive slippage = the account lost MORE than its configured max loss;
+    negative = it was squared off inside the limit. Uses the COMPILED
+    Realized P&L (no positional addons) because slippage measures the
+    intraday square-off itself. Sorted worst-first (largest slippage)."""
+    hit = comp[comp["SL HIT/NOT"] == 1]
+    rows = []
+    for _, r in hit.iterrows():
+        max_loss = float(r["MAX LOSS"])
+        realized = float(r["Realized P&L"])
+        slippage = -realized - max_loss
+        rows.append({
+            "ALGO": r["ALGO"],
+            "SERVER": r["SERVER"],
+            "UserID": r["UserID"],
+            "Alias": "" if pd.isna(r["Alias"]) else r["Alias"],
+            "MaxLoss": max_loss,
+            "Realized": realized,
+            "Slippage": slippage,
+            "SlippagePct": (slippage / max_loss * 100) if max_loss else None,
+        })
+    rows.sort(key=lambda x: -x["Slippage"])
+    return rows
+
+
+def slippage_summary(rows):
+    """Per-algo summary of the slippage rows plus an overall row:
+    SL-hit count, how many exceeded their max loss ("major"), the totals,
+    the average slippage per account (mean, rupees) and the value-weighted
+    slippage pct (total slippage / total max loss x 100)."""
+    def block(sub):
+        total_ml = sum(r["MaxLoss"] for r in sub)
+        total_slip = sum(r["Slippage"] for r in sub)
+        return {
+            "count": len(sub),
+            "over": sum(1 for r in sub if r["Slippage"] > 0),
+            "max_loss": total_ml,
+            "realized": sum(r["Realized"] for r in sub),
+            "avg_slippage": (total_slip / len(sub)) if sub else 0.0,
+            "slippage_pct": (total_slip / total_ml * 100) if total_ml else None,
+        }
+
+    algos = sorted({r["ALGO"] for r in rows if pd.notna(r["ALGO"])}, key=float)
+    per_algo = [{"ALGO": _algo_val(algo), **block([r for r in rows if r["ALGO"] == algo])}
+                for algo in algos]
+    return per_algo, {"ALGO": "Overall", **block(rows)}
+
+
+def major_slippages(rows):
+    """The "major" slippages: SL-hit accounts that lost MORE than their
+    configured max loss. `rows` comes worst-first from slippage_rows."""
+    return [r for r in rows if r["Slippage"] > 0]
+
+
+SLIP_SUMMARY_HEADERS = ["ALGO", "SL-Hit Users", "Over Max Loss", "Total MAX LOSS",
+                        "Total Realized P&L", "Avg Slippage", "Slippage %"]
+SLIP_DETAIL_HEADERS = ["ALGO", "SERVER", "UserID", "Alias", "MAX LOSS",
+                       "Realized P&L", "Slippage", "Slippage %"]
+
+
+def _write_slippage_sheet(wb, comp, report_date):
+    """Sheet "Slippage": the per-algo summary table on top, then every SL-hit
+    account worst-first, with the over-max-loss (major) rows highlighted."""
+    rows = slippage_rows(comp)
+    per_algo, overall = slippage_summary(rows)
+
+    ws4 = wb.create_sheet("Slippage")
+    n_cols = max(len(SLIP_SUMMARY_HEADERS), len(SLIP_DETAIL_HEADERS))
+
+    ws4.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+    tc = ws4.cell(1, 1, f"Sq-Off Slippage — Realized Loss vs MAX LOSS, SL-Hit Accounts  ({report_date})")
+    tc.font = Font(bold=True, italic=True, color="FFFFFF", size=13)
+    tc.fill = title_fill
+    tc.alignment = center
+    ws4.row_dimensions[1].height = 22
+
+    def header_row(r, headers):
+        for j, h in enumerate(headers, start=1):
+            cell = ws4.cell(r, j, h)
+            cell.fill = header_fill
+            cell.font = white_bold
+            cell.alignment = center_wrap
+            cell.border = inner_bdr
+
+    def money(cell):
+        cell.number_format = "#,##0"
+
+    r = 2
+    header_row(r, SLIP_SUMMARY_HEADERS)
+    r += 1
+    grand_row_fill = PatternFill("solid", fgColor="D1C9E1")
+    for srow in per_algo + [overall]:
+        is_overall = srow["ALGO"] == "Overall"
+        values = [srow["ALGO"], srow["count"], srow["over"], round(srow["max_loss"]),
+                  round(srow["realized"]), round(srow["avg_slippage"]),
+                  round(srow["slippage_pct"], 2) if srow["slippage_pct"] is not None else ""]
+        for j, v in enumerate(values, start=1):
+            cell = ws4.cell(r, j, v)
+            cell.alignment = center
+            cell.border = inner_bdr
+            if is_overall:
+                cell.fill = grand_row_fill
+                cell.font = bold
+            if j in (4, 5, 6):
+                money(cell)
+            elif j == 7 and v != "":
+                cell.number_format = "0.00"
+        r += 1
+
+    r += 1  # spacer
+    detail_header = r
+    header_row(r, SLIP_DETAIL_HEADERS)
+    r += 1
+    over_fill = PatternFill("solid", fgColor="FCE8E6")   # major (over max loss) rows
+    for row in rows:
+        values = [_algo_val(row["ALGO"]), row["SERVER"], row["UserID"], row["Alias"],
+                  round(row["MaxLoss"]), round(row["Realized"]), round(row["Slippage"]),
+                  round(row["SlippagePct"], 2) if row["SlippagePct"] is not None else ""]
+        for j, v in enumerate(values, start=1):
+            cell = ws4.cell(r, j, v)
+            cell.alignment = center
+            cell.border = inner_bdr
+            if row["Slippage"] > 0:
+                cell.fill = over_fill
+            if j in (5, 6, 7):
+                money(cell)
+            elif j == 8 and v != "":
+                cell.number_format = "0.00"
+        r += 1
+    if not rows:
+        ws4.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols)
+        nc = ws4.cell(r, 1, "No SL-hit accounts.")
+        nc.alignment = center
+        nc.font = Font(italic=True, color="595959")
+        r += 1
+
+    note_row = r + 1
+    ws4.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=n_cols)
+    nc = ws4.cell(
+        note_row, 1,
+        "*Slippage = |compiled Realized P&L| − MAX LOSS for accounts whose SL was hit "
+        "(squared off). Positive (highlighted) = the account lost more than its configured "
+        "max loss — a \"major\" slippage; negative = squared off inside the limit. "
+        "Slippage % is relative to the account's MAX LOSS."
+    )
+    nc.font = Font(italic=True, color="595959", size=9)
+    nc.alignment = left_wrap
+    ws4.row_dimensions[note_row].height = 40
+
+    ws4.freeze_panes = f"A{detail_header + 1}"
+    slip_widths = [7, 10, 20, 22, 14, 16, 14, 12]
+    for j, w in enumerate(slip_widths, start=1):
+        ws4.column_dimensions[get_column_letter(j)].width = w
+
+
 # ====================== WORKBOOK ======================
 def add_segregation_sheets(wb, comp, report_date):
     """Append the Segregation pivot + Raw_Data_Per_User + Worst 10%ile sheets
@@ -636,6 +798,7 @@ def add_segregation_sheets(wb, comp, report_date):
 
     _write_raw_sheet(wb, comp)
     _write_worst_sheet(wb, comp, algos, report_date)
+    _write_slippage_sheet(wb, comp, report_date)
 
 
 def build_workbook(comp, report_date):

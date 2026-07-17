@@ -28,7 +28,7 @@ import csv
 import io
 import re
 import sys
-from collections import namedtuple
+from collections import Counter, namedtuple
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -42,7 +42,13 @@ DEFAULT_OUTPUT = SCRIPT_DIR / "tradevalue.xlsx"
 REPORT_HEADER = ["Date", "Server", "User ID", "Allocation", "Algo", "Segment",
                  "Order Count", "Quantity", "Lots", "Lot Pct", "Trade Value", "Outlier"]
 
-SUMMARY_HEADER = ["Algo", "Rows", "Avg Lot Pct", "Std Dev", "Band", "Below", "In", "Above"]
+SUMMARY_HEADER = ["Algo", "Total Users", "Avg Lot Pct", "Std Dev", "Band", "Below", "In", "Above"]
+
+STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
+STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
+
+OUTLIER_CLIENTS_HEADER = ["Algo", "Server", "User ID", "Average Lots",
+                          "Outlier", "Lots Fired", "Diff of Lots"]
 
 # Outliers are judged per (date, algo) group by standard deviation: a row is
 # "in range" when its lot pct lies within mean +/- k * std dev of the group's
@@ -94,6 +100,51 @@ def _classify_symbol(symbol):
     if "NIFTY" in upper:
         return "NIFTY"
     return ""
+
+
+# The SAME option contract circulates under two symbol formats (different
+# brokers/servers), so both must normalise to one key or a contract would be
+# counted as two distinct strikes:
+#   NIFTY21JUL2624100PE — DDMMMYY expiry (day, month name, 2-digit year)
+#   NIFTY2672124100PE   — YYMDD expiry (2-digit year, month digit, day;
+#                         Oct/Nov/Dec are written as the single letter O/N/D)
+_MONTH_NAMES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+_MONTH_BY_NAME = {name: i + 1 for i, name in enumerate(_MONTH_NAMES)}
+_MONTH_BY_CODE = {**{str(i): i for i in range(1, 10)}, "O": 10, "N": 11, "D": 12}
+_CONTRACT_DDMMMYY = re.compile(
+    r"^(BANKNIFTY|NIFTY|SENSEX)(\d{2})(" + "|".join(_MONTH_NAMES) + r")(\d{2})(\d+)(CE|PE)$")
+_CONTRACT_YYMDD = re.compile(
+    r"^(BANKNIFTY|NIFTY|SENSEX)(\d{2})([1-9OND])(\d{2})(\d+)(CE|PE)$")
+
+
+def parse_contract(symbol):
+    """Split an option symbol into its canonical contract key
+    (segment, expiry date, strike, option type) — both expiry formats
+    normalise to the same key. Returns None for anything that isn't a
+    NIFTY / BANKNIFTY / SENSEX option (futures, equity, other formats)."""
+    text = str(symbol or "").upper().replace(" ", "")
+    match = _CONTRACT_DDMMMYY.match(text)
+    if match:
+        segment, dd, mon, yy, strike, opt = match.groups()
+        month = _MONTH_BY_NAME[mon]
+    else:
+        match = _CONTRACT_YYMDD.match(text)
+        if not match:
+            return None
+        segment, yy, mcode, dd, strike, opt = match.groups()
+        month = _MONTH_BY_CODE[mcode]
+    try:
+        expiry = date(2000 + int(yy), month, int(dd))
+    except ValueError:
+        return None
+    return (segment, expiry, int(strike), opt)
+
+
+def contract_label(contract):
+    """Display form of a contract key, e.g. "NIFTY 21JUL26 24100 PE"."""
+    segment, expiry, strike, opt = contract
+    return f"{segment} {expiry.strftime('%d%b%y').upper()} {strike} {opt}"
 
 
 def _user_key(value):
@@ -245,7 +296,7 @@ def _cell(row, idx):
 
 Order = namedtuple(
     "Order",
-    "rowid trade_date server user_id segment qty avg_price order_id exch_order_id",
+    "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol",
 )
 
 
@@ -285,7 +336,8 @@ def read_orderbook(source, name=None):
             continue
         if i_status is not None and _cell(raw, i_status).upper() != "COMPLETE":
             continue
-        segment = _classify_symbol(_cell(raw, i_symbol))
+        symbol = _cell(raw, i_symbol)
+        segment = _classify_symbol(symbol)
         if not segment:
             continue
         try:
@@ -302,6 +354,7 @@ def read_orderbook(source, name=None):
             avg_price=_decimal(_cell(raw, i_avg)),
             order_id=_cell(raw, i_order_id),
             exch_order_id=_cell(raw, i_exch_order_id),
+            symbol=sys.intern(symbol),
         ))
     return orders
 
@@ -466,28 +519,82 @@ def _lot_pct_stats(rows, std_multiplier=None):
     return stats
 
 
+def user_lot_observations(rows, std_multiplier=None):
+    """One observation per (date, algo, user): the OUTLIER UNIT IS THE USER.
+
+    A report row is per (user, segment), so a user trading NIFTY and SENSEX
+    would otherwise be judged twice on partial exposures. Here the user's
+    lots are summed across all their segments (and servers) inside the algo
+    and divided by their TOTAL allocation (one account per server):
+
+        lot_pct = total lots / total allocation * 100
+
+    Each observation carries the (date, algo) band (mean ± k·σ over the
+    per-user lot pcts) and its outlier flag; users with no usable allocation
+    get a blank flag. Rows without an algo produce no observation."""
+    obs_map = {}
+    for row in rows:
+        if not row["algo"]:
+            continue
+        key = (row["trade_date"], row["algo"], _user_key(row["user_id"]))
+        o = obs_map.get(key)
+        if o is None:
+            o = obs_map[key] = {
+                "trade_date": row["trade_date"],
+                "algo": row["algo"],
+                "user_key": key[2],
+                "user_id": row["user_id"],
+                "lots": Decimal("0"),
+                "_alloc_by_server": {},
+                "_servers": [],
+            }
+        o["lots"] += row["lots"]
+        server = _server_key(row["server"])
+        if server not in o["_servers"]:
+            o["_servers"].append(server)
+        if row["allocation"] is not None:
+            o["_alloc_by_server"][server] = row["allocation"]
+
+    out = list(obs_map.values())
+    for o in out:
+        alloc_by_server = o.pop("_alloc_by_server")
+        allocation = sum(alloc_by_server.values(), Decimal("0")) if alloc_by_server else None
+        o["allocation"] = allocation
+        o["lot_pct"] = (o["lots"] / allocation * 100) if allocation else None
+        o["server"] = " / ".join(s for s in o.pop("_servers") if s)
+
+    stats = _lot_pct_stats(out, std_multiplier)
+    for o in out:
+        stat = stats.get((o["trade_date"], o["algo"]))
+        if o["lot_pct"] is None or stat is None:
+            o["outlier"], o["band_low"], o["band_high"] = "", None, None
+            continue
+        _, _, low, high = stat
+        o["band_low"], o["band_high"] = low, high
+        if o["lot_pct"] < low:
+            o["outlier"] = "Below average range"
+        elif o["lot_pct"] > high:
+            o["outlier"] = "Above average range"
+        else:
+            o["outlier"] = "In range"
+    return out
+
+
 def _attach_lot_metrics(rows, std_multiplier=None):
-    """Add lot_pct (lots / allocation * 100) to every row, then flag outliers
-    per (date, algo) group: rows whose lot_pct lies more than k standard
-    deviations from the group's average (default k=1) are below / above the
-    range. Rows with no allocation or no algo can't be judged and stay blank."""
+    """Add lot_pct to every row (that ROW's lots vs the account allocation —
+    it documents the row), then judge outliers PER USER (combined lots across
+    the user's segments/servers ÷ combined allocation, see
+    user_lot_observations) and stamp the user's flag on each of their rows.
+    Rows with no allocation or no algo can't be judged and stay blank."""
     for row in rows:
         allocation = row["allocation"]
         row["lot_pct"] = (row["lots"] / allocation * 100) if allocation else None
 
-    stats = _lot_pct_stats(rows, std_multiplier)
+    flags = {(o["trade_date"], o["algo"], o["user_key"]): o["outlier"]
+             for o in user_lot_observations(rows, std_multiplier)}
     for row in rows:
-        stat = stats.get((row["trade_date"], row["algo"]))
-        if row["lot_pct"] is None or stat is None:
-            row["outlier"] = ""
-            continue
-        _, _, low, high = stat
-        if row["lot_pct"] < low:
-            row["outlier"] = "Below average range"
-        elif row["lot_pct"] > high:
-            row["outlier"] = "Above average range"
-        else:
-            row["outlier"] = "In range"
+        row["outlier"] = flags.get(
+            (row["trade_date"], row["algo"], _user_key(row["user_id"])), "")
     return rows
 
 
@@ -501,7 +608,7 @@ def format_row(row):
         row["segment"],
         row["order_count"],
         _fmt_decimal(row["quantity"], places=0),
-        _fmt_decimal(row["lots"]),
+        _fmt_decimal(row["lots"], places=0),
         _fmt_decimal(row["lot_pct"]) if row.get("lot_pct") is not None else "",
         _fmt_decimal(row["trade_value"]),
         row.get("outlier", ""),
@@ -509,32 +616,36 @@ def format_row(row):
 
 
 def algo_summary(rows, std_multiplier=None):
-    """Per (date, algo) outlier summary of the report rows: row count, average
-    lot pct, std dev, the mean +/- k*std band, and how many rows fall below /
-    in / above it. Pass the SAME std_multiplier that was given to aggregate()
-    so the band shown matches the flags on the rows."""
-    stats = _lot_pct_stats(rows, std_multiplier)
+    """Per (date, algo) outlier summary, ALL columns in users: "Total Users"
+    (distinct users of the algo), the per-USER lot pct statistics (mean, std
+    dev, mean +/- k*std band — see user_lot_observations), and how many USERS
+    fall below / in / above the band, so Below + In + Above = Total Users
+    (users with no usable allocation carry no lot pct and are the only ones
+    that can fall outside the three flag columns). Pass the SAME
+    std_multiplier that was given to aggregate() so the band shown matches
+    the flags on the rows."""
+    observations = user_lot_observations(rows, std_multiplier)
+    stats = _lot_pct_stats(observations, std_multiplier)
     counts = {}
-    for row in rows:
-        if row.get("lot_pct") is None or not row["algo"]:
-            continue
-        key = (row["trade_date"], row["algo"])
-        group = counts.setdefault(key, {"count": 0, "below": 0, "in_range": 0, "above": 0})
-        group["count"] += 1
-        if row["outlier"] == "Below average range":
+    for o in observations:
+        key = (o["trade_date"], o["algo"])
+        group = counts.setdefault(key, {"users": 0, "below": 0, "in_range": 0, "above": 0})
+        group["users"] += 1
+        if o["outlier"] == "Below average range":
             group["below"] += 1
-        elif row["outlier"] == "Above average range":
+        elif o["outlier"] == "Above average range":
             group["above"] += 1
-        else:
+        elif o["outlier"] == "In range":
             group["in_range"] += 1
 
     out = []
     for (trade_date, algo), group in counts.items():
-        mean, std, low, high = stats[(trade_date, algo)]
+        # a group whose users all lack an allocation has no lot-pct statistics
+        mean, std, low, high = stats.get((trade_date, algo), (None, None, None, None))
         out.append({
             "trade_date": trade_date,
             "algo": algo,
-            "rows": group["count"],
+            "users": group["users"],
             "avg_lot_pct": mean,
             "std_dev": std,
             "band_low": low,
@@ -549,16 +660,231 @@ def algo_summary(rows, std_multiplier=None):
 
 
 def format_summary_row(row):
+    has_stats = row["avg_lot_pct"] is not None
     return [
         row["algo"],
-        row["rows"],
-        _fmt_decimal(row["avg_lot_pct"]),
-        _fmt_decimal(row["std_dev"]),
-        f"{_fmt_decimal(row['band_low'])}–{_fmt_decimal(row['band_high'])}",
+        row["users"],
+        _fmt_decimal(row["avg_lot_pct"]) if has_stats else "",
+        _fmt_decimal(row["std_dev"]) if has_stats else "",
+        f"{_fmt_decimal(row['band_low'])}–{_fmt_decimal(row['band_high'])}" if has_stats else "",
         row["below"],
         row["in_range"],
         row["above"],
     ]
+
+
+def outlier_clients(rows, std_multiplier):
+    """The stricter "outlier clients" view: USERS whose per-user lot pct
+    (combined lots ÷ combined allocation, see user_lot_observations) falls
+    outside mean ± k·σ of their (date, algo) group, where k is the CLIENT
+    deviation — asked separately from (and typically wider than) the flagging
+    deviation, e.g. 2 vs 1. One row per user — a user trading two segments is
+    judged once on their combined exposure.
+
+    The group band is a lot-pct band, so it is translated into LOTS through
+    the user's own allocation: "Average Lots" is the in-range lots window for
+    THAT user (lower edge clamped at 0 — nobody can fire negative lots) and
+    "Diff of Lots" is how many lots beyond the nearest edge the user actually
+    fired. Sorted worst-first (largest lots difference) within date/algo."""
+    out = []
+    for o in user_lot_observations(rows, std_multiplier):
+        if o["outlier"] not in ("Below average range", "Above average range"):
+            continue
+        allocation = o["allocation"]
+        low_lots = max(o["band_low"], Decimal("0")) * allocation / 100
+        high_lots = o["band_high"] * allocation / 100
+        above = o["outlier"] == "Above average range"
+        out.append({
+            "trade_date": o["trade_date"],
+            "algo": o["algo"],
+            "server": o["server"],
+            "user_id": o["user_id"],
+            "band_low_lots": low_lots,
+            "band_high_lots": high_lots,
+            "outlier": o["outlier"],
+            "lots": o["lots"],
+            "diff_lots": (o["lots"] - high_lots) if above else (low_lots - o["lots"]),
+        })
+    out.sort(key=lambda r: (
+        (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])),
+        -r["diff_lots"],
+    ))
+    out.sort(key=lambda r: r["trade_date"] or date.min, reverse=True)
+    return out
+
+
+def format_lots_band(row):
+    """Display form of an outlier row's expected-lots window, e.g. "400 – 500"."""
+    return f"{int(round(row['band_low_lots'])):,} – {int(round(row['band_high_lots'])):,}"
+
+
+def add_outlier_clients_sheet(workbook, outlier_rows):
+    """Append the "Outlier Clients" sheet: one row per report row outside the
+    client deviation band, band and difference in whole lots."""
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+
+    sheet = workbook.create_sheet("Outlier Clients")
+    sheet.append(OUTLIER_CLIENTS_HEADER)
+    for row in outlier_rows:
+        sheet.append([
+            row["algo"],
+            row["server"],
+            row["user_id"],
+            format_lots_band(row),
+            row["outlier"],
+            int(round(row["lots"])),
+            int(round(row["diff_lots"])),
+        ])
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    for col_idx, title in enumerate(OUTLIER_CLIENTS_HEADER, start=1):
+        sheet.cell(row=1, column=col_idx).font = bold
+        sheet.column_dimensions[get_column_letter(col_idx)].width = max(len(title) + 6, 14)
+    lots_col = OUTLIER_CLIENTS_HEADER.index("Lots Fired") + 1
+    diff_col = OUTLIER_CLIENTS_HEADER.index("Diff of Lots") + 1
+    for r in range(1, sheet.max_row + 1):
+        for c in range(1, len(OUTLIER_CLIENTS_HEADER) + 1):
+            sheet.cell(r, c).alignment = center
+        if r > 1:
+            sheet.cell(r, lots_col).number_format = "#,##0"
+            sheet.cell(r, diff_col).number_format = "#,##0"
+    sheet.freeze_panes = "A2"
+
+
+def strike_report(orders, allocations=None):
+    """The two strike summaries, computed over (deduped) orders:
+
+      * by_algo_server — per (algo, server): how many DISTINCT contracts
+        (segment, expiry, strike, CE/PE) were traded. The algo comes from the
+        same MTM allocation matching as the trade value rows; orders whose
+        user has no MTM entry land in a blank-algo bucket.
+      * per_strike — per contract: total lots (sum |qty| / lot size, the same
+        date-based lot math as the trade value rows) and order count.
+
+    Orders whose symbol doesn't parse as an option contract are skipped."""
+    allocations = allocations or {}
+    # Server -> algo fallback for users with no MTM entry: a server's algo is
+    # the algo of its MTM accounts (the most common one, should they ever
+    # mix), so an unmatched user doesn't spawn a duplicate blank-algo row
+    # for a server that already sits under an algo.
+    server_algo_votes = {}
+    for entries in allocations.values():
+        for entry in entries:
+            if entry["algo"]:
+                server_algo_votes.setdefault(entry["server"], Counter())[entry["algo"]] += 1
+    server_algo = {server: votes.most_common(1)[0][0]
+                   for server, votes in server_algo_votes.items()}
+
+    parse_cache = {}
+    by_algo_server = {}
+    per_strike = {}
+    for row in orders:
+        if row.symbol in parse_cache:
+            contract = parse_cache[row.symbol]
+        else:
+            contract = parse_cache[row.symbol] = parse_contract(row.symbol)
+        if contract is None:
+            continue
+        entry = _pick_allocation(allocations, _user_key(row.user_id), row.server)
+        server_key = _server_key(row.server)
+        algo = entry["algo"] if entry else server_algo.get(server_key, "")
+        by_algo_server.setdefault((algo, server_key), set()).add(contract)
+        lot_size = _LOT_SIZE_BY_SEGMENT[row.segment](row.trade_date)
+        group = per_strike.setdefault(contract, {"lots": Decimal("0"), "order_count": 0})
+        group["lots"] += abs(row.qty) / lot_size
+        group["order_count"] += 1
+
+    # each row keeps its contract set so the count can be re-filtered by
+    # expiry / index in the dashboard and DOR.html
+    algo_rows = [
+        {"algo": algo, "server": server, "strike_count": len(contracts),
+         "contracts": sorted(contracts)}
+        for (algo, server), contracts in by_algo_server.items()
+    ]
+    # numeric algos first in numeric order, then text algos, blank (unmatched) last
+    algo_rows.sort(key=lambda r: (
+        (2, "") if r["algo"] == "" else
+        (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])),
+        r["server"],
+    ))
+    strike_rows = [
+        {"segment": c[0], "expiry": c[1], "strike": c[2], "opt_type": c[3],
+         "label": contract_label(c), "lots": g["lots"], "order_count": g["order_count"]}
+        for c, g in per_strike.items()
+    ]
+    strike_rows.sort(key=lambda r: (r["segment"], r["expiry"], r["strike"], r["opt_type"]))
+    return {"by_algo_server": algo_rows, "per_strike": strike_rows}
+
+
+def strike_chain(per_strike):
+    """Pivot the per-strike rows into an option-chain view:
+    {(segment, expiry): [(ce_lots, strike, pe_lots), ...]} — one row per
+    strike price, sorted by strike, CE and PE lots side by side (0 when only
+    one side traded). Keys come out sorted by (segment, expiry)."""
+    by_key = {}
+    for row in per_strike:
+        sides = by_key.setdefault((row["segment"], row["expiry"]), {}) \
+                      .setdefault(row["strike"], {"CE": Decimal("0"), "PE": Decimal("0")})
+        sides[row["opt_type"]] += row["lots"]
+    return {
+        key: [(sides[s]["CE"], s, sides[s]["PE"]) for s in sorted(sides)]
+        for key, sides in sorted(by_key.items())
+    }
+
+
+def add_strikes_sheet(workbook, strikes):
+    """Append the "Strikes" sheet: the per-(algo, server) distinct strike
+    counts in columns A-C, and one option-chain block (CE | Strike | PE) per
+    (segment, expiry) stacked from column E. Lots are whole numbers."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    sheet = workbook.create_sheet("Strikes")
+    bold = Font(bold=True)
+
+    for col_idx, title in enumerate(STRIKE_ALGO_HEADER, start=1):
+        cell = sheet.cell(row=1, column=col_idx, value=title)
+        cell.font = bold
+        sheet.column_dimensions[get_column_letter(col_idx)].width = max(len(title) + 4, 12)
+    for r, row in enumerate(strikes["by_algo_server"], start=2):
+        sheet.cell(row=r, column=1, value=row["algo"])
+        sheet.cell(row=r, column=2, value=row["server"])
+        sheet.cell(row=r, column=3, value=row["strike_count"])
+    # a per-(algo, server) count can share strikes with another server, so the
+    # overall figure is the distinct count, not the column sum
+    total_row = len(strikes["by_algo_server"]) + 2
+    sheet.cell(row=total_row, column=1, value="Total (distinct)").font = bold
+    sheet.cell(row=total_row, column=3, value=len(strikes["per_strike"])).font = bold
+
+    offset = len(STRIKE_ALGO_HEADER) + 2  # leave column D blank between the tables
+    for j in range(3):
+        sheet.column_dimensions[get_column_letter(offset + j)].width = 12
+    r = 1
+    for (segment, expiry), rows in strike_chain(strikes["per_strike"]).items():
+        sheet.merge_cells(start_row=r, start_column=offset, end_row=r, end_column=offset + 2)
+        title = sheet.cell(row=r, column=offset,
+                           value=f"{segment} {expiry.strftime('%d%b%y').upper()}")
+        title.font = bold
+        r += 1
+        for j, header in enumerate(STRIKE_CHAIN_HEADER):
+            sheet.cell(row=r, column=offset + j, value=header).font = bold
+        r += 1
+        ce_total = pe_total = Decimal("0")
+        for ce, strike, pe in rows:
+            sheet.cell(row=r, column=offset, value=int(round(ce))).number_format = "#,##0"
+            sheet.cell(row=r, column=offset + 1, value=strike)
+            sheet.cell(row=r, column=offset + 2, value=int(round(pe))).number_format = "#,##0"
+            ce_total += ce
+            pe_total += pe
+            r += 1
+        for j, value in enumerate((int(round(ce_total)), "Total", int(round(pe_total)))):
+            cell = sheet.cell(row=r, column=offset + j, value=value)
+            cell.font = bold
+            if j != 1:
+                cell.number_format = "#,##0"
+        r += 2  # blank spacer row between chains
+    sheet.freeze_panes = "A2"
 
 
 def report_csv_text(rows):
@@ -587,7 +913,7 @@ def _excel_report_row(row):
         row["segment"],
         row["order_count"],
         _excel_number(row["quantity"], places=0),
-        _excel_number(row["lots"]),
+        _excel_number(row["lots"], places=0),
         _excel_number(row.get("lot_pct")),
         _excel_number(row["trade_value"]),
         row.get("outlier", ""),
@@ -608,12 +934,14 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
     summary_sheet = workbook.create_sheet("summary")
     summary_sheet.append(SUMMARY_HEADER)
     for srow in algo_summary(rows, std_multiplier):
+        has_stats = srow["avg_lot_pct"] is not None
         summary_sheet.append([
             srow["algo"],
-            srow["rows"],
+            srow["users"],
             _excel_number(srow["avg_lot_pct"]),
             _excel_number(srow["std_dev"]),
-            f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}",
+            (f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}"
+             if has_stats else ""),
             srow["below"],
             srow["in_range"],
             srow["above"],
@@ -627,30 +955,35 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
         ws.freeze_panes = "A2"
 
 
-def write_report_excel(rows, target, std_multiplier=None):
+def write_report_excel(rows, target, std_multiplier=None, strikes=None, outliers=None):
     """Write the report workbook: sheet "tradevalue" holds the full report,
-    sheet "summary" the per-algo outlier table. `target` may be a filesystem
-    path or a writable buffer."""
+    sheet "summary" the per-algo outlier table, plus the "Strikes" /
+    "Outlier Clients" sheets when their data is given. `target` may be a
+    filesystem path or a writable buffer."""
     from openpyxl import Workbook
 
     workbook = Workbook()
     workbook.remove(workbook.active)
     add_report_sheets(workbook, rows, std_multiplier)
+    if strikes:
+        add_strikes_sheet(workbook, strikes)
+    if outliers is not None:
+        add_outlier_clients_sheet(workbook, outliers)
     workbook.save(target)
 
 
-def report_excel_bytes(rows, std_multiplier=None):
+def report_excel_bytes(rows, std_multiplier=None, strikes=None, outliers=None):
     buffer = io.BytesIO()
-    write_report_excel(rows, buffer, std_multiplier)
+    write_report_excel(rows, buffer, std_multiplier, strikes, outliers)
     return buffer.getvalue()
 
 
-def write_report(rows, output_path, std_multiplier=None):
+def write_report(rows, output_path, std_multiplier=None, strikes=None, outliers=None):
     if str(output_path).lower().endswith(".csv"):
         with open(output_path, "w", newline="", encoding="utf-8") as fh:
             fh.write(report_csv_text(rows))
     else:
-        write_report_excel(rows, output_path, std_multiplier)
+        write_report_excel(rows, output_path, std_multiplier, strikes, outliers)
 
 
 def report_totals(rows):
@@ -688,11 +1021,16 @@ def main(argv=None):
                         help=f"output path, .xlsx or .csv (default: {DEFAULT_OUTPUT.name})")
     parser.add_argument("-d", "--deviation", type=float, default=1.0,
                         help="outlier threshold in standard deviations of the algo's lot pct (default 1)")
+    parser.add_argument("-c", "--client-deviation", type=float, default=2.0,
+                        help="stricter threshold for the Outlier Clients sheet (default 2)")
     args = parser.parse_args(argv)
 
     if args.deviation <= 0:
         parser.error("--deviation must be greater than 0")
+    if args.client_deviation <= 0:
+        parser.error("--client-deviation must be greater than 0")
     std_multiplier = Decimal(str(args.deviation))
+    client_multiplier = Decimal(str(args.client_deviation))
 
     inputs = args.inputs or _default_files(ORDERBOOK_PATTERN)
     if not inputs:
@@ -727,14 +1065,18 @@ def main(argv=None):
         print(f"dropped {dropped} duplicate orders")
 
     report_rows = aggregate(deduped, allocations, std_multiplier)
-    write_report(report_rows, args.output, std_multiplier)
+    strikes = strike_report(deduped, allocations)
+    outliers = outlier_clients(report_rows, client_multiplier)
+    write_report(report_rows, args.output, std_multiplier, strikes, outliers)
 
     totals = report_totals(report_rows)
     matched = len({r["user_id"] for r in report_rows if r["allocation"] is not None})
     print(f"wrote {len(report_rows)} rows to {args.output}")
     print(f"allocation matched for {matched}/{totals['users']} users")
-    print(f"totals: {totals['users']} users | lots {_fmt_decimal(totals['lots'])} "
+    print(f"totals: {totals['users']} users | lots {_fmt_decimal(totals['lots'], places=0)} "
           f"| trade value {_fmt_decimal(totals['trade_value'])}")
+    print(f"strikes: {len(strikes['per_strike'])} distinct contracts")
+    print(f"outlier clients (±{args.client_deviation:g}σ): {len(outliers)} rows")
 
 
 if __name__ == "__main__":

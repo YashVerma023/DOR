@@ -8,9 +8,12 @@ workbook; this file is the client-facing view.
 """
 
 import html
+import json
 import math
 import statistics
 from datetime import datetime
+
+from tradevalue import strike_chain
 
 
 def _money(v):
@@ -37,14 +40,15 @@ def _kpi_tiles(pairs):
 def _tv_summary_table(tv_summary):
     body = []
     for s in tv_summary:
-        band = f"{_num2(s['band_low'])} – {_num2(s['band_high'])}"
+        has_stats = s["avg_lot_pct"] is not None
+        band = f"{_num2(s['band_low'])} – {_num2(s['band_high'])}" if has_stats else "&mdash;"
         body.append(
             "<tr>"
             f'<td class="txt">{_esc(s["algo"])}</td>'
-            f"<td>{s['rows']}</td>"
-            f"<td>{_num2(s['avg_lot_pct'])}</td>"
-            f"<td>{_num2(s['std_dev'])}</td>"
-            f"<td>{_esc(band)}</td>"
+            f"<td>{s['users']}</td>"
+            f"<td>{_num2(s['avg_lot_pct']) if has_stats else '&mdash;'}</td>"
+            f"<td>{_num2(s['std_dev']) if has_stats else '&mdash;'}</td>"
+            f"<td>{band}</td>"
             f'<td class="below">{s["below"]}</td>'
             f"<td>{s['in_range']}</td>"
             f'<td class="above">{s["above"]}</td>'
@@ -53,11 +57,280 @@ def _tv_summary_table(tv_summary):
     return f"""
     <table class="tbl">
       <thead><tr>
-        <th class="txt">Algo</th><th>Rows</th><th>Avg Lot Pct</th><th>Std Dev</th>
+        <th class="txt">Algo</th><th>Total Users</th><th>Avg Lot Pct</th><th>Std Dev</th>
         <th>Band</th><th>Below</th><th>In</th><th>Above</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
+
+
+def _pct_cell(value):
+    return _num2(value) if value is not None else "&mdash;"
+
+
+def _slippage_tables(slippage):
+    """Avg slippage per algo (with overall row) and the major slippages —
+    SL-hit accounts that lost more than their configured max loss."""
+    sum_body = []
+    for s in slippage["summary"] + [slippage["overall"]]:
+        cls = ' class="grand"' if s["ALGO"] == "Overall" else ""
+        sum_body.append(
+            f"<tr{cls}>"
+            f"<td>{_esc(s['ALGO'])}</td>"
+            f"<td>{s['count']}</td>"
+            f"<td>{s['over']}</td>"
+            f"<td>{_money(s['max_loss'])}</td>"
+            f"<td>{_money(s['realized'])}</td>"
+            f"<td>{_money(s['avg_slippage'])}</td>"
+            f"<td>{_pct_cell(s['slippage_pct'])}</td>"
+            "</tr>"
+        )
+    summary_tbl = f"""
+        <h3>Avg Slippage per Algo</h3>
+        <div class="tbl-scroll">
+        <table class="tbl">
+          <thead><tr>
+            <th>Algo</th><th>SL-Hit Users</th><th>Over Max Loss</th><th>Total Max Loss</th>
+            <th>Total Realized P&amp;L</th><th>Avg Slippage</th><th>Slippage %</th>
+          </tr></thead>
+          <tbody>{''.join(sum_body)}</tbody>
+        </table>
+        </div>"""
+
+    if slippage["majors"]:
+        maj_body = []
+        for r in slippage["majors"]:
+            maj_body.append(
+                "<tr>"
+                f"<td>{_esc(r['ALGO'])}</td>"
+                f"<td>{_esc(r['SERVER'])}</td>"
+                f"<td>{_esc(r['UserID'])}</td>"
+                f"<td>{_money(r['MaxLoss'])}</td>"
+                f"<td>{_money(r['Realized'])}</td>"
+                f'<td class="above">{_money(r["Slippage"])}</td>'
+                f"<td>{_pct_cell(r['SlippagePct'])}</td>"
+                "</tr>"
+            )
+        majors_tbl = f"""
+        <h3>Major Slippages (over max loss)</h3>
+        <div class="tbl-scroll">
+        <table class="tbl">
+          <thead><tr>
+            <th>Algo</th><th>Server</th><th>User ID</th><th>Max Loss</th>
+            <th>Realized P&amp;L</th><th>Slippage</th><th>Slippage %</th>
+          </tr></thead>
+          <tbody>{''.join(maj_body)}</tbody>
+        </table>
+        </div>"""
+    else:
+        majors_tbl = ('<h3>Major Slippages (over max loss)</h3>'
+                      '<div class="empty-note">No account lost more than its configured max loss.</div>')
+
+    return f"""
+    <div class="strike-grid">
+      <div class="card strike-card">{summary_tbl}</div>
+      <div class="card strike-card">{majors_tbl}</div>
+    </div>"""
+
+
+def _outlier_clients_table(outlier_rows):
+    """The stricter client-outlier view: band ("Average Lots") and difference
+    are whole lots, converted per user from the lot-pct band."""
+    if not outlier_rows:
+        return '<div class="empty-note">No outlier clients at this deviation.</div>'
+    body = []
+    for r in outlier_rows:
+        band = (f"{int(round(r['band_low_lots'])):,} &ndash; "
+                f"{int(round(r['band_high_lots'])):,}")
+        cls = "below" if r["outlier"].startswith("Below") else "above"
+        body.append(
+            "<tr>"
+            f"<td>{_esc(r['algo'])}</td>"
+            f"<td>{_esc(r['server'])}</td>"
+            f"<td>{_esc(r['user_id'])}</td>"
+            f"<td>{band}</td>"
+            f'<td class="{cls}">{_esc(r["outlier"])}</td>'
+            f"<td>{int(round(r['lots'])):,}</td>"
+            f"<td>{int(round(r['diff_lots'])):,}</td>"
+            "</tr>"
+        )
+    return f"""
+    <table class="tbl">
+      <thead><tr>
+        <th>Algo</th><th>Server</th><th>User ID</th>
+        <th>Average Lots</th><th>Outlier</th><th>Lots Fired</th><th>Diff of Lots</th>
+      </tr></thead>
+      <tbody>{''.join(body)}</tbody>
+    </table>"""
+
+
+def _expiry_label(expiry):
+    return expiry.strftime("%d%b%y").upper()
+
+
+def _strikes_tables(strikes):
+    """The two strike summaries side by side, each behind its own expiry +
+    index dropdown pair: distinct strikes per (algo, server) — with an "All"
+    option that reproduces the unfiltered counts — and the lots-per-strike
+    option chain (CE | Strike | PE). Lots are whole numbers."""
+    # every (expiry|All, index|All) combination is precomputed, so the table
+    # swap is a pure lookup in the page's JS
+    seg_set, exp_dates = set(), set()
+    for r in strikes["by_algo_server"]:
+        for contract in r["contracts"]:
+            seg_set.add(contract[0])
+            exp_dates.add(contract[1])
+    expiry_labels = [_expiry_label(e) for e in sorted(exp_dates)]
+    segments = sorted(seg_set)
+
+    def counts_for(exp_label, seg):
+        rows, distinct = [], set()
+        for r in strikes["by_algo_server"]:
+            sel = [c for c in r["contracts"]
+                   if (exp_label == "All" or _expiry_label(c[1]) == exp_label)
+                   and (seg == "All" or c[0] == seg)]
+            if sel:
+                rows.append([r["algo"] or "—", r["server"], len(sel)])
+                distinct.update(sel)
+        return {"rows": rows, "total": len(distinct)}
+
+    as_counts = {e: {s: counts_for(e, s) for s in ["All"] + segments}
+                 for e in ["All"] + expiry_labels}
+
+    # server-side render of the default (All / All) view — shown before the
+    # script runs and in print
+    initial = as_counts["All"]["All"]
+    algo_body = [
+        "<tr>"
+        f'<td class="txt">{_esc(algo)}</td>'
+        f'<td class="txt">{_esc(server)}</td>'
+        f"<td>{count}</td>"
+        "</tr>"
+        for algo, server, count in initial["rows"]
+    ]
+    algo_body.append(
+        '<tr class="grand"><td class="txt">Total (distinct)</td><td class="txt"></td>'
+        f"<td>{initial['total']}</td></tr>"
+    )
+
+    # {expiry label: {index: [[ce, strike, pe], ...]}} — expiry labels in date order
+    chains, chain_expiries = {}, []
+    for (segment, expiry), rows in strike_chain(strikes["per_strike"]).items():
+        label = _expiry_label(expiry)
+        if label not in chains:
+            chains[label] = {}
+            chain_expiries.append((expiry, label))
+        chains[label][segment] = [[int(round(ce)), strike, int(round(pe))]
+                                  for ce, strike, pe in rows]
+    chain_expiries = [label for _, label in sorted(chain_expiries)]
+
+    return f"""
+    <div class="strike-grid">
+      <div class="card strike-card">
+        <h3>Strikes per Algo / Server</h3>
+        <div class="chain-controls">
+          <label>Expiry <select id="as-expiry"></select></label>
+          <label>Index <select id="as-index"></select></label>
+        </div>
+        <div class="tbl-scroll">
+        <table class="tbl">
+          <thead><tr><th class="txt">Algo</th><th class="txt">Server</th><th>Strikes Traded</th></tr></thead>
+          <tbody id="as-body">{''.join(algo_body)}</tbody>
+        </table>
+        </div>
+      </div>
+      <div class="card strike-card">
+        <h3>Lots per Strike &mdash; Option Chain</h3>
+        <div class="chain-controls">
+          <label>Expiry <select id="chain-expiry"></select></label>
+          <label>Index <select id="chain-index"></select></label>
+        </div>
+        <div class="tbl-scroll">
+        <table class="tbl">
+          <thead><tr><th>CE</th><th>Strike</th><th>PE</th></tr></thead>
+          <tbody id="chain-body"></tbody>
+        </table>
+        </div>
+      </div>
+    </div>
+    <script>
+    var CHAINS = {json.dumps(chains)};
+    var CHAIN_EXPIRIES = {json.dumps(chain_expiries)};
+    var AS_COUNTS = {json.dumps(as_counts)};
+    </script>"""
+
+
+_CHAIN_SCRIPT = """
+<script>
+(function () {
+  var expirySel = document.getElementById('chain-expiry');
+  var indexSel = document.getElementById('chain-index');
+  var body = document.getElementById('chain-body');
+  if (!expirySel || !indexSel || !body) return;
+  function fmt(n) { return n.toLocaleString('en-US'); }
+  function fillOptions(sel, values) {
+    sel.innerHTML = '';
+    values.forEach(function (v) {
+      var opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    });
+  }
+  function render() {
+    var rows = (CHAINS[expirySel.value] || {})[indexSel.value] || [];
+    var ceTotal = 0, peTotal = 0, out = '';
+    rows.forEach(function (r) {
+      ceTotal += r[0]; peTotal += r[2];
+      out += '<tr><td>' + fmt(r[0]) + '</td><td>' + r[1] + '</td><td>' + fmt(r[2]) + '</td></tr>';
+    });
+    out += '<tr class="grand"><td>' + fmt(ceTotal) + '</td><td>Total</td><td>' + fmt(peTotal) + '</td></tr>';
+    body.innerHTML = out;
+  }
+  function onExpiry() {
+    fillOptions(indexSel, Object.keys(CHAINS[expirySel.value] || {}).sort());
+    render();
+  }
+  fillOptions(expirySel, CHAIN_EXPIRIES);
+  expirySel.addEventListener('change', onExpiry);
+  indexSel.addEventListener('change', render);
+  onExpiry();
+})();
+(function () {
+  var expirySel = document.getElementById('as-expiry');
+  var indexSel = document.getElementById('as-index');
+  var body = document.getElementById('as-body');
+  if (!expirySel || !indexSel || !body) return;
+  function esc(v) {
+    var d = document.createElement('div');
+    d.textContent = String(v);
+    return d.innerHTML;
+  }
+  function fillOptions(sel, values) {
+    sel.innerHTML = '';
+    values.forEach(function (v) {
+      var opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    });
+  }
+  function render() {
+    var data = (AS_COUNTS[expirySel.value] || {})[indexSel.value] || {rows: [], total: 0};
+    var out = '';
+    data.rows.forEach(function (r) {
+      out += '<tr><td class="txt">' + esc(r[0]) + '</td><td class="txt">' + esc(r[1]) +
+             '</td><td>' + r[2] + '</td></tr>';
+    });
+    out += '<tr class="grand"><td class="txt">Total (distinct)</td><td class="txt"></td><td>' +
+           data.total + '</td></tr>';
+    body.innerHTML = out;
+  }
+  fillOptions(expirySel, Object.keys(AS_COUNTS));
+  fillOptions(indexSel, Object.keys(AS_COUNTS['All']));
+  expirySel.addEventListener('change', render);
+  indexSel.addEventListener('change', render);
+})();
+</script>
+"""
 
 
 def _nice_ticks(vmax, target=5):
@@ -77,13 +350,13 @@ def _nice_ticks(vmax, target=5):
     return ticks
 
 
-def _boxplot_svg(tv_rows):
-    """Inline-SVG box plot of lot pct per algo — self-contained (no JS), same
-    design as the dashboard chart: gray box/whiskers for the distribution,
-    flagged outliers overlaid as blue (below) / orange (above) points with
-    native <title> hover tooltips."""
+def _boxplot_svg(boxplot_rows):
+    """Inline-SVG box plot of per-USER lot pct per algo (one point per user)
+    — self-contained (no JS), same design as the dashboard chart: gray
+    box/whiskers for the distribution, flagged outliers overlaid as blue
+    (below) / orange (above) points with native <title> hover tooltips."""
     by_algo = {}
-    for r in tv_rows:
+    for r in boxplot_rows:
         if r.get("lot_pct") is None or not r["algo"]:
             continue
         by_algo.setdefault(str(r["algo"]), []).append(r)
@@ -302,17 +575,23 @@ _PIVOT_SCRIPT = """
 
 
 def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, pivot_rows,
-                   tv_rows=None):
+                   boxplot_rows=None, strikes=None, outliers=None, outlier_deviation=None,
+                   slippage=None):
     """Assemble the complete DOR.html document and return it as a string.
-    `tv_rows` (the per-user report rows) feeds the box plot; when omitted the
-    chart section is skipped."""
+    `boxplot_rows` (per-user observations from tradevalue.
+    user_lot_observations) feeds the box plot; `strikes` (from
+    tradevalue.strike_report) feeds the strikes section; `outliers` (from
+    tradevalue.outlier_clients, flagged at `outlier_deviation` std devs)
+    feeds the outlier clients section; `slippage` ({"summary", "overall",
+    "majors"} from segregate_int_pos_mtm2) feeds the sq-off slippage section.
+    Each section is skipped when its data is omitted."""
     generated = datetime.now().strftime("%d-%b-%Y %H:%M")
     grand = next((r for r in pivot_rows if r["kind"] == "grandtotal"), None)
 
     tv_kpis = _kpi_tiles([
         ("Users", f"{tv_totals['users']:,}"),
         ("Orders", f"{tv_totals['orders']:,}"),
-        ("Total Lots", _num2(tv_totals["lots"])),
+        ("Total Lots", _money(tv_totals["lots"])),
         ("Trade Value", _money(tv_totals["trade_value"])),
     ])
     seg_pairs = [
@@ -330,16 +609,53 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
         ]
     seg_kpis = _kpi_tiles(seg_pairs)
 
-    boxplot = _boxplot_svg(tv_rows) if tv_rows else ""
+    boxplot = _boxplot_svg(boxplot_rows) if boxplot_rows else ""
     boxplot_section = f"""
 <section>
   <h2>Lot Pct by Algo (Box Plot)</h2>
-  <div class="section-note">Distribution of each algo&rsquo;s lot pct across users;
-  the &plusmn;{deviation:g}&sigma; flagged outliers are shown as points.</div>
+  <div class="section-note">Distribution of each algo&rsquo;s per-user lot pct (one point
+  per user); the &plusmn;{deviation:g}&sigma; flagged outliers are shown as points.</div>
   <div class="card">
     {boxplot}
   </div>
 </section>""" if boxplot else ""
+
+    slippage_section = f"""
+<section>
+  <h2>Sq-Off Slippage (SL-Hit Accounts)</h2>
+  <div class="section-note">Slippage = |compiled Realized P&amp;L| &minus; MAX LOSS for accounts
+  whose SL was hit (squared off). Positive = the account lost <b>more</b> than its configured
+  max loss &mdash; a major slippage; negative = squared off inside the limit. Slippage % is
+  relative to the account&rsquo;s MAX LOSS; the algo-level figure is total slippage / total
+  max loss.</div>
+  {_slippage_tables(slippage)}
+</section>""" if slippage is not None else ""
+
+    k2 = outlier_deviation if outlier_deviation is not None else deviation
+    outliers_section = f"""
+<section>
+  <h2>Outlier Clients (&plusmn;{k2:g}&sigma;)</h2>
+  <div class="section-note">One row per user: those whose combined lot pct sits more than
+  {k2:g} standard deviation(s) from their algo&rsquo;s average. <b>Average Lots</b> is that
+  band converted into lots for the user&rsquo;s own allocation; <b>Diff of Lots</b> is how
+  many lots beyond the nearest band edge were actually fired.</div>
+  <div class="card scroll">
+    {_outlier_clients_table(outliers)}
+  </div>
+</section>""" if outliers is not None else ""
+
+    strikes_section = f"""
+<section>
+  <h2>Strikes Traded</h2>
+  <div class="section-note">A strike is one contract (index + expiry + strike + CE/PE);
+  the two exchange symbol formats for the same contract are counted once. Pick an expiry
+  and index to see its option chain &mdash; CE / PE lots per strike (whole lots, same
+  date-based lot sizes as the trade value rows). Users with no MTM entry inherit their
+  server&rsquo;s algo; an algo shows blank only when the whole server has no MTM
+  accounts.</div>
+  {_strikes_tables(strikes)}
+</section>
+{_CHAIN_SCRIPT}""" if strikes and strikes.get("per_strike") else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -392,16 +708,15 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .kpi-label {{ color: var(--muted); font-size: 12px; }}
   .kpi-value {{ font-size: 20px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }}
   .tbl {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+  /* every table cell — data AND header — is centered (client-facing report) */
   .tbl th {{
-    background: var(--header); color: #fff; padding: 8px 10px; text-align: right;
+    background: var(--header); color: #fff; padding: 8px 10px; text-align: center;
     font-weight: 600; white-space: nowrap; position: sticky; top: 0;
   }}
-  .tbl th.txt {{ text-align: left; }}
   .tbl td {{
-    padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right;
+    padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: center;
     font-variant-numeric: tabular-nums; white-space: nowrap;
   }}
-  .tbl td.txt {{ text-align: left; }}
   .tbl tbody tr:hover td {{ background: #F8FAFC; }}
   .tbl tr.subtotal td {{ background: var(--subtotal); font-weight: 600; }}
   .tbl tr.algototal td {{ background: var(--algototal); font-weight: 700; }}
@@ -409,6 +724,22 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .tbl td.below {{ color: var(--below); font-weight: 600; }}
   .tbl td.above {{ color: #B45309; font-weight: 600; }}
   .scroll {{ overflow-x: auto; }}
+  .strike-grid {{ display: grid; grid-template-columns: 1fr 1.4fr; gap: 14px;
+                  align-items: start; }}
+  @media (max-width: 820px) {{
+    .strike-grid {{ grid-template-columns: 1fr; }}
+  }}
+  /* title + dropdowns stay fixed; only the table body scrolls, and the sticky
+     header sits flush at the scrollport top so no row peeks above it */
+  .strike-card .tbl-scroll {{ max-height: 420px; overflow: auto; }}
+  .strike-card h3 {{ font-size: 13.5px; font-weight: 700; color: var(--header);
+                     margin-bottom: 8px; }}
+  .chain-controls {{ display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap;
+                     color: var(--muted); font-size: 12.5px; }}
+  .chain-controls select {{
+    margin-left: 6px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--surface); color: var(--ink); font-size: 12.5px;
+  }}
   .legend {{ display: flex; gap: 18px; align-items: center; margin-bottom: 10px;
              color: var(--muted); font-size: 12.5px; flex-wrap: wrap; }}
   .legend .legend-note {{ margin-left: auto; }}
@@ -424,7 +755,6 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .caret {{ display: inline-block; width: 15px; color: var(--muted);
             transition: transform .15s ease; }}
   tr.open .caret {{ transform: rotate(90deg); }}
-  #pivot-table td.indent {{ padding-left: 30px; }}
   .pivot-tools {{ display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }}
   .pivot-tools button {{
     border: 1px solid var(--line); background: var(--surface); border-radius: 6px;
@@ -433,6 +763,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .pivot-tools button:hover {{ background: #F8FAFC; }}
   .pivot-tools .hint {{ color: var(--muted); font-size: 12px; margin-left: auto; }}
   .footnote {{ color: var(--muted); font-size: 12px; margin-top: 10px; }}
+  .empty-note {{ color: var(--muted); font-style: italic; text-align: center; padding: 14px; }}
   footer {{
     max-width: 1100px; margin: 0 auto 30px; padding: 0 20px;
     color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px;
@@ -477,13 +808,17 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   </div>
 </section>
 
+{slippage_section}
+
 <section>
   <h2>Trade Value</h2>
   <div class="section-note">
     Completed NIFTY / BANKNIFTY / SENSEX orders only (F&amp;O exchanges NFO / BFO), duplicates
     removed. Outliers are users whose
-    lot pct (lots / allocation &times; 100) is more than {deviation:g} standard deviation(s) from
-    their algo&rsquo;s average.
+    lot pct (combined lots across their segments &divide; allocation &times; 100) is more than
+    {deviation:g} standard deviation(s) from their algo&rsquo;s average. All columns count
+    users, so Below + In + Above = Total Users (users with no usable allocation carry
+    no flag).
   </div>
   {tv_kpis}
   <div class="card scroll">
@@ -492,6 +827,10 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
 </section>
 
 {boxplot_section}
+
+{outliers_section}
+
+{strikes_section}
 
 </main>
 <footer>

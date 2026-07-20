@@ -286,10 +286,19 @@ def _pivot_row_style(row):
     return [style] * len(row)
 
 
+def _pnl_color(value):
+    """Profit green / loss red for the Realized, Unrealized and MTM columns."""
+    if pd.isna(value) or value == 0:
+        return ""
+    return ("color:#15803D;font-weight:600" if value > 0
+            else "color:#DC2626;font-weight:600")
+
+
 styled = (
     pivot_df.style
     .apply(_pivot_row_style, axis=1)
     .set_properties(**{"text-align": "center"})
+    .map(_pnl_color, subset=["Realized P&L", "Unrealized P&L", "MTM"])
     .format({
         "MAX LOSS": "{:,.0f}", "ALLOCATION": "{:,.0f}", "Realized P&L": "{:,.0f}",
         "Unrealized P&L": "{:,.0f}", "MTM": "{:,.0f}",
@@ -298,31 +307,33 @@ styled = (
 )
 st.dataframe(styled, width="stretch", hide_index=True, height=600)
 
-# ---- Slippage (SL-hit / squared-off accounts) ----
-st.header("Sq-Off Slippage (SL-Hit Accounts)")
+# ---- Slippage (realized loss % beyond max-loss %) ----
+st.header("Slippage")
 st.caption(
-    "Slippage = |compiled Realized P&L| − MAX LOSS for accounts whose SL was hit. "
-    "Positive = the account lost more than its configured max loss (a major slippage); "
-    "negative = squared off inside the limit. Slippage % is relative to MAX LOSS."
+    "ML % = MAX LOSS / ALLOCATION; Realized ML % = |Realized P&L| / ALLOCATION — plain ratios "
+    "of allocation, same convention as Return %. An account has slippage only when Realized "
+    "ML % exceeds ML % by at least 0.1 (1.00 → 1.09 is not slippage; 1.10 is). Avg Slippage = "
+    "average Realized ML % of the algo's slippage accounts; Major = slippage accounts above "
+    "their algo's average."
 )
 slip_rows = seg.slippage_rows(dor_state["comp"])
-slip_algo, slip_overall = seg.slippage_summary(slip_rows)
-slip_majors = seg.major_slippages(slip_rows)
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("SL-Hit Accounts", slip_overall["count"])
-k2.metric("Over Max Loss", slip_overall["over"])
-k3.metric("Avg Slippage", f"{slip_overall['avg_slippage']:,.0f}")
-k4.metric("Slippage %", f"{slip_overall['slippage_pct']:.2f}"
-          if slip_overall["slippage_pct"] is not None else "—")
-if slip_rows:
+slip_algo, slip_overall = seg.slippage_summary(slip_rows, dor_state["comp"])
+slip_majors = seg.major_slippages(slip_rows, slip_algo)
+if not slip_rows:
+    st.info("-- No slippage today --")
+else:
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Accounts", slip_overall["accounts"])
+    k2.metric("Slippage Accounts", slip_overall["slipped"])
+    k3.metric("Avg Slippage %", f"{slip_overall['avg_slippage']:.2f}")
+    k4.metric("Major Slippages", len(slip_majors))
     sl1, sl2 = st.columns(2)
     with sl1:
         st.subheader("Avg Slippage per Algo")
         df_slip_sum = pd.DataFrame(
             [
-                [s["ALGO"], s["count"], s["over"], round(s["max_loss"]), round(s["realized"]),
-                 round(s["avg_slippage"]),
-                 round(s["slippage_pct"], 2) if s["slippage_pct"] is not None else None]
+                [s["ALGO"], s["accounts"], s["slipped"],
+                 round(s["avg_slippage"], 2) if s["avg_slippage"] is not None else None]
                 for s in slip_algo + [slip_overall]
             ],
             columns=seg.SLIP_SUMMARY_HEADERS,
@@ -330,23 +341,22 @@ if slip_rows:
         st.dataframe(df_slip_sum.style.set_properties(**{"text-align": "center"}),
                      width="stretch", hide_index=True)
     with sl2:
-        st.subheader("Major Slippages (over max loss)")
+        st.subheader("Major Slippages")
         if slip_majors:
             df_majors = pd.DataFrame(
                 [
                     [seg._algo_val(r["ALGO"]), r["SERVER"], r["UserID"], r["Alias"],
-                     round(r["MaxLoss"]), round(r["Realized"]), round(r["Slippage"]),
-                     round(r["SlippagePct"], 2) if r["SlippagePct"] is not None else None]
+                     round(r["Allocation"]), round(r["MaxLoss"]), round(r["Realized"]),
+                     round(r["MLPct"], 2), round(r["RealizedMLPct"], 2),
+                     round(r["DiffPct"], 2), round(r["AlgoAvgSlippage"], 2)]
                     for r in slip_majors
                 ],
-                columns=seg.SLIP_DETAIL_HEADERS,
+                columns=seg.SLIP_MAJOR_HEADERS,
             )
             st.dataframe(df_majors.style.set_properties(**{"text-align": "center"}),
                          width="stretch", hide_index=True)
         else:
-            st.info("No account lost more than its configured max loss.")
-else:
-    st.info("No SL-hit accounts in this report.")
+            st.info("No slippage account is above its algo's average.")
 
 # ---- Trade Value (after the pivot) ----
 st.header("Trade Value")
@@ -505,6 +515,8 @@ dor_html = build_dor_html(
     outliers=outlier_rows,
     outlier_deviation=float(client_deviation),
     slippage={"summary": slip_algo, "overall": slip_overall, "majors": slip_majors},
+    excel_bytes=excel_buffer.getvalue(),
+    excel_filename=f"DOR_{report_date or 'report'}.xlsx",
 )
 
 d1, d2 = st.columns(2)

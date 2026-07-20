@@ -7,6 +7,7 @@ Int / Pos+Int segregation pivot. The full row-level data stays in the Excel
 workbook; this file is the client-facing view.
 """
 
+import base64
 import html
 import json
 import math
@@ -29,12 +30,22 @@ def _esc(v):
 
 
 def _kpi_tiles(pairs):
-    tiles = "".join(
-        f'<div class="kpi"><div class="kpi-label">{_esc(label)}</div>'
-        f'<div class="kpi-value">{_esc(value)}</div></div>'
-        for label, value in pairs
-    )
-    return f'<div class="kpi-grid">{tiles}</div>'
+    """Each pair is (label, value) or (label, value, css_class) — the class
+    colours the value (e.g. "pos"/"neg" for profit/loss)."""
+    tiles = []
+    for pair in pairs:
+        label, value = pair[0], pair[1]
+        cls = f" {pair[2]}" if len(pair) > 2 and pair[2] else ""
+        tiles.append(
+            f'<div class="kpi"><div class="kpi-label">{_esc(label)}</div>'
+            f'<div class="kpi-value{cls}">{_esc(value)}</div></div>'
+        )
+    return f'<div class="kpi-grid">{"".join(tiles)}</div>'
+
+
+def _sign_cls(value):
+    """CSS class for a P&L number: profit green, loss red, zero default."""
+    return "pos" if float(value) > 0 else ("neg" if float(value) < 0 else "")
 
 
 def _tv_summary_table(tv_summary):
@@ -69,20 +80,18 @@ def _pct_cell(value):
 
 
 def _slippage_tables(slippage):
-    """Avg slippage per algo (with overall row) and the major slippages —
-    SL-hit accounts that lost more than their configured max loss."""
+    """Avg slippage per algo (accounts / slippage accounts / avg Realized
+    ML % of the slippage accounts, with an overall row) and the major
+    slippages — accounts whose Realized ML % is above their algo's average."""
     sum_body = []
     for s in slippage["summary"] + [slippage["overall"]]:
         cls = ' class="grand"' if s["ALGO"] == "Overall" else ""
         sum_body.append(
             f"<tr{cls}>"
             f"<td>{_esc(s['ALGO'])}</td>"
-            f"<td>{s['count']}</td>"
-            f"<td>{s['over']}</td>"
-            f"<td>{_money(s['max_loss'])}</td>"
-            f"<td>{_money(s['realized'])}</td>"
-            f"<td>{_money(s['avg_slippage'])}</td>"
-            f"<td>{_pct_cell(s['slippage_pct'])}</td>"
+            f"<td>{s['accounts']}</td>"
+            f"<td>{s['slipped']}</td>"
+            f"<td>{_pct_cell(s['avg_slippage'])}</td>"
             "</tr>"
         )
     summary_tbl = f"""
@@ -90,8 +99,7 @@ def _slippage_tables(slippage):
         <div class="tbl-scroll">
         <table class="tbl">
           <thead><tr>
-            <th>Algo</th><th>SL-Hit Users</th><th>Over Max Loss</th><th>Total Max Loss</th>
-            <th>Total Realized P&amp;L</th><th>Avg Slippage</th><th>Slippage %</th>
+            <th>Algo</th><th>Accounts</th><th>Slippage Accounts</th><th>Avg Slippage %</th>
           </tr></thead>
           <tbody>{''.join(sum_body)}</tbody>
         </table>
@@ -105,26 +113,31 @@ def _slippage_tables(slippage):
                 f"<td>{_esc(r['ALGO'])}</td>"
                 f"<td>{_esc(r['SERVER'])}</td>"
                 f"<td>{_esc(r['UserID'])}</td>"
+                f"<td>{_money(r['Allocation'])}</td>"
                 f"<td>{_money(r['MaxLoss'])}</td>"
-                f"<td>{_money(r['Realized'])}</td>"
-                f'<td class="above">{_money(r["Slippage"])}</td>'
-                f"<td>{_pct_cell(r['SlippagePct'])}</td>"
+                f"{_pnl_td(r['Realized'])}"
+                f"<td>{_num2(r['MLPct'])}</td>"
+                f'<td class="above">{_num2(r["RealizedMLPct"])}</td>'
+                f"<td>{_num2(r['DiffPct'])}</td>"
+                f"<td>{_num2(r['AlgoAvgSlippage'])}</td>"
                 "</tr>"
             )
         majors_tbl = f"""
-        <h3>Major Slippages (over max loss)</h3>
+        <h3>Major Slippages</h3>
         <div class="tbl-scroll">
         <table class="tbl">
           <thead><tr>
-            <th>Algo</th><th>Server</th><th>User ID</th><th>Max Loss</th>
-            <th>Realized P&amp;L</th><th>Slippage</th><th>Slippage %</th>
+            <th>Algo</th><th>Server</th><th>User ID</th><th>Allocation</th><th>Max Loss</th>
+            <th>Realized P&amp;L</th><th>ML %</th><th>Realized ML %</th><th>Diff %</th>
+            <th>Algo Avg %</th>
           </tr></thead>
           <tbody>{''.join(maj_body)}</tbody>
         </table>
         </div>"""
     else:
-        majors_tbl = ('<h3>Major Slippages (over max loss)</h3>'
-                      '<div class="empty-note">No account lost more than its configured max loss.</div>')
+        majors_tbl = ('<h3>Major Slippages</h3>'
+                      '<div class="empty-note">No slippage account is above its '
+                      'algo&rsquo;s average.</div>')
 
     return f"""
     <div class="strike-grid">
@@ -437,15 +450,21 @@ def _boxplot_svg(boxplot_rows):
     return legend + svg
 
 
+def _pnl_td(value):
+    """Table cell for a P&L amount — profit green, loss red."""
+    cls = _sign_cls(value)
+    return f'<td class="{cls}">{_money(value)}</td>' if cls else f"<td>{_money(value)}</td>"
+
+
 def _metric_cells(r):
     return (
         f"<td>{r['Users']}</td>"
         f"<td>{r['SLHit']}</td>"
         f"<td>{_money(r['MaxLoss'])}</td>"
         f"<td>{_money(r['Allocation'])}</td>"
-        f"<td>{_money(r['Realized'])}</td>"
-        f"<td>{_money(r['Unrealized'])}</td>"
-        f"<td>{_money(r['MTM'])}</td>"
+        f"{_pnl_td(r['Realized'])}"
+        f"{_pnl_td(r['Unrealized'])}"
+        f"{_pnl_td(r['MTM'])}"
         f"<td>{_num2(r['Return'])}</td>"
         f"<td>{_num2(r['P95'])}</td>"
         f"<td>{_num2(r['P5'])}</td>"
@@ -576,15 +595,17 @@ _PIVOT_SCRIPT = """
 
 def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, pivot_rows,
                    boxplot_rows=None, strikes=None, outliers=None, outlier_deviation=None,
-                   slippage=None):
+                   slippage=None, excel_bytes=None, excel_filename=None):
     """Assemble the complete DOR.html document and return it as a string.
     `boxplot_rows` (per-user observations from tradevalue.
     user_lot_observations) feeds the box plot; `strikes` (from
     tradevalue.strike_report) feeds the strikes section; `outliers` (from
     tradevalue.outlier_clients, flagged at `outlier_deviation` std devs)
     feeds the outlier clients section; `slippage` ({"summary", "overall",
-    "majors"} from segregate_int_pos_mtm2) feeds the sq-off slippage section.
-    Each section is skipped when its data is omitted."""
+    "majors"} from segregate_int_pos_mtm2) feeds the slippage section;
+    `excel_bytes`/`excel_filename` embed the full workbook as a download
+    button in the masthead. Each section is skipped when its data is
+    omitted."""
     generated = datetime.now().strftime("%d-%b-%Y %H:%M")
     grand = next((r for r in pivot_rows if r["kind"] == "grandtotal"), None)
 
@@ -602,12 +623,22 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     ]
     if grand:
         seg_pairs += [
-            ("Realized P&L", _money(grand["Realized"])),
-            ("Unrealized P&L", _money(grand["Unrealized"])),
-            ("MTM", _money(grand["MTM"])),
+            ("Realized P&L", _money(grand["Realized"]), _sign_cls(grand["Realized"])),
+            ("Unrealized P&L", _money(grand["Unrealized"]), _sign_cls(grand["Unrealized"])),
+            ("MTM", _money(grand["MTM"]), _sign_cls(grand["MTM"])),
             ("Return %", _num2(grand["Return"])),
         ]
     seg_kpis = _kpi_tiles(seg_pairs)
+
+    download_btn = ""
+    if excel_bytes:
+        b64 = base64.b64encode(excel_bytes).decode("ascii")
+        fname = excel_filename or "DOR.xlsx"
+        download_btn = (
+            f'<a class="dl-btn" download="{_esc(fname)}" '
+            f'href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;'
+            f'base64,{b64}">&#11015; Download Excel &mdash; full data</a>'
+        )
 
     boxplot = _boxplot_svg(boxplot_rows) if boxplot_rows else ""
     boxplot_section = f"""
@@ -620,16 +651,25 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   </div>
 </section>""" if boxplot else ""
 
-    slippage_section = f"""
+    if slippage is None:
+        slippage_section = ""
+    else:
+        slippage_note = """
+  <div class="section-note">ML % = MAX LOSS / ALLOCATION; Realized ML % =
+  |Realized P&amp;L| / ALLOCATION &mdash; plain ratios of allocation, same convention as
+  Return %. An account has slippage only when Realized ML % exceeds ML % by at least 0.1
+  (1.00 &rarr; 1.09 is not slippage; 1.10 is). Avg Slippage = average Realized ML % of the
+  algo&rsquo;s slippage accounts; Major = slippage accounts above their algo&rsquo;s
+  average.</div>"""
+        slippage_body = (_slippage_tables(slippage) if slippage["overall"]["slipped"]
+                         else '<div class="card"><div class="empty-note">'
+                              '-- No slippage today --</div></div>')
+        slippage_section = f"""
 <section>
-  <h2>Sq-Off Slippage (SL-Hit Accounts)</h2>
-  <div class="section-note">Slippage = |compiled Realized P&amp;L| &minus; MAX LOSS for accounts
-  whose SL was hit (squared off). Positive = the account lost <b>more</b> than its configured
-  max loss &mdash; a major slippage; negative = squared off inside the limit. Slippage % is
-  relative to the account&rsquo;s MAX LOSS; the algo-level figure is total slippage / total
-  max loss.</div>
-  {_slippage_tables(slippage)}
-</section>""" if slippage is not None else ""
+  <h2>Slippage</h2>
+  {slippage_note}
+  {slippage_body}
+</section>"""
 
     k2 = outlier_deviation if outlier_deviation is not None else deviation
     outliers_section = f"""
@@ -723,6 +763,16 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .tbl tr.grand td {{ background: var(--grand); font-weight: 700; }}
   .tbl td.below {{ color: var(--below); font-weight: 600; }}
   .tbl td.above {{ color: #B45309; font-weight: 600; }}
+  .tbl td.pos {{ color: #15803D; font-weight: 600; }}
+  .tbl td.neg {{ color: #DC2626; font-weight: 600; }}
+  .kpi-value.pos {{ color: #15803D; }}
+  .kpi-value.neg {{ color: #DC2626; }}
+  .masthead .dl-btn {{
+    display: inline-block; margin-top: 12px; padding: 7px 16px; border-radius: 8px;
+    background: #334155; border: 1px solid #475569; color: #fff; text-decoration: none;
+    font-size: 12.5px; font-weight: 600;
+  }}
+  .masthead .dl-btn:hover {{ background: #475569; }}
   .scroll {{ overflow-x: auto; }}
   .strike-grid {{ display: grid; grid-template-columns: 1fr 1.4fr; gap: 14px;
                   align-items: start; }}
@@ -771,7 +821,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   @media print {{
     body {{ background: #fff; }}
     .card, .kpi {{ box-shadow: none; }}
-    .pivot-tools {{ display: none; }}
+    .pivot-tools, .masthead .dl-btn {{ display: none; }}
     .masthead {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     .tbl th, .tbl tr.subtotal td, .tbl tr.algototal td, .tbl tr.grand td,
     .dot {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
@@ -784,6 +834,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     <div class="date">Report date<b>{_esc(report_date)}</b></div>
     <h1>Daily Operations Report</h1>
     <div class="sub">Trade Value &amp; Intraday / Positional Segregation — summary view</div>
+    {download_btn}
   </div>
 </div>
 <main>

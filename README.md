@@ -8,8 +8,8 @@ A Streamlit app (plus standalone CLIs) that turns four raw inputs into the daily
    stricter **Outlier Clients** list at a second deviation.
 2. **Intraday / Positional segregation** (§2) — a pivot of Realized/Unrealized P&L per algo →
    Int / Pos+Int → server, with max-loss addons applied to positional accounts, the worst-10%ile
-   exception report, and the **sq-off slippage** view (realized loss vs configured max loss for
-   SL-hit accounts).
+   exception report, and the **slippage** view (accounts whose realized loss / allocation
+   overshoots their max-loss / allocation by ≥ 0.1).
 
 Outputs: one Excel workbook `DOR_<date>.xlsx` (8 sheets: `tradevalue`, `summary`, `Strikes`,
 `Outlier Clients`, `Segregation`, `Raw_Data_Per_User`, `Worst 10%ile`, `Slippage`) and one
@@ -278,7 +278,9 @@ accounts − positional, `Noren` = rows with User Type "Noren".
 Aggregate cells are written as live formulas so the sheet stays auditable in Excel:
 Sub-Totals use `=SUM(...)` over their data block, Algo/Grand Totals add the sub-total rows,
 and every `Return %` cell is `=IF(G{row}=0,0,H{row}/G{row})` (Realized ÷ Allocation).
-P5/P95 are written as computed values.
+P5/P95 are written as computed values. The Realized / Unrealized / MTM columns carry
+conditional formatting — profit green, loss red — that keeps recolouring as the formulas
+recalculate.
 
 ## 2.5 Raw_Data_Per_User sheet
 
@@ -300,27 +302,35 @@ Per **Algo × Int/Pos** group:
   3. return < 0 → **"Negative return"**
   4. otherwise → **"Low relative return"**
 
-## 2.7 Sq-off slippage (`Slippage` sheet)
+## 2.7 Slippage (`Slippage` sheet)
 
-For every account whose **SL was hit** (`SL HIT/NOT == 1` — the squared-off accounts counted in
-the pivot):
+Evaluated over **all** accounts with `ALLOCATION > 0`, both limits expressed as plain **ratios**
+of the account's allocation (positive numbers = loss; the same unit convention as the pivot's
+`Return %` — **not** multiplied by 100):
 
 ```
-Slippage   = |compiled Realized P&L| − MAX LOSS
-Slippage % = Slippage / MAX LOSS × 100          (blank when MAX LOSS is 0)
+ML %          = MAX LOSS / ALLOCATION
+Realized ML % = |compiled Realized P&L| / ALLOCATION
 ```
 
-Positive slippage = the account lost **more** than its configured max loss; negative = it was
-squared off inside the limit. The **compiled** Realized P&L is used (no positional addons) —
-slippage measures the intraday square-off itself. Per-order slippage (trigger vs fill) is not
-derivable from the orderbook: it carries no stop-loss orders (all LIMIT/MARKET, no trigger
-prices).
+An account **has slippage** only when its realized loss overshoots the configured max-loss by
+**at least 0.1**:
 
-- **Avg slippage** — per algo + overall: SL-hit count, how many exceeded max loss, totals,
-  the mean slippage per account (₹) and the value-weighted `Slippage % = Σ slippage / Σ max loss`.
-- **Major slippages** — the accounts with positive slippage (lost more than max loss), sorted
-  worst-first. The Excel sheet lists **all** SL-hit accounts with the major rows highlighted;
-  the dashboard and DOR.html show the major table alongside the per-algo summary.
+```
+Realized ML % − ML % ≥ 0.1
+```
+
+so ML% 1.00 → Realized 1.09 is *not* slippage, 1.10 is; a profit or a loss inside the limit is
+never slippage. The **compiled** Realized P&L is used (no positional addons). Per-order slippage
+(trigger vs fill) is not derivable from the orderbook: it carries no stop-loss orders.
+
+- **Avg slippage** — per algo + overall: total accounts, slippage accounts, and
+  `Avg Slippage % = mean Realized ML %` over the algo's **slippage accounts** ("—" when none).
+- **Major slippages** — the slippage accounts whose `Realized ML %` is **greater than their
+  algo's Avg Slippage %**, sorted worst-first. The Excel sheet lists **all** slippage accounts
+  with the major rows highlighted; the dashboard and DOR.html show the major table alongside
+  the per-algo summary.
+- A day with no slippage accounts shows **"-- No slippage today --"** in all three outputs.
 
 ## 2.8 Report date
 
@@ -334,14 +344,17 @@ Pure presentation — no new math. It embeds the already-computed numbers into a
 self-contained HTML file: KPI tiles, the per-algo trade-value outlier summary, the box plot as
 inline SVG (same quartile/whisker/point rules as §1.10, with deterministic point jitter so stacked
 outliers stay visible), the outlier clients table (§1.11), the two strikes tables (§1.9, side by
-side), the sq-off slippage summary and major slippages (§2.7), and the segregation pivot as a
+side), the slippage summary and major slippages (§2.7), and the segregation pivot as a
 click-to-drill-down table (Algo → Int / Pos+Int → servers).
 
 Presentation rules: every table is center-aligned — data and headers — for the client-facing
-look. In the side-by-side cards (strikes, slippage) the card title and the expiry/index dropdowns
-stay fixed and only the table body scrolls, with the sticky header flush at the scroll top. The
-strikes/chain dropdown filters are precomputed lookups embedded in the page — no recalculation in
-the browser. Row-level data intentionally stays out of the HTML; it lives in the Excel workbook.
+look. Realized P&L / Unrealized P&L / MTM values are coloured by sign (profit green, loss red)
+in the pivot and the KPI tiles. In the side-by-side cards (strikes, slippage) the card title and
+the expiry/index dropdowns stay fixed and only the table body scrolls, with the sticky header
+flush at the scroll top. The strikes/chain dropdown filters are precomputed lookups embedded in
+the page — no recalculation in the browser. The masthead carries a **Download Excel** button with
+the full 8-sheet workbook embedded in the page (base64 data URI — the HTML stays a single
+self-contained file); row-level data otherwise stays out of the HTML.
 
 ---
 

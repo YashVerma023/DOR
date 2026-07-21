@@ -25,6 +25,8 @@ running it directly keeps the original interactive CLI flow.
 
 import os
 import pandas as pd
+
+from tradevalue import INDIAN_XLSX_FMT
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
@@ -223,6 +225,21 @@ def aggregate(sub: pd.DataFrame):
         unreal   = g["Unrealized P&L"].sum()
         alloc    = g["ALLOCATION"].sum()
         p5, p95  = pct_returns(g)
+        # the server's account detail — the deepest drill level of the pivot
+        # (worst realized first)
+        user_rows = [
+            {
+                "UserID": rec["UserID"],
+                "Alias": "" if pd.isna(rec["Alias"]) else str(rec["Alias"]),
+                "SLHit": int(rec["SL HIT/NOT"] == 1),
+                "MaxLoss": float(rec["MAX LOSS"]),
+                "Allocation": float(rec["ALLOCATION"]),
+                "Realized": float(rec["AdjRealized"]),
+                "Return": float(rec["UserReturn"]),
+            }
+            for _, rec in g.iterrows()
+        ]
+        user_rows.sort(key=lambda u: u["Realized"])
         rows.append({
             "ALGO"      : g["ALGO"].iloc[0],
             "SERVER"    : server,
@@ -236,6 +253,7 @@ def aggregate(sub: pd.DataFrame):
             "Return"    : (realized / alloc) if alloc else 0.0,
             "P95"       : p95,
             "P5"        : p5,
+            "UserRows"  : user_rows,
         })
     rows.sort(key=lambda x: str(x["SERVER"]))
     return rows
@@ -243,7 +261,7 @@ def aggregate(sub: pd.DataFrame):
 
 # ====================== STYLES ======================
 HEADERS = ["ALGO", "SERVER", "No. of Users", "No. of SL Hit Users", "MAX LOSS",
-           "ALLOCATION", "Realized P&L", "Unrealized P&L", "MTM", "Return %",
+           "ALLOCATION", "Realized P&L", "Unrealized P&L", "MTM", "P&L %",
            "95%", "5%"]
 KEYS    = ["ALGO", "SERVER", "Users", "SLHit", "MaxLoss",
            "Allocation", "Realized", "Unrealized", "MTM", "Return",
@@ -350,7 +368,7 @@ def write_data_row(ws, row, rowdict, fill, is_bold=False, bdr=None):
             cell.value = _algo_val(rowdict[key])
         elif key in MONEY_KEYS:
             cell.value         = round(float(rowdict[key]))
-            cell.number_format = "#,##0"
+            cell.number_format = INDIAN_XLSX_FMT
         elif key in PCT_KEYS:
             cell.value         = round(float(rowdict[key]), 4)
             cell.number_format = "0.00"
@@ -374,7 +392,7 @@ def write_subtotal_row(ws, row, data_start, data_end, fill, n_servers, pct=None,
             cl             = KEY_COL[key]
             cell.value     = f"=SUM({cl}{data_start}:{cl}{data_end})"
             if key in MONEY_KEYS:
-                cell.number_format = "#,##0"
+                cell.number_format = INDIAN_XLSX_FMT
         elif key == "Return":
             cell.value         = f"=IF(G{row}=0,0,H{row}/G{row})"
             cell.number_format = "0.00"
@@ -400,7 +418,7 @@ def write_total_row(ws, row, label, n_servers, ref_rows, fill, pct=None, is_bold
             formula    = "+".join(f"{cl}{rr}" for rr in ref_rows)
             cell.value = f"={formula}"
             if key in MONEY_KEYS:
-                cell.number_format = "#,##0"
+                cell.number_format = INDIAN_XLSX_FMT
         elif key == "Return":
             cell.value         = f"=IF(G{row}=0,0,H{row}/G{row})"
             cell.number_format = "0.00"
@@ -474,6 +492,12 @@ def pivot_rows(comp):
                     "Return": round(float(rowdict["Return"]), 2),
                     "P95": round(float(rowdict["P95"]), 2),
                     "P5": round(float(rowdict["P5"]), 2),
+                    "user_rows": [
+                        {"UserID": u["UserID"], "Alias": u["Alias"], "SLHit": u["SLHit"],
+                         "MaxLoss": round(u["MaxLoss"]), "Allocation": round(u["Allocation"]),
+                         "Realized": round(u["Realized"]), "Return": round(u["Return"], 2)}
+                        for u in rowdict["UserRows"]
+                    ],
                 })
             sub_row = block_row("subtotal", display_label, "Sub-Total",
                                 sub["SERVER"].nunique(), sub)
@@ -640,7 +664,7 @@ def _write_slippage_sheet(wb, comp, report_date):
                 if is_major:
                     cell.fill = major_fill
                 if j in (5, 6, 7):
-                    cell.number_format = "#,##0"
+                    cell.number_format = INDIAN_XLSX_FMT
                 elif j in (8, 9, 10):
                     cell.number_format = "0.00"
             r += 1
@@ -884,7 +908,7 @@ def _write_raw_sheet(wb, comp):
             cell.border = inner_bdr
             if hdr in money_cols and isinstance(val, (int, float)):
                 cell.value         = float(val)
-                cell.number_format = "#,##0"
+                cell.number_format = INDIAN_XLSX_FMT
             if hdr in ("Type", "ALGO", "SERVER", "SL Hit"):
                 cell.alignment = center
 
@@ -1003,7 +1027,7 @@ def _write_worst_sheet(wb, comp, algos, report_date):
                     cell.fill   = d_fill
                     cell.border = inner_bdr
                     if hdr in W_MONEY:
-                        cell.number_format = "#,##0"
+                        cell.number_format = INDIAN_XLSX_FMT
                         cell.alignment     = center
                     elif hdr in W_PCT:
                         cell.number_format = "0.00"

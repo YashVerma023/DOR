@@ -47,8 +47,6 @@ SUMMARY_HEADER = ["Algo", "Total Users", "Avg Lot Pct", "Std Dev", "Band", "Belo
 STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
 
-OUTLIER_CLIENTS_HEADER = ["Algo", "Server", "User ID", "Average Lots",
-                          "Outlier", "Lots Fired", "Diff of Lots"]
 
 # Outliers are judged per (date, algo) group by standard deviation: a row is
 # "in range" when its lot pct lies within mean +/- k * std dev of the group's
@@ -81,6 +79,51 @@ def _decimal(value, default="0"):
         return Decimal(str(value).replace(",", "").strip())
     except (InvalidOperation, ValueError):
         return Decimal(default)
+
+
+# Excel number format with Indian digit grouping (16,44,536 / 5,72,58,680);
+# the escaped-comma groups drop automatically for smaller magnitudes, and the
+# first two conditional sections keep crore-scale values grouped on both signs.
+INDIAN_XLSX_FMT = (r"[>=10000000]##\,##\,##\,##\,##0;"
+                   r"[<=-10000000]-##\,##\,##\,##\,##0;"
+                   r"##\,##\,##0")
+
+
+def format_indian(value, places=0):
+    """Indian-style digit grouping: 1644536 -> "16,44,536" (last three
+    digits, then groups of two)."""
+    text = f"{float(value):.{places}f}"
+    sign = "-" if text.startswith("-") else ""
+    text = text.lstrip("-")
+    int_part, _, frac = text.partition(".")
+    if len(int_part) > 3:
+        head, tail = int_part[:-3], int_part[-3:]
+        groups = []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            groups.insert(0, head)
+        int_part = ",".join(groups + [tail])
+    return sign + int_part + (("." + frac) if frac else "")
+
+
+def format_crore(value):
+    """Compact Indian units: 13418000000 -> "1,341.8 Cr", 4038000000 ->
+    "403.8 Cr"; below a crore -> lakhs ("53.5 L"); below a lakh -> plain
+    Indian-grouped number."""
+    v = float(value)
+    magnitude = abs(v)
+    if magnitude >= 1e7:
+        scaled, unit = v / 1e7, " Cr"
+    elif magnitude >= 1e5:
+        scaled, unit = v / 1e5, " L"
+    else:
+        return format_indian(v)
+    text = format_indian(scaled, places=2)
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text + unit
 
 
 def _fmt_decimal(value, places=2):
@@ -296,8 +339,24 @@ def _cell(row, idx):
 
 Order = namedtuple(
     "Order",
-    "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol",
+    "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol "
+    "category",
 )
+
+# Order tags mark the trade kind: "h_..." = hedge, "v_..." = VAR, "s_..." =
+# square-off; anything else is a normal trade.
+ORDER_CATEGORIES = ("normal", "hedge", "var", "sqoff")
+
+
+def _order_category(tag):
+    text = str(tag or "").strip().lower()
+    if text.startswith("h_"):
+        return "hedge"
+    if text.startswith("v_"):
+        return "var"
+    if text.startswith("s_"):
+        return "sqoff"
+    return "normal"
 
 
 FO_EXCHANGES = {"BFO", "NFO"}
@@ -327,6 +386,7 @@ def read_orderbook(source, name=None):
     i_order_id = col("order_id", "orderid", "order id")
     i_exch_order_id = col("exchg_order_id", "exch_order_id", "exchange_order_id", "exchgorderid")
     i_rowid = col("row_id", "id", "sno")
+    i_tag = col("tag")
     if i_symbol is None or i_avg is None or i_qty is None:
         raise ValueError("orderbook is missing the symbol / avg price / quantity columns")
 
@@ -355,6 +415,7 @@ def read_orderbook(source, name=None):
             order_id=_cell(raw, i_order_id),
             exch_order_id=_cell(raw, i_exch_order_id),
             symbol=sys.intern(symbol),
+            category=_order_category(_cell(raw, i_tag)),
         ))
     return orders
 
@@ -673,85 +734,6 @@ def format_summary_row(row):
     ]
 
 
-def outlier_clients(rows, std_multiplier):
-    """The stricter "outlier clients" view: USERS whose per-user lot pct
-    (combined lots ÷ combined allocation, see user_lot_observations) falls
-    outside mean ± k·σ of their (date, algo) group, where k is the CLIENT
-    deviation — asked separately from (and typically wider than) the flagging
-    deviation, e.g. 2 vs 1. One row per user — a user trading two segments is
-    judged once on their combined exposure.
-
-    The group band is a lot-pct band, so it is translated into LOTS through
-    the user's own allocation: "Average Lots" is the in-range lots window for
-    THAT user (lower edge clamped at 0 — nobody can fire negative lots) and
-    "Diff of Lots" is how many lots beyond the nearest edge the user actually
-    fired. Sorted worst-first (largest lots difference) within date/algo."""
-    out = []
-    for o in user_lot_observations(rows, std_multiplier):
-        if o["outlier"] not in ("Below average range", "Above average range"):
-            continue
-        allocation = o["allocation"]
-        low_lots = max(o["band_low"], Decimal("0")) * allocation / 100
-        high_lots = o["band_high"] * allocation / 100
-        above = o["outlier"] == "Above average range"
-        out.append({
-            "trade_date": o["trade_date"],
-            "algo": o["algo"],
-            "server": o["server"],
-            "user_id": o["user_id"],
-            "band_low_lots": low_lots,
-            "band_high_lots": high_lots,
-            "outlier": o["outlier"],
-            "lots": o["lots"],
-            "diff_lots": (o["lots"] - high_lots) if above else (low_lots - o["lots"]),
-        })
-    out.sort(key=lambda r: (
-        (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])),
-        -r["diff_lots"],
-    ))
-    out.sort(key=lambda r: r["trade_date"] or date.min, reverse=True)
-    return out
-
-
-def format_lots_band(row):
-    """Display form of an outlier row's expected-lots window, e.g. "400 – 500"."""
-    return f"{int(round(row['band_low_lots'])):,} – {int(round(row['band_high_lots'])):,}"
-
-
-def add_outlier_clients_sheet(workbook, outlier_rows):
-    """Append the "Outlier Clients" sheet: one row per report row outside the
-    client deviation band, band and difference in whole lots."""
-    from openpyxl.styles import Alignment, Font
-    from openpyxl.utils import get_column_letter
-
-    sheet = workbook.create_sheet("Outlier Clients")
-    sheet.append(OUTLIER_CLIENTS_HEADER)
-    for row in outlier_rows:
-        sheet.append([
-            row["algo"],
-            row["server"],
-            row["user_id"],
-            format_lots_band(row),
-            row["outlier"],
-            int(round(row["lots"])),
-            int(round(row["diff_lots"])),
-        ])
-    bold = Font(bold=True)
-    center = Alignment(horizontal="center")
-    for col_idx, title in enumerate(OUTLIER_CLIENTS_HEADER, start=1):
-        sheet.cell(row=1, column=col_idx).font = bold
-        sheet.column_dimensions[get_column_letter(col_idx)].width = max(len(title) + 6, 14)
-    lots_col = OUTLIER_CLIENTS_HEADER.index("Lots Fired") + 1
-    diff_col = OUTLIER_CLIENTS_HEADER.index("Diff of Lots") + 1
-    for r in range(1, sheet.max_row + 1):
-        for c in range(1, len(OUTLIER_CLIENTS_HEADER) + 1):
-            sheet.cell(r, c).alignment = center
-        if r > 1:
-            sheet.cell(r, lots_col).number_format = "#,##0"
-            sheet.cell(r, diff_col).number_format = "#,##0"
-    sheet.freeze_panes = "A2"
-
-
 def strike_report(orders, allocations=None):
     """The two strike summaries, computed over (deduped) orders:
 
@@ -791,9 +773,14 @@ def strike_report(orders, allocations=None):
         algo = entry["algo"] if entry else server_algo.get(server_key, "")
         by_algo_server.setdefault((algo, server_key), set()).add(contract)
         lot_size = _LOT_SIZE_BY_SEGMENT[row.segment](row.trade_date)
-        group = per_strike.setdefault(contract, {"lots": Decimal("0"), "order_count": 0})
-        group["lots"] += abs(row.qty) / lot_size
+        group = per_strike.setdefault(contract, {"lots": Decimal("0"), "order_count": 0,
+                                                 "breakdown": {}})
+        lots = abs(row.qty) / lot_size
+        group["lots"] += lots
         group["order_count"] += 1
+        # per (algo, trade kind) split — feeds the chain's hedge/var/sqoff/algo filters
+        bkey = (algo, row.category)
+        group["breakdown"][bkey] = group["breakdown"].get(bkey, Decimal("0")) + lots
 
     # each row keeps its contract set so the count can be re-filtered by
     # expiry / index in the dashboard and DOR.html
@@ -810,7 +797,8 @@ def strike_report(orders, allocations=None):
     ))
     strike_rows = [
         {"segment": c[0], "expiry": c[1], "strike": c[2], "opt_type": c[3],
-         "label": contract_label(c), "lots": g["lots"], "order_count": g["order_count"]}
+         "label": contract_label(c), "lots": g["lots"], "order_count": g["order_count"],
+         "breakdown": g["breakdown"]}
         for c, g in per_strike.items()
     ]
     strike_rows.sort(key=lambda r: (r["segment"], r["expiry"], r["strike"], r["opt_type"]))
@@ -872,9 +860,9 @@ def add_strikes_sheet(workbook, strikes):
         r += 1
         ce_total = pe_total = Decimal("0")
         for ce, strike, pe in rows:
-            sheet.cell(row=r, column=offset, value=int(round(ce))).number_format = "#,##0"
+            sheet.cell(row=r, column=offset, value=int(round(ce))).number_format = INDIAN_XLSX_FMT
             sheet.cell(row=r, column=offset + 1, value=strike)
-            sheet.cell(row=r, column=offset + 2, value=int(round(pe))).number_format = "#,##0"
+            sheet.cell(row=r, column=offset + 2, value=int(round(pe))).number_format = INDIAN_XLSX_FMT
             ce_total += ce
             pe_total += pe
             r += 1
@@ -882,7 +870,7 @@ def add_strikes_sheet(workbook, strikes):
             cell = sheet.cell(row=r, column=offset + j, value=value)
             cell.font = bold
             if j != 1:
-                cell.number_format = "#,##0"
+                cell.number_format = INDIAN_XLSX_FMT
         r += 2  # blank spacer row between chains
     sheet.freeze_panes = "A2"
 
@@ -955,11 +943,11 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
         ws.freeze_panes = "A2"
 
 
-def write_report_excel(rows, target, std_multiplier=None, strikes=None, outliers=None):
+def write_report_excel(rows, target, std_multiplier=None, strikes=None):
     """Write the report workbook: sheet "tradevalue" holds the full report,
-    sheet "summary" the per-algo outlier table, plus the "Strikes" /
-    "Outlier Clients" sheets when their data is given. `target` may be a
-    filesystem path or a writable buffer."""
+    sheet "summary" the per-algo outlier table, plus the "Strikes" sheet when
+    strike data is given. `target` may be a filesystem path or a writable
+    buffer."""
     from openpyxl import Workbook
 
     workbook = Workbook()
@@ -967,23 +955,21 @@ def write_report_excel(rows, target, std_multiplier=None, strikes=None, outliers
     add_report_sheets(workbook, rows, std_multiplier)
     if strikes:
         add_strikes_sheet(workbook, strikes)
-    if outliers is not None:
-        add_outlier_clients_sheet(workbook, outliers)
     workbook.save(target)
 
 
-def report_excel_bytes(rows, std_multiplier=None, strikes=None, outliers=None):
+def report_excel_bytes(rows, std_multiplier=None, strikes=None):
     buffer = io.BytesIO()
-    write_report_excel(rows, buffer, std_multiplier, strikes, outliers)
+    write_report_excel(rows, buffer, std_multiplier, strikes)
     return buffer.getvalue()
 
 
-def write_report(rows, output_path, std_multiplier=None, strikes=None, outliers=None):
+def write_report(rows, output_path, std_multiplier=None, strikes=None):
     if str(output_path).lower().endswith(".csv"):
         with open(output_path, "w", newline="", encoding="utf-8") as fh:
             fh.write(report_csv_text(rows))
     else:
-        write_report_excel(rows, output_path, std_multiplier, strikes, outliers)
+        write_report_excel(rows, output_path, std_multiplier, strikes)
 
 
 def report_totals(rows):
@@ -1021,16 +1007,11 @@ def main(argv=None):
                         help=f"output path, .xlsx or .csv (default: {DEFAULT_OUTPUT.name})")
     parser.add_argument("-d", "--deviation", type=float, default=1.0,
                         help="outlier threshold in standard deviations of the algo's lot pct (default 1)")
-    parser.add_argument("-c", "--client-deviation", type=float, default=2.0,
-                        help="stricter threshold for the Outlier Clients sheet (default 2)")
     args = parser.parse_args(argv)
 
     if args.deviation <= 0:
         parser.error("--deviation must be greater than 0")
-    if args.client_deviation <= 0:
-        parser.error("--client-deviation must be greater than 0")
     std_multiplier = Decimal(str(args.deviation))
-    client_multiplier = Decimal(str(args.client_deviation))
 
     inputs = args.inputs or _default_files(ORDERBOOK_PATTERN)
     if not inputs:
@@ -1066,17 +1047,15 @@ def main(argv=None):
 
     report_rows = aggregate(deduped, allocations, std_multiplier)
     strikes = strike_report(deduped, allocations)
-    outliers = outlier_clients(report_rows, client_multiplier)
-    write_report(report_rows, args.output, std_multiplier, strikes, outliers)
+    write_report(report_rows, args.output, std_multiplier, strikes)
 
     totals = report_totals(report_rows)
     matched = len({r["user_id"] for r in report_rows if r["allocation"] is not None})
     print(f"wrote {len(report_rows)} rows to {args.output}")
     print(f"allocation matched for {matched}/{totals['users']} users")
-    print(f"totals: {totals['users']} users | lots {_fmt_decimal(totals['lots'], places=0)} "
-          f"| trade value {_fmt_decimal(totals['trade_value'])}")
+    print(f"totals: {totals['users']} users | lots {format_indian(totals['lots'])} "
+          f"| trade value {format_indian(totals['trade_value'], places=2)}")
     print(f"strikes: {len(strikes['per_strike'])} distinct contracts")
-    print(f"outlier clients (±{args.client_deviation:g}σ): {len(outliers)} rows")
 
 
 if __name__ == "__main__":

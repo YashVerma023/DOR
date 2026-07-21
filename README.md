@@ -3,26 +3,32 @@
 A Streamlit app (plus standalone CLIs) that turns four raw inputs into the daily ops report:
 
 1. **Trade Value analysis** (§1) — per-user lots / trade value from the orderbook, with
-   statistical outlier flagging on per-user lot pct, the per-algo summary and box plot, the
-   strikes-traded views (counts per algo/server + a CE/Strike/PE option chain), and the
-   stricter **Outlier Clients** list at a second deviation.
+   statistical outlier flagging on per-user lot pct, the per-algo summary (a drill-down that
+   reveals the outlier user ids), and the strikes-traded views (algo → server counts + a
+   CE/Strike/PE option chain).
 2. **Intraday / Positional segregation** (§2) — a pivot of Realized/Unrealized P&L per algo →
    Int / Pos+Int → server, with max-loss addons applied to positional accounts, the worst-10%ile
    exception report, and the **slippage** view (accounts whose realized loss / allocation
    overshoots their max-loss / allocation by ≥ 0.1).
 
-Outputs: one Excel workbook `DOR_<date>.xlsx` (8 sheets: `tradevalue`, `summary`, `Strikes`,
-`Outlier Clients`, `Segregation`, `Raw_Data_Per_User`, `Worst 10%ile`, `Slippage`) and one
-self-contained, client-shareable `DOR_<date>.html` (all tables center-aligned, data and headers).
+3. **Portfolio analysis** (§4, optional — needs the Multileg Orders / MLOB input) — per
+   (algo, server) portfolio summary with per-user drill-down for the "QS" portfolios by
+   default, plus instant any-portfolio analysis inside the HTML report itself.
+
+Outputs: one Excel workbook `DOR_<date>.xlsx` (sheets: `tradevalue`, `summary`, `Strikes`,
+`Portfolio QS` when the MLOB is given, `Segregation`, `Raw_Data_Per_User`, `Worst 10%ile`,
+`Slippage`) and one self-contained, client-shareable `DOR_<date>.html` (all tables
+center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,536`).
 
 ## Files
 
 | File | Role |
 |---|---|
-| `app.py` | Streamlit UI — upload the 4 inputs, set the two outlier deviations, one **Process** click computes everything. Run with `streamlit run app.py`. |
-| `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain, outlier clients (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1 -c 2`). |
+| `app.py` | Streamlit UI — upload the inputs, set the outlier deviation, one **Process** click computes everything. Run with `streamlit run app.py`. |
+| `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1`). |
 | `segregate_int_pos_mtm2.py` | Segregation engine: pivot, raw per-user sheet, worst 10%ile, slippage (also an interactive CLI). |
-| `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters and the pivot drill-down are plain inline JS). |
+| `portfolio.py` | Portfolio analysis engine over the Multileg Orders (MLOB): per-portfolio / per-user PnL, QS summary, any-pattern reports. |
+| `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters, the drill-downs and the in-page portfolio analysis are plain inline JS). |
 
 ## Inputs
 
@@ -32,8 +38,11 @@ self-contained, client-shareable `DOR_<date>.html` (all tables center-aligned, d
 | Compiled User MTM (CSV/Excel) | Allocations + algo for trade value; the account universe for segregation |
 | Combined Max Loss — 1DTE (required) | Positional classification + realized-P&L addon |
 | Combined Max Loss — 4DTE (optional) | Extra addon for non-Noren positional accounts |
-| Outlier deviation `k` (default 1.0) | Width of the lot-pct outlier band (± k standard deviations) — drives the row flags, the algo summary band and the box plot |
-| Client outlier deviation `k₂` (default 2.0) | Stricter band for the **Outlier Clients** view (§1.11) — changing it does not require reprocessing |
+| Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
+| Outlier deviation `k` (default 1.0) | Width of the lot-pct outlier band (± k standard deviations) — drives the flags and the algo summary band |
+| NIFTY / SENSEX day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
+| Segregation algos (multiselect, empty = all) | Which algos the Int / Pos+Int pivot and its KPI summary cover (§2.3) — dashboard and DOR.html; populated after the first Process |
+| Slippage algos (multiselect, empty = all) | Which algos the slippage analysis covers (§2.7) — applies to the dashboard and DOR.html; populated after the first Process |
 
 Column matching is tolerant: header names are normalised (lower-cased, non-alphanumerics stripped),
 so `user_id`, `User ID` and `UserID` all match.
@@ -144,6 +153,10 @@ Per (date, algo), **every column counts users**: `Total Users` (distinct users o
 fall Below / In / Above the band — so `Below + In + Above = Total Users` (only users with no
 usable allocation carry no flag and fall outside the three columns).
 
+The table is a **drill-down pivot**: clicking an algo row (DOR.html) or picking an algo
+(dashboard) reveals the **outlier user ids** — user id, server, lot pct, lots, and whether they
+sit below or above the band (below users first, worst first).
+
 The sum of `Total Users` across algos can differ from the `Users` KPI: unmatched users (no MTM
 entry) have no algo to sit under.
 
@@ -164,51 +177,32 @@ contract circulates under two exchange symbol formats, so both are normalised to
 Symbols that don't parse as a NIFTY / BANKNIFTY / SENSEX option (futures, equity) are skipped.
 Both summaries are computed over the **deduped** orders:
 
-- **Strikes per Algo / Server** — count of distinct contracts per (algo, server); the algo comes
-  from the same MTM allocation matching as the trade value rows (§1.6). An unmatched user (no MTM
-  entry) inherits their **server's** algo — the algo of the server's MTM accounts (most common one
-  if they ever mix) — so a server doesn't split into a duplicate blank-algo row; the algo is blank
-  only when the whole server has no MTM accounts. The overall figure is the **distinct** count,
-  not the column sum (two servers can trade the same strike). In the dashboard and DOR.html the
-  table has its own expiry + index dropdown pair (default **All / All** = the unfiltered counts);
-  the "Total (distinct)" row follows the active filter.
+- **Strikes per Algo / Server** — a **two-level drill-down**: the default view is per algo
+  (algo | no. of servers | distinct strikes), and clicking an algo (or picking one in the
+  dashboard) reveals its per-server counts. The algo comes from the same MTM allocation matching
+  as the trade value rows (§1.6); an unmatched user (no MTM entry) inherits their **server's**
+  algo — so a server doesn't split into a duplicate blank-algo row; the algo is blank only when
+  the whole server has no MTM accounts. Counts are **distinct** contracts at every level — an
+  algo's figure is distinct across its servers, and the "Total (distinct)" row across everything
+  — never the column sum (two servers can trade the same strike). In the dashboard and DOR.html
+  the table has its own expiry + index dropdown pair (default **All / All**).
 - **Lots per Strike — option chain** — per contract, `lots = Σ |qty| / lot_size(trade date)` (the
-  same lot math as §1.5, so the total ties back to the `Total Lots` KPI exactly), presented as an
-  option chain: one row per strike price with **CE | Strike | PE** lots side by side. The
-  dashboard and DOR.html put the chain behind an expiry + index dropdown pair; the Excel sheet
-  stacks one chain block per (index, expiry). Lots are always shown as **whole numbers** (no
-  decimals) — everywhere, including the trade value rows and KPIs.
+  same lot math as §1.5), presented as an option chain: one row per strike price with
+  **CE | Strike | PE** lots side by side. The dashboard and DOR.html put the chain behind an
+  expiry + index dropdown pair; the Excel sheet stacks one chain block per (index, expiry).
+  When the index's **day open / day close** are entered in the dashboard, the chain centres on
+  the **ATM** — the traded strike nearest the day-mid `(open + close) / 2`, highlighted — and
+  shows only **No. of strikes** above and below it (an input in the chain card, default 10;
+  both the report and the dashboard have it). Without a day-mid the full chain shows, and its
+  total ties back to the `Total Lots` KPI exactly. Lots are always shown as **whole numbers**
+  (no decimals) — everywhere, including the trade value rows and KPIs.
 
-## 1.10 Box plot (dashboard + DOR.html)
-
-Per algo, the **per-user** lot pct distribution (§1.7 — one point per user): box = Q1–Q3
-(quartiles via the *inclusive* method), line = median, whiskers = the furthest actual values
-within **1.5 × IQR** of the box. The overlaid points are **not** IQR outliers — they are the
-users flagged by the ± k·σ rule above (blue = below, orange = above).
-
-## 1.11 Outlier clients (second deviation, `Outlier Clients` sheet)
-
-The **client outlier deviation `k₂`** (asked next to `k`, default 2.0) drives a stricter,
-client-facing list: every **user** whose per-user lot pct (§1.7) falls outside `mean ± k₂·σ` of
-its (date, algo) group — the same statistics as §1.7, only the width differs. One row per user.
-
-Because the band is a lot-**pct** band, it is converted into **lots** through the user's own
-allocation, so the numbers are directly comparable with what the user actually fired:
-
-```
-Average Lots  = [ band_low_pct × allocation / 100 , band_high_pct × allocation / 100 ]
-                (lower edge clamped at 0 — nobody can fire negative lots)
-Lots Fired    = the user's combined lots
-Diff of Lots  = Lots − band_high_lots   (above the range)
-              = band_low_lots − Lots    (below the range)
-```
-
-Columns: `Algo · Server · User ID · Average Lots (low – high) · Outlier · Lots Fired ·
-Diff of Lots`, sorted worst-first (largest lots difference) per algo. All lots are whole
-numbers. Changing `k₂` in the dashboard recomputes this table instantly (no reprocess); `k`
-continues to drive the row flags, algo summary and box plot unchanged.
-
----
+  The chain also carries **trade-kind and algo filters** (default: everything included). The
+  order's `Tag` marks the kind — `h_…` = hedge, `v_…` = VAR, `s_…` = square-off, anything else
+  is a normal trade. Three toggles (Hedge / VAR / Sq-off) include or exclude those kinds —
+  normal trades always count — and an Algo dropdown restricts the chain to one algo. Both the
+  report and the dashboard have the same controls; the per-(algo, kind) split is embedded in
+  the page so filtering never recomputes.
 
 # Part 2 — Int / Pos Segregation (`segregate_int_pos_mtm2.py`)
 
@@ -271,7 +265,24 @@ min/max misleading.
 once for the algo); the Grand Total sums the per-algo counts.
 
 **KPI tiles:** `Accounts` = all rows, `Positional` = classified positional, `Intraday` =
-accounts − positional, `Noren` = rows with User Type "Noren".
+accounts − positional, plus `Allocation` (× 100, Cr), `Realized P&L` (Cr) and `P&L %` from the
+grand total. Tiles are centered and flow in a single row.
+
+**Algo selection:** the dashboard inputs carry a "Segregation — algos to include" multiselect
+(empty = all). The pivot and its KPI tiles — in the dashboard **and** in DOR.html — cover only
+the selected algos; the Excel `Segregation` / `Raw_Data_Per_User` / `Worst 10%ile` sheets always
+keep every algo (the workbook is the full audit trail).
+
+**Displayed columns:** the dashboard and DOR.html pivot show a trimmed set —
+`Algo · Server · Users · SL Hit · Max Loss · Allocation · Realized P&L · P&L %` (plus the
+Type/Section row label; the ratio field is titled **P&L %** everywhere, including the Excel
+header). `Unrealized P&L`, `MTM` and `P95/P5` stay in the Excel Segregation sheet, where the
+full column set and live formulas remain.
+
+**Compact money display:** `Allocation` (× 100 — the stored value is in hundreds) and
+`Realized P&L` render in compact Indian units (`403.8 Cr`, `53.5 L`) in the pivot and the KPI
+cards; the Trade Value KPI uses the same format. `P&L %` and every calculation keep the stored
+basis; the Excel sheet keeps full stored values.
 
 ## 2.4 Excel formulas (Segregation sheet)
 
@@ -330,6 +341,9 @@ never slippage. The **compiled** Realized P&L is used (no positional addons). Pe
   algo's Avg Slippage %**, sorted worst-first. The Excel sheet lists **all** slippage accounts
   with the major rows highlighted; the dashboard and DOR.html show the major table alongside
   the per-algo summary.
+- **Algo filter** — the algos to analyse are picked in the **dashboard inputs** (multiselect,
+  empty = all); both the dashboard section and the DOR.html report show the selection, with the
+  Overall row computed over it.
 - A day with no slippage accounts shows **"-- No slippage today --"** in all three outputs.
 
 ## 2.8 Report date
@@ -341,30 +355,93 @@ Inferred from the first non-empty `Date` value in the compiled MTM sheet, format
 # Part 3 — DOR.html (`dor.py`)
 
 Pure presentation — no new math. It embeds the already-computed numbers into a single
-self-contained HTML file: KPI tiles, the per-algo trade-value outlier summary, the box plot as
-inline SVG (same quartile/whisker/point rules as §1.10, with deterministic point jitter so stacked
-outliers stay visible), the outlier clients table (§1.11), the two strikes tables (§1.9, side by
-side), the slippage summary and major slippages (§2.7), and the segregation pivot as a
-click-to-drill-down table (Algo → Int / Pos+Int → servers).
+self-contained HTML file: KPI tiles, the per-algo trade-value outlier summary as a drill-down
+(§1.8 — algo rows expand into their outlier user ids), the two strikes tables (§1.9, side by
+side, algo → server drill; the chain has an ATM window with its No.-of-strikes input), the
+slippage summary and major slippages for the algos selected at input time (§2.7), the
+portfolio analysis (§4), and the segregation pivot as a click-to-drill-down table
+(Algo → Int / Pos+Int → servers → users; the user level shows id, alias, SL hit, max loss,
+allocation, realized P&L and P&L %, worst realized first).
 
-Presentation rules: every table is center-aligned — data and headers — for the client-facing
-look. Realized P&L / Unrealized P&L / MTM values are coloured by sign (profit green, loss red)
-in the pivot and the KPI tiles. In the side-by-side cards (strikes, slippage) the card title and
-the expiry/index dropdowns stay fixed and only the table body scrolls, with the sticky header
-flush at the scroll top. The strikes/chain dropdown filters are precomputed lookups embedded in
-the page — no recalculation in the browser. The masthead carries a **Download Excel** button with
-the full 8-sheet workbook embedded in the page (base64 data URI — the HTML stays a single
-self-contained file); row-level data otherwise stays out of the HTML.
+Presentation rules: every table is center-aligned — data and headers — and every number uses
+**Indian digit grouping** (16,44,536) for the client-facing look. Realized P&L / Unrealized
+P&L / MTM values are coloured by sign (profit green, loss red) in the pivot and the KPI tiles.
+In the side-by-side cards (strikes, slippage) the card title and the expiry/index dropdowns stay
+fixed and only the table body scrolls, with the sticky header flush at the scroll top. The
+strikes/chain dropdown filters are precomputed lookups embedded in the page — no recalculation
+in the browser. The masthead carries a **Download Excel** button with the full workbook embedded
+in the page (base64 data URI — the HTML stays a single self-contained file); row-level data
+otherwise stays out of the HTML.
+
+---
+
+# Part 4 — Portfolio Analysis (`portfolio.py`)
+
+Driven by the optional **Multileg Orders (MLOB)** input; shown just above the Strikes section.
+
+## 4.1 Algo column
+
+The MLOB has no algo, so one is derived first: each (User ID, Server) is matched against the
+Compiled User MTM exactly like the trade value rows (§1.6); users with no MTM entry inherit
+their **server's** algo (same fallback as the strikes table, §1.9).
+
+## 4.2 PnL
+
+Only `Status == COMPLETE` rows count. Per portfolio (and identically per user):
+
+```
+sell value = Σ Avg Price × Filled Quantity     over SELL rows
+buy value  = Σ Avg Price × Filled Quantity     over BUY rows
+PnL        = sell value − buy value
+```
+
+## 4.3 Portfolio Summary table
+
+The default **"QS" Portfolio Analysis** covers every portfolio whose `Portfolio Name` contains
+`QS` (e.g. `MTWTF_SN_ODTE_1100_WT3%_QS`, `MTWTF_SN_ODTE_QS0_1100_WT3%`). It is a
+**three-level drill-down** — the compact algo view is the default, and each level expands
+(click, like the segregation pivot) into the next:
+
+```
+1. Algo view    algo | no. of servers | users | portfolios | orders | PnL
+2. Server view  the algo's servers, same metrics per server
+3. User view    the server's users — user id | portfolios | orders | PnL (worst PnL first)
+```
+
+with per level:
+
+```
+Portfolio Executed Users = distinct users that executed a matching portfolio
+                           (at algo level a user on two servers counts once)
+No. of Portfolio         = distinct matching portfolio names
+Total Orders             = COMPLETE entries (rows) of those portfolios
+PnL                      = Σ sell value − Σ buy value
+```
+
+The Total row counts distinct users / portfolios over the whole selection. PnL cells are
+coloured by sign. The dashboard shows the same three views through algo / server pickers.
+
+## 4.4 Analyse any other portfolio — in the HTML itself
+
+Below the QS table, DOR.html has a **combobox**: a dropdown of every portfolio name that
+narrows as you type (`y` → only names containing `y`, `ya` → only `ya`, …). Pick a name to
+analyse that portfolio, or type any fragment (e.g. `WT3%`) to aggregate every matching
+portfolio — either way the same report renders instantly (the per-(algo, server, user,
+portfolio) groups are embedded in the page, so no reprocessing is involved). The dashboard has
+the same pair: a type-to-filter name picker plus a fragment box. Outputs: the QS analysis is also written to the workbook as the
+**`Portfolio QS`** sheet (summary rows with the user detail underneath, Total at the end).
 
 ---
 
 ## Notes
 
 - `app.py` caches processing on the file contents + deviation `k` + report schema, and warns when
-  the uploaded inputs changed since the last **Process** click. The client deviation `k₂`, the
-  outlier clients table, the strikes filters and the slippage views are computed at render time
-  from the cached results — changing `k₂` or a dropdown never requires a reprocess.
+  the uploaded inputs changed since the last **Process** click. The drill-down picks, the strikes
+  filters, the slippage algo selection and the portfolio patterns are all applied at render time
+  from the cached results — none of them requires a reprocess.
 - Trade value math uses `Decimal` end to end; segregation uses pandas floats with money rounded
   to whole rupees in the outputs.
 - Lots are always displayed as whole numbers (no decimals) across all outputs; `Lot Pct`,
-  `Return %` and `Slippage %` keep 2 decimals.
+  `Return %` and `Slippage %` keep 2 decimals. Displayed numbers use Indian digit grouping
+  (`16,44,536`) everywhere — the dashboard and DOR.html format directly, and the Excel money
+  cells carry an Indian-grouping number format (the cell values stay plain numbers).

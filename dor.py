@@ -48,33 +48,36 @@ def _sign_cls(value):
 
 
 def _tv_summary_table(tv_summary, user_obs=None):
-    """The Algo Summary as a drill-down pivot: each algo row expands into
-    its OUTLIER users — user id, server, lot pct, lots, and whether they sit
-    below or above the band (below users first, worst first)."""
+    """The Algo Summary as a drill-down pivot — one row per (algo, Int /
+    Pos+Int) group; each row expands into its OUTLIER users — user id,
+    server, lots per Cr, lots, and whether they sit below or above the band
+    (below users first, worst first)."""
     outliers_by_group = {}
     for o in (user_obs or []):
         if o["outlier"] in ("Below average range", "Above average range"):
-            outliers_by_group.setdefault((o["trade_date"], o["algo"]), []).append(o)
+            outliers_by_group.setdefault(
+                (o["trade_date"], o["algo"], o["user_type"]), []).append(o)
 
     body = []
     for i, s in enumerate(tv_summary):
-        has_stats = s["avg_lot_pct"] is not None
+        has_stats = s["avg_lots_per_cr"] is not None
         band = f"{_num2(s['band_low'])} – {_num2(s['band_high'])}" if has_stats else "&mdash;"
         # below users first (farthest below leading), then above (farthest
         # above leading) — worst first within each side
-        flagged = sorted(outliers_by_group.get((s["trade_date"], s["algo"]), []),
-                         key=lambda o: ((0, o["lot_pct"])
-                                        if o["outlier"].startswith("Below")
-                                        else (1, -o["lot_pct"])))
-        # every algo row is drillable, even with no outliers — the drill then
+        flagged = sorted(
+            outliers_by_group.get((s["trade_date"], s["algo"], s["user_type"]), []),
+            key=lambda o: ((0, o["lots_per_cr"])
+                           if o["outlier"].startswith("Below")
+                           else (1, -o["lots_per_cr"])))
+        # every row is drillable, even with no outliers — the drill then
         # shows an explicit "none" row, so the interaction stays uniform
         key = f"tvs{i}"
         body.append(
             f'<tr class="algototal lvl1" data-key="{key}">'
             f'<td class="txt"><span class="caret">&#9656;</span>{_esc(s["algo"])}</td>'
+            f"<td>{_esc(s['user_type']) or '&mdash;'}</td>"
             f"<td>{s['users']}</td>"
-            f"<td>{_num2(s['avg_lot_pct']) if has_stats else '&mdash;'}</td>"
-            f"<td>{_num2(s['std_dev']) if has_stats else '&mdash;'}</td>"
+            f"<td>{_num2(s['avg_lots_per_cr']) if has_stats else '&mdash;'}</td>"
             f"<td>{band}</td>"
             f'<td class="below">{s["below"]}</td>'
             f"<td>{s['in_range']}</td>"
@@ -85,10 +88,9 @@ def _tv_summary_table(tv_summary, user_obs=None):
             cls = "below" if o["outlier"].startswith("Below") else "above"
             body.append(
                 f'<tr class="lvl3 hidden" data-parent="{key}">'
-                f'<td class="txt"></td>'
+                f'<td class="txt"></td><td></td>'
                 f"<td>{_esc(o['user_id'])}</td>"
                 f"<td>{_esc(o['server'])}</td>"
-                f"<td>{_num2(o['lot_pct'])}</td>"
                 f"<td>{_money(o['lots'])} lots</td>"
                 f'<td colspan="3" class="{cls}">{_esc(o["outlier"])}</td>'
                 "</tr>"
@@ -97,14 +99,14 @@ def _tv_summary_table(tv_summary, user_obs=None):
             body.append(
                 f'<tr class="lvl3 hidden" data-parent="{key}">'
                 f'<td class="txt"></td>'
-                f'<td colspan="7" class="note">No outlier users in this algo.</td>'
+                f'<td colspan="7" class="note">No outlier users in this group.</td>'
                 "</tr>"
             )
     return f"""
     <table class="tbl drill-tbl" id="tv-summary">
       <thead><tr>
-        <th class="txt">Algo</th><th>Total Users</th><th>Avg Lot Pct</th><th>Std Dev</th>
-        <th>Band</th><th>Below</th><th>In</th><th>Above</th>
+        <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Avg Lots per Cr</th>
+        <th>Range</th><th>Below</th><th>In</th><th>Above</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -653,14 +655,14 @@ def _pnl_td(value, crore=False):
 def _metric_cells(r):
     # trimmed display set — Unrealized / MTM / P95 / P5 live in the Excel
     # Segregation sheet, not the report view. Allocation is displayed x100
-    # (the stored value is in hundreds); Return % keeps the stored basis.
+    # (the stored value is in hundreds); P&L % keeps the stored basis.
     return (
         f"<td>{r['Users']}</td>"
-        f"<td>{r['SLHit']}</td>"
         f"<td>{_money(r['MaxLoss'])}</td>"
         f"<td>{_esc(format_crore(r['Allocation'] * 100))}</td>"
         f"{_pnl_td(r['Realized'], crore=True)}"
         f"<td>{_num2(r['Return'])}</td>"
+        f"<td>{r['SLHit']}</td>"
     )
 
 
@@ -734,11 +736,11 @@ def _pivot_table(pivot_rows):
                         f'<td class="txt"></td><td class="txt"></td>'
                         f'<td class="txt">{_esc(u["UserID"])}</td>'
                         f'<td class="note">{_esc(u["Alias"])}</td>'
-                        f"<td>{u['SLHit']}</td>"
                         f"<td>{_money(u['MaxLoss'])}</td>"
                         f"<td>{_esc(format_crore(u['Allocation'] * 100))}</td>"
                         f"{_pnl_td(u['Realized'], crore=True)}"
                         f"<td>{_num2(u['Return'])}</td>"
+                        f"<td>{u['SLHit']}</td>"
                         "</tr>"
                     )
     if grand is not None:
@@ -760,8 +762,8 @@ def _pivot_table(pivot_rows):
     <table class="tbl" id="pivot-table">
       <thead><tr>
         <th class="txt">Type</th><th class="txt">Algo</th><th class="txt">Server</th>
-        <th>Users</th><th>SL Hit</th><th>Max Loss</th><th>Allocation</th>
-        <th>Realized P&amp;L</th><th>P&amp;L %</th>
+        <th>Users</th><th>Max Loss</th><th>Allocation</th>
+        <th>Realized P&amp;L</th><th>P&amp;L %</th><th>SL Hit</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -1111,14 +1113,20 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   <div class="section-note">
     Completed NIFTY / BANKNIFTY / SENSEX orders only (F&amp;O exchanges NFO / BFO), duplicates
     removed. Outliers are users whose
-    lot pct (combined lots across their segments &divide; allocation &times; 100) is more than
-    {deviation:g} standard deviation(s) from their algo&rsquo;s average. All columns count
-    users, so Below + In + Above = Total Users (users with no usable allocation carry
-    no flag). Click an algo row to see its outlier user ids.
+    <b>Lots per Cr</b> (combined lots &divide; normalise, where normalise = allocation /
+    1,00,000 &mdash; sub-1-Cr allocations normalise fractionally, e.g. 80,000 &rarr; 0.8)
+    is more than {deviation:g} standard deviation(s) from their algo&rsquo;s average. All
+    columns count users, so Below + In + Above = Total Users (only users with no usable
+    allocation carry no flag). Click an algo row to see its outlier user ids.
   </div>
   {tv_kpis}
   <div class="card scroll">
     {_tv_summary_table(tv_summary, user_obs)}
+  </div>
+  <div class="footnote">
+    *Every account is normalised by allocation / 1,00,000 (e.g. 15,60,000 &rarr; 15.6;
+    80,000 &rarr; 0.8), so Lots per Cr is comparable across allocation sizes. Expanded rows
+    show each outlier user&rsquo;s id &middot; server &middot; actual lots fired &middot; flag.
   </div>
 </section>
 

@@ -3,9 +3,10 @@
 A Streamlit app (plus standalone CLIs) that turns four raw inputs into the daily ops report:
 
 1. **Trade Value analysis** (§1) — per-user lots / trade value from the orderbook, with
-   statistical outlier flagging on per-user lot pct, the per-algo summary (a drill-down that
-   reveals the outlier user ids), and the strikes-traded views (algo → server counts + a
-   CE/Strike/PE option chain).
+   statistical outlier flagging on per-user **Lots per Cr** (split Int / Pos+Int), the
+   per-(algo, type) summary (a drill-down that reveals the outlier user ids), and the
+   strikes-traded views (algo → server counts + a CE/Strike/PE option chain with ATM
+   centring and hedge/VAR/sq-off/algo filters).
 2. **Intraday / Positional segregation** (§2) — a pivot of Realized/Unrealized P&L per algo →
    Int / Pos+Int → server, with max-loss addons applied to positional accounts, the worst-10%ile
    exception report, and the **slippage** view (accounts whose realized loss / allocation
@@ -39,7 +40,7 @@ center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,
 | Combined Max Loss — 1DTE (required) | Positional classification + realized-P&L addon |
 | Combined Max Loss — 4DTE (optional) | Extra addon for non-Noren positional accounts |
 | Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
-| Outlier deviation `k` (default 1.0) | Width of the lot-pct outlier band (± k standard deviations) — drives the flags and the algo summary band |
+| Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (mean ± k standard deviations, per algo + type group) — drives the flags and the Algo Summary Range |
 | NIFTY / SENSEX day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
 | Segregation algos (multiselect, empty = all) | Which algos the Int / Pos+Int pivot and its KPI summary cover (§2.3) — dashboard and DOR.html; populated after the first Process |
 | Slippage algos (multiselect, empty = all) | Which algos the slippage analysis covers (§2.7) — applies to the dashboard and DOR.html; populated after the first Process |
@@ -112,50 +113,59 @@ entry whose **server matches the orderbook row's server** is used; if no server 
 stays **unmatched (blank Allocation)** rather than guessing the wrong account. Per (user, server)
 only the first MTM row is kept.
 
-## 1.7 Lot Pct and outlier flagging
+## 1.7 Lots per Cr and outlier flagging
 
-The report row's `Lot Pct` column documents the row:
+Every account normalises by `allocation / 1,00,000` (stored value — 1,00,000 stored = 1 Cr in
+the ×100 display convention): 15,60,000 → 15.6, and the sub-1-Cr variations 80,000 / 60,000 /
+40,000 / 20,000 → 0.8 / 0.6 / 0.4 / 0.2. Only accounts with no usable allocation carry no
+metric and a blank flag. The report row's `Normalise` and `Lots per Cr` columns document the
+row:
 
 ```
-Lot Pct (row) = row Lots / Allocation × 100      (blank when the user has no allocation)
+Normalise         = Allocation / 1,00,000
+Lots per Cr (row) = row Lots / Normalise         (blank when the user has no allocation)
 ```
 
 **The outlier unit is the USER, not the row.** A report row is per (user, segment), so a user
 trading NIFTY and SENSEX would otherwise be judged twice on partial exposures. Per
 (date, algo, user), the user's lots are summed across all their segments (and servers) and
-divided by their **total** allocation (one account per server):
+normalised by their **total** allocation (one account per server):
 
 ```
-lot_pct (user) = Σ user's lots / Σ user's allocations × 100
+lots_per_cr (user) = Σ user's lots / ( Σ user's allocations / 1,00,000 )
 ```
 
-Outliers are judged **per (trade date, algo) group over these per-user values**, using the
-**population standard deviation** (variance divided by *n*, not *n−1*):
+Each (user, server) account is also classified **Int / Pos+Int** using the segregation
+classification (§2.1) — the tradevalue rows carry a `Type` column — and outliers are judged
+**per (trade date, algo, type) group over these per-user values**, using the **population
+standard deviation** (variance divided by *n*, not *n−1*):
 
 ```
-mean = Σ lot_pct / n                       (n = users with a usable allocation)
-std  = sqrt( Σ (lot_pct − mean)² / n )
-band = [ mean − k·std , mean + k·std ]      (k = the chosen deviation, default 1)
+mean = Σ lots_per_cr / n                   (n = users with a usable allocation)
+std   = sqrt( Σ (lots_per_cr − mean)² / n )
+range = [ mean − k·std , mean + k·std ]     (k = the chosen deviation, default 1)
 ```
 
-- `lot_pct < mean − k·std` → **"Below average range"**
-- `lot_pct > mean + k·std` → **"Above average range"**
+- `lots_per_cr < mean − k·std` → **"Below average range"**
+- `lots_per_cr > mean + k·std` → **"Above average range"**
 - otherwise → **"In range"**
 - users with no allocation or no algo can't be judged → blank flag
 
-The user's flag is stamped on **each of their report rows** (so a row's own `Lot Pct` may sit
-inside the band while the row is flagged — the judgement is on the user's combined exposure).
+The user's flag is stamped on **each of their report rows** (so a row's own `Lots per Cr` may
+sit inside the range while the row is flagged — the judgement is on the user's combined
+exposure). The report note under the Algo Summary explains the normalisation.
 
 ## 1.8 Algo summary & totals
 
-Per (date, algo), **every column counts users**: `Total Users` (distinct users of the algo),
-`Avg Lot Pct` / `Std Dev` / `Band` (the per-user statistics of §1.7), and how many **users**
-fall Below / In / Above the band — so `Below + In + Above = Total Users` (only users with no
+One summary row per (date, algo, **Int / Pos+Int**) group, **every column counting users**:
+`Total Users` (distinct users of the group), `Avg Lots per Cr` / `Std Dev` / `Range` (the
+per-user statistics of §1.7, computed within the group), and how many **users** fall Below /
+In / Above the range — so `Below + In + Above = Total Users` per row (only users with no
 usable allocation carry no flag and fall outside the three columns).
 
-The table is a **drill-down pivot**: clicking an algo row (DOR.html) or picking an algo
-(dashboard) reveals the **outlier user ids** — user id, server, lot pct, lots, and whether they
-sit below or above the band (below users first, worst first).
+The table is a **drill-down pivot**: clicking an (algo, type) row (DOR.html) or picking one
+(dashboard) reveals the **outlier user ids** — user id, server, lots per Cr, lots, and whether
+they sit below or above the range (below users first, worst first).
 
 The sum of `Total Users` across algos can differ from the `Users` KPI: unmatched users (no MTM
 entry) have no algo to sit under.
@@ -251,7 +261,7 @@ ALLOCATION          = Σ ALLOCATION
 Realized P&L        = Σ Realized P&L (Final)
 Unrealized P&L      = Σ Unrealized P&L
 MTM                 = Realized + Unrealized
-Return %            = Realized / Allocation        (0 when allocation is 0)
+P&L %               = Realized / Allocation        (0 when allocation is 0)
 95% (P95) / 5% (P5) = 95th / 5th percentile of UserReturn within the group,
                       computed only over accounts with ALLOCATION > 0
 ```
@@ -288,7 +298,7 @@ basis; the Excel sheet keeps full stored values.
 
 Aggregate cells are written as live formulas so the sheet stays auditable in Excel:
 Sub-Totals use `=SUM(...)` over their data block, Algo/Grand Totals add the sub-total rows,
-and every `Return %` cell is `=IF(G{row}=0,0,H{row}/G{row})` (Realized ÷ Allocation).
+and every `P&L %` cell is `=IF(G{row}=0,0,H{row}/G{row})` (Realized ÷ Allocation).
 P5/P95 are written as computed values. The Realized / Unrealized / MTM columns carry
 conditional formatting — profit green, loss red — that keeps recolouring as the formulas
 recalculate.
@@ -306,7 +316,7 @@ Per **Algo × Int/Pos** group:
 - Rank accounts by `UserReturn`; keep those **at or below the group's 10th percentile**.
   Only accounts with `ALLOCATION > 0` are ranked (zero-allocation returns are undefined).
 - `Algo Avg Return %` shown next to each user = the **group-level** return
-  `Σ Realized (Final) / Σ Allocation` — the same value as that section's sub-total Return %.
+  `Σ Realized (Final) / Σ Allocation` — the same value as that section's sub-total P&L %.
 - `Reason` is auto-inferred (first match wins, editable afterwards in Excel):
   1. SL Hit == 1 → **"SL Hit"**
   2. allocation ≤ 0 → **"Zero/low allocation"**
@@ -317,7 +327,7 @@ Per **Algo × Int/Pos** group:
 
 Evaluated over **all** accounts with `ALLOCATION > 0`, both limits expressed as plain **ratios**
 of the account's allocation (positive numbers = loss; the same unit convention as the pivot's
-`Return %` — **not** multiplied by 100):
+`P&L %` — **not** multiplied by 100):
 
 ```
 ML %          = MAX LOSS / ALLOCATION
@@ -441,7 +451,7 @@ the same pair: a type-to-filter name picker plus a fragment box. Outputs: the QS
   from the cached results — none of them requires a reprocess.
 - Trade value math uses `Decimal` end to end; segregation uses pandas floats with money rounded
   to whole rupees in the outputs.
-- Lots are always displayed as whole numbers (no decimals) across all outputs; `Lot Pct`,
-  `Return %` and `Slippage %` keep 2 decimals. Displayed numbers use Indian digit grouping
+- Lots are always displayed as whole numbers (no decimals) across all outputs; `Lots per Cr`,
+  `P&L %` and `Slippage %` keep 2 decimals. Displayed numbers use Indian digit grouping
   (`16,44,536`) everywhere — the dashboard and DOR.html format directly, and the Excel money
   cells carry an Indian-grouping number format (the cell values stay plain numbers).

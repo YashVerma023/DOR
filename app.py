@@ -51,6 +51,7 @@ from tradevalue import (
     strike_report,
     user_lot_observations,
 )
+from tradevalue import _user_key as tv_user_key
 
 st.set_page_config(page_title="Daily Operations Report", layout="wide")
 st.title("Daily Operations Report")
@@ -129,8 +130,8 @@ with dev_col:
     deviation = st.number_input(
         "Outlier deviation (× std dev)",
         min_value=0.1, max_value=10.0, value=1.0, step=0.5,
-        help="A user is an outlier when their combined lot pct is more than "
-             "this many standard deviations away from their algo's average.",
+        help="A user is an outlier when their Lots per Cr is more than this "
+             "many standard deviations away from their algo's average.",
     )
 with seg_col:
     seg_algos_input = st.multiselect(
@@ -167,11 +168,24 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, one_bytes, four_bytes,
     # change, stale cached rows from an older code version are not reused.
     multiplier = Decimal(str(deviation_value))
 
+    # Segregation first — its Int / Positional classification also splits the
+    # trade value users
+    four = seg.load_combined(io.BytesIO(four_bytes)) if four_bytes else {}
+    one = seg.load_combined(io.BytesIO(one_bytes))
+    comp = seg.prepare_comp(io.BytesIO(mtm_bytes), four, one)
+    report_date = seg.infer_report_date(comp)
+    servers = (comp["SERVER"].map(seg._server_key) if "SERVER" in comp.columns
+               else [""] * len(comp))
+    type_map = {
+        (tv_user_key(uid), srv): ("Int" if t == "Intraday" else "Pos+Int")
+        for uid, srv, t in zip(comp["UserID"], servers, comp["Type"])
+    }
+
     # Trade value
     orders = read_orderbook(io.BytesIO(ob_bytes), ob_name)
     allocations = read_allocations(io.BytesIO(mtm_bytes), mtm_name)
     deduped = dedup_orders(orders)
-    tv_rows = aggregate(deduped, allocations, multiplier)
+    tv_rows = aggregate(deduped, allocations, multiplier, type_map)
     strikes = strike_report(deduped, allocations)
 
     # Portfolio analysis (optional MLOB)
@@ -179,12 +193,6 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, one_bytes, four_bytes,
     if mlob_bytes:
         mlob = read_mlob(io.BytesIO(mlob_bytes), mlob_name)
         pf_groups = portfolio_groups(mlob, allocations)
-
-    # Segregation
-    four = seg.load_combined(io.BytesIO(four_bytes)) if four_bytes else {}
-    one = seg.load_combined(io.BytesIO(one_bytes))
-    comp = seg.prepare_comp(io.BytesIO(mtm_bytes), four, one)
-    report_date = seg.infer_report_date(comp)
 
     return {
         "tv_rows": tv_rows,
@@ -233,8 +241,8 @@ if process_clicked:
         st.error(f"Processing failed: {exc}")
 
 
-PIVOT_COLS = ["Section", "ALGO", "SERVER", "No. of Users", "No. of SL Hit Users",
-              "MAX LOSS", "ALLOCATION", "Realized P&L", "P&L %"]
+PIVOT_COLS = ["Section", "ALGO", "SERVER", "No. of Users", "MAX LOSS", "ALLOCATION",
+              "Realized P&L", "P&L %", "No. of SL Hit Users"]
 
 # ---------------------------------------------------------------------------
 # Results
@@ -286,12 +294,12 @@ pivot_df = pd.DataFrame(
             "ALGO": r["ALGO"],
             "SERVER": r["SERVER"],
             "No. of Users": r["Users"],
-            "No. of SL Hit Users": r["SLHit"],
             "MAX LOSS": r["MaxLoss"],
             # display convention: the stored allocation is in hundreds
             "ALLOCATION": r["Allocation"] * 100,
             "Realized P&L": r["Realized"],
             "P&L %": r["Return"],
+            "No. of SL Hit Users": r["SLHit"],
         }
         for r in pivot_rows_view
     ],
@@ -415,10 +423,11 @@ if matched < totals["users"]:
 
 st.subheader("Algo Summary")
 st.caption(
-    "All columns count users. Outliers are judged per user — combined lots across their "
-    "segments/servers ÷ combined allocation — so Below + In + Above = Total Users "
-    "(users with no usable allocation carry no flag). Pick an algo below to see its "
-    "outlier user ids."
+    "All columns count users. Outliers are judged per user on **Lots per Cr** — combined "
+    "lots ÷ normalise, where normalise = allocation / 1,00,000 (sub-1-Cr allocations "
+    "normalise fractionally: 80,000 → 0.8, … 20,000 → 0.2) — so Below + In + Above = "
+    "Total Users (only users with no usable allocation carry no flag). Pick an algo below "
+    "to see its outlier user ids."
 )
 summary_rows = algo_summary(tv_rows, used_multiplier)
 user_obs = user_lot_observations(tv_rows, used_multiplier)
@@ -426,23 +435,26 @@ df_summary = pd.DataFrame([format_summary_row(s) for s in summary_rows], columns
 st.dataframe(df_summary.style.set_properties(**{"text-align": "center"}),
              width="stretch", hide_index=True)
 
+_summary_labels = [f"Algo {s['algo']}" + (f" · {s['user_type']}" if s["user_type"] else "")
+                   for s in summary_rows]
 algo_pick = st.selectbox(
-    "Outlier users — pick an algo",
-    ["—"] + [f"Algo {s['algo']}" for s in summary_rows],
+    "Outlier users — pick an algo / type",
+    ["—"] + _summary_labels,
     key="summary_drill",
 )
 if algo_pick != "—":
-    picked = summary_rows[[f"Algo {s['algo']}" for s in summary_rows].index(algo_pick)]
+    picked = summary_rows[_summary_labels.index(algo_pick)]
     flagged = [o for o in user_obs
                if o["algo"] == picked["algo"] and o["trade_date"] == picked["trade_date"]
+               and o["user_type"] == picked["user_type"]
                and o["outlier"] in ("Below average range", "Above average range")]
-    flagged.sort(key=lambda o: ((0, o["lot_pct"]) if o["outlier"].startswith("Below")
-                                else (1, -o["lot_pct"])))
+    flagged.sort(key=lambda o: ((0, o["lots_per_cr"]) if o["outlier"].startswith("Below")
+                                else (1, -o["lots_per_cr"])))
     if flagged:
         df_flagged = pd.DataFrame(
-            [[o["user_id"], o["server"], round(float(o["lot_pct"]), 2),
+            [[o["user_id"], o["server"], round(float(o["lots_per_cr"]), 2),
               format_indian(o["lots"]), o["outlier"]] for o in flagged],
-            columns=["User ID", "Server", "Lot Pct", "Lots", "Outlier"],
+            columns=["User ID", "Server", "Lots per Cr", "Lots", "Outlier"],
         )
         st.dataframe(df_flagged.style.set_properties(**{"text-align": "center"}),
                      width="stretch", hide_index=True)

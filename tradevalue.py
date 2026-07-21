@@ -39,19 +39,27 @@ SUMMARY_PATTERN = "Compiled_User_MTM_*"
 TABLE_SUFFIXES = (".csv", ".xlsx", ".xlsm", ".xls")
 DEFAULT_OUTPUT = SCRIPT_DIR / "tradevalue.xlsx"
 
-REPORT_HEADER = ["Date", "Server", "User ID", "Allocation", "Algo", "Segment",
-                 "Order Count", "Quantity", "Lots", "Lot Pct", "Trade Value", "Outlier"]
+REPORT_HEADER = ["Date", "Server", "User ID", "Allocation", "Algo", "Type", "Segment",
+                 "Order Count", "Quantity", "Lots", "Normalise", "Lots per Cr",
+                 "Trade Value", "Outlier"]
 
-SUMMARY_HEADER = ["Algo", "Total Users", "Avg Lot Pct", "Std Dev", "Band", "Below", "In", "Above"]
+SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Avg Lots per Cr", "Range",
+                  "Below", "In", "Above"]
+
+# Normalise base: allocation / 1,00,000 (stored value; 1,00,000 stored = 1 Cr
+# in the x100 display convention). Every account normalises by it — 15,60,000
+# -> 15.6, and the sub-1-Cr variations 80,000 / 60,000 / 40,000 / 20,000
+# -> 0.8 / 0.6 / 0.4 / 0.2.
+NORMALISE_BASE = Decimal(100000)
 
 STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
 
 
-# Outliers are judged per (date, algo) group by standard deviation: a row is
-# "in range" when its lot pct lies within mean +/- k * std dev of the group's
-# lot pct. Functions that take a `std_multiplier` accept k as a Decimal
-# (e.g. 1, 1.5, 2); the default is 1 standard deviation.
+# Outliers are judged per (date, algo) group by standard deviation: a user is
+# "in range" when their lots per Cr lies within mean +/- k * std dev of the
+# group's values. Functions that take a `std_multiplier` accept k as a
+# Decimal (e.g. 1, 1.5, 2); the default is 1 standard deviation.
 DEFAULT_STD_MULTIPLIER = Decimal("1")
 
 
@@ -504,12 +512,18 @@ def dedup_orders(rows):
     return list(best.values()) + keyless
 
 
-def aggregate(rows, allocations=None, std_multiplier=None):
+def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
     """Group orders by (date, server, user, segment) and attach each user's
     allocation from the summary (None when the user isn't in the summary).
     Users are grouped on their canonical id, so "4101961" and "04101961"
-    are the same user; the report shows the zero-padded form when known."""
+    are the same user; the report shows the zero-padded form when known.
+
+    `type_map` classifies each (user key, server key) account as "Int" or
+    "Pos+Int" (the segregation classification); the Lots per Cr statistics
+    and outlier bands are then computed per (date, algo, type) group.
+    Without a map every account is one unlabelled group per algo."""
     allocations = allocations or {}
+    type_map = type_map or {}
     groups = {}
     display = {}
     for row in rows:
@@ -547,6 +561,8 @@ def aggregate(rows, allocations=None, std_multiplier=None):
             "user_id": user_id,
             "allocation": entry["allocation"] if entry else None,
             "algo": entry["algo"] if entry else "",
+            "user_type": type_map.get((user_key, _server_key(server)),
+                                      "Int" if type_map else ""),
             "segment": segment,
             "order_count": group["order_count"],
             "quantity": group["quantity"],
@@ -559,16 +575,17 @@ def aggregate(rows, allocations=None, std_multiplier=None):
     return _attach_lot_metrics(out, std_multiplier)
 
 
-def _lot_pct_stats(rows, std_multiplier=None):
-    """Per (date, algo) statistics of lot_pct: mean, population std dev, and
-    the outlier band mean +/- k * std dev. Returns
-    {(date, algo): (mean, std, low, high)}."""
+def _lots_per_cr_stats(rows, std_multiplier=None):
+    """Per (date, algo, type) statistics of lots per Cr: mean, population
+    std dev, and the outlier band mean +/- k * std dev. Returns
+    {(date, algo, type): (mean, std, low, high)}."""
     k = std_multiplier if std_multiplier is not None else DEFAULT_STD_MULTIPLIER
     groups = {}
     for row in rows:
-        if row.get("lot_pct") is None or not row["algo"]:
+        if row.get("lots_per_cr") is None or not row["algo"]:
             continue
-        groups.setdefault((row["trade_date"], row["algo"]), []).append(row["lot_pct"])
+        groups.setdefault((row["trade_date"], row["algo"], row.get("user_type", "")),
+                          []).append(row["lots_per_cr"])
 
     stats = {}
     for key, pcts in groups.items():
@@ -586,24 +603,29 @@ def user_lot_observations(rows, std_multiplier=None):
     A report row is per (user, segment), so a user trading NIFTY and SENSEX
     would otherwise be judged twice on partial exposures. Here the user's
     lots are summed across all their segments (and servers) inside the algo
-    and divided by their TOTAL allocation (one account per server):
+    and normalised by their TOTAL allocation (one account per server):
 
-        lot_pct = total lots / total allocation * 100
+        normalise   = total allocation / 1,00,000
+        lots per Cr = total lots / normalise
 
-    Each observation carries the (date, algo) band (mean ± k·σ over the
-    per-user lot pcts) and its outlier flag; users with no usable allocation
-    get a blank flag. Rows without an algo produce no observation."""
+    Every account normalises the same way — allocations below 1,00,000 get a
+    fractional normalise (80,000 -> 0.8, …, 20,000 -> 0.2). Users with no
+    usable allocation carry no metric and a blank flag. Each observation
+    carries the (date, algo) band (mean ± k·σ over the per-user lots per Cr)
+    and its outlier flag. Rows without an algo produce no observation."""
     obs_map = {}
     for row in rows:
         if not row["algo"]:
             continue
-        key = (row["trade_date"], row["algo"], _user_key(row["user_id"]))
+        key = (row["trade_date"], row["algo"], row.get("user_type", ""),
+               _user_key(row["user_id"]))
         o = obs_map.get(key)
         if o is None:
             o = obs_map[key] = {
                 "trade_date": row["trade_date"],
                 "algo": row["algo"],
-                "user_key": key[2],
+                "user_type": key[2],
+                "user_key": key[3],
                 "user_id": row["user_id"],
                 "lots": Decimal("0"),
                 "_alloc_by_server": {},
@@ -621,20 +643,21 @@ def user_lot_observations(rows, std_multiplier=None):
         alloc_by_server = o.pop("_alloc_by_server")
         allocation = sum(alloc_by_server.values(), Decimal("0")) if alloc_by_server else None
         o["allocation"] = allocation
-        o["lot_pct"] = (o["lots"] / allocation * 100) if allocation else None
+        o["normalise"] = (allocation / NORMALISE_BASE) if allocation else None
+        o["lots_per_cr"] = (o["lots"] / o["normalise"]) if o["normalise"] else None
         o["server"] = " / ".join(s for s in o.pop("_servers") if s)
 
-    stats = _lot_pct_stats(out, std_multiplier)
+    stats = _lots_per_cr_stats(out, std_multiplier)
     for o in out:
-        stat = stats.get((o["trade_date"], o["algo"]))
-        if o["lot_pct"] is None or stat is None:
+        stat = stats.get((o["trade_date"], o["algo"], o["user_type"]))
+        if o["lots_per_cr"] is None or stat is None:
             o["outlier"], o["band_low"], o["band_high"] = "", None, None
             continue
         _, _, low, high = stat
         o["band_low"], o["band_high"] = low, high
-        if o["lot_pct"] < low:
+        if o["lots_per_cr"] < low:
             o["outlier"] = "Below average range"
-        elif o["lot_pct"] > high:
+        elif o["lots_per_cr"] > high:
             o["outlier"] = "Above average range"
         else:
             o["outlier"] = "In range"
@@ -642,20 +665,22 @@ def user_lot_observations(rows, std_multiplier=None):
 
 
 def _attach_lot_metrics(rows, std_multiplier=None):
-    """Add lot_pct to every row (that ROW's lots vs the account allocation —
-    it documents the row), then judge outliers PER USER (combined lots across
-    the user's segments/servers ÷ combined allocation, see
-    user_lot_observations) and stamp the user's flag on each of their rows.
-    Rows with no allocation or no algo can't be judged and stay blank."""
+    """Add Normalise (allocation / 1,00,000) and Lots per Cr (that ROW's lots
+    ÷ normalise — it documents the row), then judge outliers PER USER
+    (combined lots ÷ combined normalise, see user_lot_observations) and
+    stamp the user's flag on each of their rows. Rows with no allocation or
+    no algo can't be judged and stay blank."""
     for row in rows:
         allocation = row["allocation"]
-        row["lot_pct"] = (row["lots"] / allocation * 100) if allocation else None
+        row["normalise"] = (allocation / NORMALISE_BASE) if allocation else None
+        row["lots_per_cr"] = (row["lots"] / row["normalise"]) if row["normalise"] else None
 
-    flags = {(o["trade_date"], o["algo"], o["user_key"]): o["outlier"]
+    flags = {(o["trade_date"], o["algo"], o["user_type"], o["user_key"]): o["outlier"]
              for o in user_lot_observations(rows, std_multiplier)}
     for row in rows:
         row["outlier"] = flags.get(
-            (row["trade_date"], row["algo"], _user_key(row["user_id"])), "")
+            (row["trade_date"], row["algo"], row.get("user_type", ""),
+             _user_key(row["user_id"])), "")
     return rows
 
 
@@ -666,11 +691,13 @@ def format_row(row):
         row["user_id"],
         _fmt_decimal(row["allocation"], places=0) if row["allocation"] is not None else "",
         row.get("algo", ""),
+        row.get("user_type", ""),
         row["segment"],
         row["order_count"],
         _fmt_decimal(row["quantity"], places=0),
         _fmt_decimal(row["lots"], places=0),
-        _fmt_decimal(row["lot_pct"]) if row.get("lot_pct") is not None else "",
+        _fmt_decimal(row["normalise"]) if row.get("normalise") is not None else "",
+        _fmt_decimal(row["lots_per_cr"]) if row.get("lots_per_cr") is not None else "",
         _fmt_decimal(row["trade_value"]),
         row.get("outlier", ""),
     ]
@@ -678,18 +705,18 @@ def format_row(row):
 
 def algo_summary(rows, std_multiplier=None):
     """Per (date, algo) outlier summary, ALL columns in users: "Total Users"
-    (distinct users of the algo), the per-USER lot pct statistics (mean, std
+    (distinct users of the algo), the per-USER lots per Cr statistics (mean, std
     dev, mean +/- k*std band — see user_lot_observations), and how many USERS
     fall below / in / above the band, so Below + In + Above = Total Users
-    (users with no usable allocation carry no lot pct and are the only ones
-    that can fall outside the three flag columns). Pass the SAME
+    (users with no usable allocation carry no lots per Cr and are the only
+    ones that can fall outside the three flag columns). Pass the SAME
     std_multiplier that was given to aggregate() so the band shown matches
     the flags on the rows."""
     observations = user_lot_observations(rows, std_multiplier)
-    stats = _lot_pct_stats(observations, std_multiplier)
+    stats = _lots_per_cr_stats(observations, std_multiplier)
     counts = {}
     for o in observations:
-        key = (o["trade_date"], o["algo"])
+        key = (o["trade_date"], o["algo"], o["user_type"])
         group = counts.setdefault(key, {"users": 0, "below": 0, "in_range": 0, "above": 0})
         group["users"] += 1
         if o["outlier"] == "Below average range":
@@ -700,14 +727,16 @@ def algo_summary(rows, std_multiplier=None):
             group["in_range"] += 1
 
     out = []
-    for (trade_date, algo), group in counts.items():
-        # a group whose users all lack an allocation has no lot-pct statistics
-        mean, std, low, high = stats.get((trade_date, algo), (None, None, None, None))
+    for (trade_date, algo, user_type), group in counts.items():
+        # a group whose users all lack an allocation has no statistics
+        mean, std, low, high = stats.get((trade_date, algo, user_type),
+                                         (None, None, None, None))
         out.append({
             "trade_date": trade_date,
             "algo": algo,
+            "user_type": user_type,
             "users": group["users"],
-            "avg_lot_pct": mean,
+            "avg_lots_per_cr": mean,
             "std_dev": std,
             "band_low": low,
             "band_high": high,
@@ -715,18 +744,21 @@ def algo_summary(rows, std_multiplier=None):
             "in_range": group["in_range"],
             "above": group["above"],
         })
-    out.sort(key=lambda r: (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])))
+    out.sort(key=lambda r: (
+        (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])),
+        r["user_type"],
+    ))
     out.sort(key=lambda r: r["trade_date"] or date.min, reverse=True)
     return out
 
 
 def format_summary_row(row):
-    has_stats = row["avg_lot_pct"] is not None
+    has_stats = row["avg_lots_per_cr"] is not None
     return [
         row["algo"],
+        row["user_type"],
         row["users"],
-        _fmt_decimal(row["avg_lot_pct"]) if has_stats else "",
-        _fmt_decimal(row["std_dev"]) if has_stats else "",
+        _fmt_decimal(row["avg_lots_per_cr"]) if has_stats else "",
         f"{_fmt_decimal(row['band_low'])}–{_fmt_decimal(row['band_high'])}" if has_stats else "",
         row["below"],
         row["in_range"],
@@ -898,11 +930,13 @@ def _excel_report_row(row):
         row["user_id"],
         _excel_number(row["allocation"], places=0),
         row["algo"],
+        row.get("user_type", ""),
         row["segment"],
         row["order_count"],
         _excel_number(row["quantity"], places=0),
         _excel_number(row["lots"], places=0),
-        _excel_number(row.get("lot_pct")),
+        _excel_number(row.get("normalise")),
+        _excel_number(row.get("lots_per_cr")),
         _excel_number(row["trade_value"]),
         row.get("outlier", ""),
     ]
@@ -922,12 +956,12 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
     summary_sheet = workbook.create_sheet("summary")
     summary_sheet.append(SUMMARY_HEADER)
     for srow in algo_summary(rows, std_multiplier):
-        has_stats = srow["avg_lot_pct"] is not None
+        has_stats = srow["avg_lots_per_cr"] is not None
         summary_sheet.append([
             srow["algo"],
+            srow["user_type"],
             srow["users"],
-            _excel_number(srow["avg_lot_pct"]),
-            _excel_number(srow["std_dev"]),
+            _excel_number(srow["avg_lots_per_cr"]),
             (f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}"
              if has_stats else ""),
             srow["below"],

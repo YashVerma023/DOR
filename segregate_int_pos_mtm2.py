@@ -611,7 +611,7 @@ def _write_slippage_sheet(wb, comp, report_date):
     n_cols = max(len(SLIP_SUMMARY_HEADERS), len(SLIP_DETAIL_HEADERS))
 
     ws4.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
-    tc = ws4.cell(1, 1, f"Slippage — Realized Loss % vs Max Loss % of Allocation  ({report_date})")
+    tc = ws4.cell(1, 1, f"Max SL Slippage Analysis — Realized Loss % vs Max Loss % of Allocation  ({report_date})")
     tc.font = Font(bold=True, italic=True, color="FFFFFF", size=13)
     tc.fill = title_fill
     tc.alignment = center

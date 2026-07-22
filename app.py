@@ -128,10 +128,10 @@ if not _known_algos:
 dev_col, seg_col, slip_col, btn_col = st.columns([1, 1.5, 1.5, 1])
 with dev_col:
     deviation = st.number_input(
-        "Outlier deviation (× std dev)",
+        "Outlier deviation (× MAD)",
         min_value=0.1, max_value=10.0, value=1.0, step=0.5,
         help="A user is an outlier when their Lots per Cr is more than this "
-             "many standard deviations away from their algo's average.",
+             "many robust deviations (MAD) away from their algo's median.",
     )
 with seg_col:
     seg_algos_input = st.multiselect(
@@ -335,14 +335,14 @@ styled = (
     .set_properties(**{"text-align": "center"})
     .map(_pnl_color, subset=["Realized P&L"])
     .format({
-        "MAX LOSS": format_indian, "ALLOCATION": format_crore,
+        "MAX LOSS": format_crore, "ALLOCATION": format_crore,
         "Realized P&L": format_crore, "P&L %": "{:.2f}",
     })
 )
 st.dataframe(styled, width="stretch", hide_index=True, height=600)
 
 # ---- Slippage (realized loss % beyond max-loss %) ----
-st.header("Slippage")
+st.header("Max SL Slippage Analysis")
 st.caption(
     "ML % = MAX LOSS / ALLOCATION; Realized ML % = |Realized P&L| / ALLOCATION — plain ratios "
     "of allocation, same convention as Return %. An account has slippage only when Realized "
@@ -390,7 +390,7 @@ else:
             df_majors = pd.DataFrame(
                 [
                     [seg._algo_val(r["ALGO"]), r["SERVER"], r["UserID"], r["Alias"],
-                     format_indian(r["Allocation"]), format_indian(r["MaxLoss"]),
+                     format_indian(r["Allocation"]), format_crore(r["MaxLoss"]),
                      format_indian(r["Realized"]),
                      round(r["MLPct"], 2), round(r["RealizedMLPct"], 2),
                      round(r["DiffPct"], 2), round(r["AlgoAvgSlippage"], 2)]
@@ -414,7 +414,7 @@ m2.metric("Orders", format_indian(totals["orders"]))
 m3.metric("Total Lots", format_indian(totals["lots"]))
 m4.metric("Total Trade Value", format_crore(totals["trade_value"]))
 
-st.caption(f"Outliers: beyond {used_deviation:g} standard deviation(s) from each algo's average lot pct.")
+st.caption(f"Outliers: beyond {used_deviation:g} robust deviation(s) (MAD) from each algo + type group's median Lots per Cr.")
 if matched < totals["users"]:
     st.caption(
         f"Allocation matched for {matched} of {totals['users']} users "

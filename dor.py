@@ -60,8 +60,7 @@ def _tv_summary_table(tv_summary, user_obs=None):
 
     body = []
     for i, s in enumerate(tv_summary):
-        has_stats = s["avg_lots_per_cr"] is not None
-        band = f"{_num2(s['band_low'])} – {_num2(s['band_high'])}" if has_stats else "&mdash;"
+        has_stats = s["median_lots_per_cr"] is not None
         # below users first (farthest below leading), then above (farthest
         # above leading) — worst first within each side
         flagged = sorted(
@@ -77,8 +76,7 @@ def _tv_summary_table(tv_summary, user_obs=None):
             f'<td class="txt"><span class="caret">&#9656;</span>{_esc(s["algo"])}</td>'
             f"<td>{_esc(s['user_type']) or '&mdash;'}</td>"
             f"<td>{s['users']}</td>"
-            f"<td>{_num2(s['avg_lots_per_cr']) if has_stats else '&mdash;'}</td>"
-            f"<td>{band}</td>"
+            f"<td>{_num2(s['median_lots_per_cr']) if has_stats else '&mdash;'}</td>"
             f'<td class="below">{s["below"]}</td>'
             f"<td>{s['in_range']}</td>"
             f'<td class="above">{s["above"]}</td>'
@@ -92,21 +90,21 @@ def _tv_summary_table(tv_summary, user_obs=None):
                 f"<td>{_esc(o['user_id'])}</td>"
                 f"<td>{_esc(o['server'])}</td>"
                 f"<td>{_money(o['lots'])} lots</td>"
-                f'<td colspan="3" class="{cls}">{_esc(o["outlier"])}</td>'
+                f'<td colspan="2" class="{cls}">{_esc(o["outlier"])}</td>'
                 "</tr>"
             )
         if not flagged:
             body.append(
                 f'<tr class="lvl3 hidden" data-parent="{key}">'
                 f'<td class="txt"></td>'
-                f'<td colspan="7" class="note">No outlier users in this group.</td>'
+                f'<td colspan="6" class="note">No outlier users in this group.</td>'
                 "</tr>"
             )
     return f"""
     <table class="tbl drill-tbl" id="tv-summary">
       <thead><tr>
-        <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Avg Lots per Cr</th>
-        <th>Range</th><th>Below</th><th>In</th><th>Above</th>
+        <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Median Lots per Cr</th>
+        <th>Below</th><th>In</th><th>Above</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -153,7 +151,7 @@ def _slippage_tables(slippage):
                 f"<td>{_esc(r['SERVER'])}</td>"
                 f"<td>{_esc(r['UserID'])}</td>"
                 f"<td>{_money(r['Allocation'])}</td>"
-                f"<td>{_money(r['MaxLoss'])}</td>"
+                f"<td>{_esc(format_crore(r['MaxLoss']))}</td>"
                 f"{_pnl_td(r['Realized'])}"
                 f"<td>{_num2(r['MLPct'])}</td>"
                 f'<td class="above">{_num2(r["RealizedMLPct"])}</td>'
@@ -658,7 +656,7 @@ def _metric_cells(r):
     # (the stored value is in hundreds); P&L % keeps the stored basis.
     return (
         f"<td>{r['Users']}</td>"
-        f"<td>{_money(r['MaxLoss'])}</td>"
+        f"<td>{_esc(format_crore(r['MaxLoss']))}</td>"
         f"<td>{_esc(format_crore(r['Allocation'] * 100))}</td>"
         f"{_pnl_td(r['Realized'], crore=True)}"
         f"<td>{_num2(r['Return'])}</td>"
@@ -736,7 +734,7 @@ def _pivot_table(pivot_rows):
                         f'<td class="txt"></td><td class="txt"></td>'
                         f'<td class="txt">{_esc(u["UserID"])}</td>'
                         f'<td class="note">{_esc(u["Alias"])}</td>'
-                        f"<td>{_money(u['MaxLoss'])}</td>"
+                        f"<td>{_esc(format_crore(u['MaxLoss']))}</td>"
                         f"<td>{_esc(format_crore(u['Allocation'] * 100))}</td>"
                         f"{_pnl_td(u['Realized'], crore=True)}"
                         f"<td>{_num2(u['Return'])}</td>"
@@ -866,7 +864,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
                               f"{_esc(empty_note)}</div></div>")
         slippage_section = f"""
 <section>
-  <h2>Slippage</h2>
+  <h2>Max SL Slippage Analysis</h2>
   {slippage_note}
   {slippage_body}
 </section>"""
@@ -1115,7 +1113,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     removed. Outliers are users whose
     <b>Lots per Cr</b> (combined lots &divide; normalise, where normalise = allocation /
     1,00,000 &mdash; sub-1-Cr allocations normalise fractionally, e.g. 80,000 &rarr; 0.8)
-    is more than {deviation:g} standard deviation(s) from their algo&rsquo;s average. All
+    is more than {deviation:g} robust deviation(s) (MAD) away from their algo&rsquo;s median. All
     columns count users, so Below + In + Above = Total Users (only users with no usable
     allocation carry no flag). Click an algo row to see its outlier user ids.
   </div>

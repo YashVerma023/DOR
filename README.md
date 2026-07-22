@@ -40,7 +40,7 @@ center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,
 | Combined Max Loss — 1DTE (required) | Positional classification + realized-P&L addon |
 | Combined Max Loss — 4DTE (optional) | Extra addon for non-Noren positional accounts |
 | Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
-| Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (mean ± k standard deviations, per algo + type group) — drives the flags and the Algo Summary Range |
+| Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (median ± k × MAD, per algo + type group) — drives the flags and the Algo Summary Range |
 | NIFTY / SENSEX day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
 | Segregation algos (multiselect, empty = all) | Which algos the Int / Pos+Int pivot and its KPI summary cover (§2.3) — dashboard and DOR.html; populated after the first Process |
 | Slippage algos (multiselect, empty = all) | Which algos the slippage analysis covers (§2.7) — applies to the dashboard and DOR.html; populated after the first Process |
@@ -137,13 +137,14 @@ lots_per_cr (user) = Σ user's lots / ( Σ user's allocations / 1,00,000 )
 
 Each (user, server) account is also classified **Int / Pos+Int** using the segregation
 classification (§2.1) — the tradevalue rows carry a `Type` column — and outliers are judged
-**per (trade date, algo, type) group over these per-user values**, using the **population
-standard deviation** (variance divided by *n*, not *n−1*):
+**per (trade date, algo, type) group over these per-user values**, using **robust statistics**
+(median / MAD) so that a blowing account cannot widen the very range that is meant to catch it
+(with mean ± std-dev, one extreme user inflates the std dev and shields itself):
 
 ```
-mean = Σ lots_per_cr / n                   (n = users with a usable allocation)
-std   = sqrt( Σ (lots_per_cr − mean)² / n )
-range = [ mean − k·std , mean + k·std ]     (k = the chosen deviation, default 1)
+median = the middle per-user lots_per_cr          (n = users with a usable allocation)
+MAD    = 1.4826 × median( |lots_per_cr − median| )   (std-dev equivalent, outlier-immune)
+range  = [ median − k·MAD , median + k·MAD ]         (k = the chosen deviation, default 1)
 ```
 
 - `lots_per_cr < mean − k·std` → **"Below average range"**
@@ -158,7 +159,7 @@ exposure). The report note under the Algo Summary explains the normalisation.
 ## 1.8 Algo summary & totals
 
 One summary row per (date, algo, **Int / Pos+Int**) group, **every column counting users**:
-`Total Users` (distinct users of the group), `Avg Lots per Cr` / `Std Dev` / `Range` (the
+`Total Users` (distinct users of the group), `Median Lots per Cr` / `Range` (the
 per-user statistics of §1.7, computed within the group), and how many **users** fall Below /
 In / Above the range — so `Below + In + Above = Total Users` per row (only users with no
 usable allocation carry no flag and fall outside the three columns).

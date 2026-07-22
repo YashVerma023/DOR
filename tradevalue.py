@@ -27,6 +27,7 @@ import argparse
 import csv
 import io
 import re
+import statistics
 import sys
 from collections import Counter, namedtuple
 from datetime import date, datetime
@@ -43,7 +44,7 @@ REPORT_HEADER = ["Date", "Server", "User ID", "Allocation", "Algo", "Type", "Seg
                  "Order Count", "Quantity", "Lots", "Normalise", "Lots per Cr",
                  "Trade Value", "Outlier"]
 
-SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Avg Lots per Cr", "Range",
+SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Median Lots per Cr", "Range",
                   "Below", "In", "Above"]
 
 # Normalise base: allocation / 1,00,000 (stored value; 1,00,000 stored = 1 Cr
@@ -56,11 +57,14 @@ STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
 
 
-# Outliers are judged per (date, algo) group by standard deviation: a user is
-# "in range" when their lots per Cr lies within mean +/- k * std dev of the
-# group's values. Functions that take a `std_multiplier` accept k as a
-# Decimal (e.g. 1, 1.5, 2); the default is 1 standard deviation.
+# Outliers are judged per (date, algo, type) group by ROBUST deviation: a
+# user is "in range" when their lots per Cr lies within median +/- k * MAD of
+# the group's values (MAD = median absolute deviation, scaled by 1.4826 so it
+# matches a std dev on well-behaved data). Unlike mean/std-dev, a blowing
+# account cannot widen the range that is meant to catch it. Functions that
+# take a `std_multiplier` accept k as a Decimal (e.g. 1, 1.5, 2); default 1.
 DEFAULT_STD_MULTIPLIER = Decimal("1")
+_MAD_SCALE = Decimal("1.4826")
 
 
 # ---------------------------------------------------------------------------
@@ -576,9 +580,10 @@ def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
 
 
 def _lots_per_cr_stats(rows, std_multiplier=None):
-    """Per (date, algo, type) statistics of lots per Cr: mean, population
-    std dev, and the outlier band mean +/- k * std dev. Returns
-    {(date, algo, type): (mean, std, low, high)}."""
+    """Per (date, algo, type) ROBUST statistics of lots per Cr: the median,
+    the scaled MAD (1.4826 × median absolute deviation — a std-dev
+    equivalent that a blowing account cannot inflate), and the outlier range
+    median +/- k * MAD. Returns {(date, algo, type): (median, mad, low, high)}."""
     k = std_multiplier if std_multiplier is not None else DEFAULT_STD_MULTIPLIER
     groups = {}
     for row in rows:
@@ -588,12 +593,10 @@ def _lots_per_cr_stats(rows, std_multiplier=None):
                           []).append(row["lots_per_cr"])
 
     stats = {}
-    for key, pcts in groups.items():
-        n = len(pcts)
-        mean = sum(pcts) / n
-        variance = sum((p - mean) ** 2 for p in pcts) / n
-        std = variance.sqrt()
-        stats[key] = (mean, std, mean - k * std, mean + k * std)
+    for key, values in groups.items():
+        med = statistics.median(values)
+        mad = statistics.median(abs(v - med) for v in values) * _MAD_SCALE
+        stats[key] = (med, mad, med - k * mad, med + k * mad)
     return stats
 
 
@@ -705,8 +708,8 @@ def format_row(row):
 
 def algo_summary(rows, std_multiplier=None):
     """Per (date, algo) outlier summary, ALL columns in users: "Total Users"
-    (distinct users of the algo), the per-USER lots per Cr statistics (mean, std
-    dev, mean +/- k*std band — see user_lot_observations), and how many USERS
+    (distinct users of the algo), the per-USER lots per Cr statistics (median,
+    median +/- k*MAD range — see user_lot_observations), and how many USERS
     fall below / in / above the band, so Below + In + Above = Total Users
     (users with no usable allocation carry no lots per Cr and are the only
     ones that can fall outside the three flag columns). Pass the SAME
@@ -736,7 +739,7 @@ def algo_summary(rows, std_multiplier=None):
             "algo": algo,
             "user_type": user_type,
             "users": group["users"],
-            "avg_lots_per_cr": mean,
+            "median_lots_per_cr": mean,
             "std_dev": std,
             "band_low": low,
             "band_high": high,
@@ -753,12 +756,12 @@ def algo_summary(rows, std_multiplier=None):
 
 
 def format_summary_row(row):
-    has_stats = row["avg_lots_per_cr"] is not None
+    has_stats = row["median_lots_per_cr"] is not None
     return [
         row["algo"],
         row["user_type"],
         row["users"],
-        _fmt_decimal(row["avg_lots_per_cr"]) if has_stats else "",
+        _fmt_decimal(row["median_lots_per_cr"]) if has_stats else "",
         f"{_fmt_decimal(row['band_low'])}–{_fmt_decimal(row['band_high'])}" if has_stats else "",
         row["below"],
         row["in_range"],
@@ -956,12 +959,12 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
     summary_sheet = workbook.create_sheet("summary")
     summary_sheet.append(SUMMARY_HEADER)
     for srow in algo_summary(rows, std_multiplier):
-        has_stats = srow["avg_lots_per_cr"] is not None
+        has_stats = srow["median_lots_per_cr"] is not None
         summary_sheet.append([
             srow["algo"],
             srow["user_type"],
             srow["users"],
-            _excel_number(srow["avg_lots_per_cr"]),
+            _excel_number(srow["median_lots_per_cr"]),
             (f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}"
              if has_stats else ""),
             srow["below"],

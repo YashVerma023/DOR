@@ -20,6 +20,9 @@ Outputs: one Excel workbook `DOR_<date>.xlsx` (sheets: `tradevalue`, `summary`, 
 `Portfolio QS` when the MLOB is given, `Segregation`, `Raw_Data_Per_User`, `Worst 10%ile`,
 `Slippage`) and one self-contained, client-shareable `DOR_<date>.html` (all tables
 center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,536`).
+When a **secondary index User MTM** is uploaded (§below) the workbook carries a second set —
+`summary 2`, `Segregation 2`, `Raw_Data_Per_User 2`, `Worst 10%ile 2`, `Slippage 2` — and the
+dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once **per MTM file**.
 
 ## Files
 
@@ -37,11 +40,13 @@ center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,
 |---|---|
 | Compiled Orderbook (CSV/Excel) | Trade value rows |
 | Compiled User MTM (CSV/Excel) | Allocations + algo for trade value; the account universe for segregation |
-| Combined Max Loss — 1DTE (required) | Positional classification + realized-P&L addon |
+| Secondary index User MTM (optional, CSV/Excel) | When two indexes ran on **different servers** (e.g. 8 NIFTY servers + 2 BANKNIFTY servers) the orderbook is combined but the User MTM comes as two files — the second file's accounts join the allocation matching, and its servers get their **own** segregation cards/pivot, Algo Summary and outlier (median ± MAD) bands, so one index's Lots-per-Cr scale never corrupts the other's |
+| Combined Max Loss — 1DTE (required in 0DTE mode) | Positional classification + realized-P&L addon |
 | Combined Max Loss — 4DTE (optional) | Extra addon for non-Noren positional accounts |
 | Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
 | Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (median ± k × MAD, per algo + type group) — drives the flags and the Algo Summary Range |
-| NIFTY / SENSEX day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
+| NIFTY / SENSEX / BANKNIFTY day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
+| NIFTY / SENSEX / BANKNIFTY expiry (text, e.g. `28JUL26`) | The expiry label of each index's strikes (§1.9). One orderbook holds a **single expiry per index**, and the symbol formats are too ambiguous to parse a date from — so the expiry is entered here, and only the strike is read from the symbol. Left empty → the chain shows `NA` |
 | Segregation algos (multiselect, empty = all) | Which algos the Int / Pos+Int pivot and its KPI summary cover (§2.3) — dashboard and DOR.html; populated after the first Process |
 | Slippage algos (multiselect, empty = all) | Which algos the slippage analysis covers (§2.7) — applies to the dashboard and DOR.html; populated after the first Process |
 
@@ -176,17 +181,27 @@ Report KPIs: `Users` = distinct user ids, `Orders` = Σ order counts, `Total Lot
 
 ## 1.9 Strikes traded (`Strikes` sheet + dashboard + DOR.html)
 
-A **strike** is one option contract: **(index, expiry date, strike price, CE/PE)**. The same
-contract circulates under two exchange symbol formats, so both are normalised to that one key
+A **strike** is one option contract: **(index, strike price, CE/PE)**. The same contract
+circulates under several exchange symbol formats, so all of them must normalise to that one key
 (otherwise a contract traded through different brokers/servers would count twice):
 
-| Format | Example | Reading |
+| Format | Example | Strike read |
 |---|---|---|
-| `DDMMMYY` | `NIFTY21JUL2624100PE` | day 21, month JUL, year 26 → 21-Jul-2026, strike 24100, PE |
-| `YYMDD` | `NIFTY2672124100PE` | year 26, month 7, day 21 → 21-Jul-2026 (Oct/Nov/Dec are the single letter `O`/`N`/`D`), strike 24100, PE |
+| compact `DDMMMYY` | `NIFTY21JUL2624100PE` | 24100 PE |
+| compact `YYMDD` | `NIFTY2672124100PE` | 24100 PE (Oct/Nov/Dec are the single letter `O`/`N`/`D`) |
+| compact monthly (no day) | `NIFTY26JUL24100PE` | 24100 PE |
+| spaced, 4-digit year | `NIFTY 21JUL2026 PE 24100` | 24100 PE |
+| spaced, 2-digit year | `NIFTY 21JUL26 24100 PE` | 24100 PE |
 
-Symbols that don't parse as a NIFTY / BANKNIFTY / SENSEX option (futures, equity) are skipped.
-Both summaries are computed over the **deduped** orders:
+The **expiry is deliberately not parsed** — the compact forms are ambiguous
+(`NIFTY26JUL22600CE` reads as 26-Jul-2022 strike 600 just as well as Jul-2026 strike 22600),
+and one orderbook holds a **single expiry per index** anyway. So each index's expiry is
+**entered in the dashboard** and applied as a display label, and only the strike is read from
+the symbol — by **value**: index strikes sit in a known band (NIFTY 8k–60k, BANKNIFTY
+20k–100k, SENSEX 40k–200k — set far wider than today's levels so drift never breaks parsing),
+so the tail digits that read as a plausible level are the strike (tried 5-digit first, then
+6 and 4). Symbols that don't parse as a NIFTY / BANKNIFTY / SENSEX option (futures, equity)
+are skipped. Both summaries are computed over the **deduped** orders:
 
 - **Strikes per Algo / Server** — a **two-level drill-down**: the default view is per algo
   (algo | no. of servers | distinct strikes), and clicking an algo (or picking one in the
@@ -200,7 +215,9 @@ Both summaries are computed over the **deduped** orders:
 - **Lots per Strike — option chain** — per contract, `lots = Σ |qty| / lot_size(trade date)` (the
   same lot math as §1.5), presented as an option chain: one row per strike price with
   **CE | Strike | PE** lots side by side. The dashboard and DOR.html put the chain behind an
-  expiry + index dropdown pair; the Excel sheet stacks one chain block per (index, expiry).
+  expiry + index dropdown pair (the expiry labels are the ones entered in the inputs; an index
+  with no entry shows `NA`); the Excel sheet stacks one chain block per index, captioned with
+  its entered expiry.
   When the index's **day open / day close** are entered in the dashboard, the chain centres on
   the **ATM** — the traded strike nearest the day-mid `(open + close) / 2`, highlighted — and
   shows only **No. of strikes** above and below it (an input in the chain card, default 10;

@@ -47,11 +47,12 @@ def _sign_cls(value):
     return "pos" if float(value) > 0 else ("neg" if float(value) < 0 else "")
 
 
-def _tv_summary_table(tv_summary, user_obs=None):
+def _tv_summary_table(tv_summary, user_obs=None, table_id="tv-summary"):
     """The Algo Summary as a drill-down pivot — one row per (algo, Int /
     Pos+Int) group; each row expands into its OUTLIER users — user id,
     server, lots per Cr, lots, and whether they sit below or above the band
-    (below users first, worst first)."""
+    (below users first, worst first). `table_id` keeps ids unique when the
+    report carries one table per User MTM file."""
     outliers_by_group = {}
     for o in (user_obs or []):
         if o["outlier"] in ("Below average range", "Above average range"):
@@ -70,7 +71,7 @@ def _tv_summary_table(tv_summary, user_obs=None):
                            else (1, -o["lots_per_cr"])))
         # every row is drillable, even with no outliers — the drill then
         # shows an explicit "none" row, so the interaction stays uniform
-        key = f"tvs{i}"
+        key = f"{table_id}-{i}"
         body.append(
             f'<tr class="algototal lvl1" data-key="{key}">'
             f'<td class="txt"><span class="caret">&#9656;</span>{_esc(s["algo"])}</td>'
@@ -101,7 +102,7 @@ def _tv_summary_table(tv_summary, user_obs=None):
                 "</tr>"
             )
     return f"""
-    <table class="tbl drill-tbl" id="tv-summary">
+    <table class="tbl drill-tbl" id="{table_id}">
       <thead><tr>
         <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Median Lots per Cr</th>
         <th>Below</th><th>In</th><th>Above</th>
@@ -379,29 +380,28 @@ _PORTFOLIO_SCRIPT = """
 """
 
 
-def _expiry_label(expiry):
-    return expiry.strftime("%d%b%y").upper()
-
-
-def _strikes_tables(strikes, mids=None):
+def _strikes_tables(strikes, mids=None, expiry_map=None):
     """The two strike summaries side by side, each behind its own expiry +
     index dropdown pair: distinct strikes per (algo, server) — with an "All"
     option that reproduces the unfiltered counts — and the lots-per-strike
     option chain (CE | Strike | PE). Lots are whole numbers.
 
-    `mids` maps index -> day-mid price ((day open + day close) / 2, entered
-    in the dashboard). When the selected index has a mid, the chain centres
-    on the ATM (the traded strike nearest the mid, highlighted) and shows
-    only N strikes above and below it — N is the "No. of strikes" input in
-    the page, default 10."""
+    A contract is (index, strike, CE/PE) — the expiry is not parsed from the
+    symbols. `expiry_map` ({index: expiry text entered in the dashboard})
+    labels each index's chain; an index with no entry shows as "NA". `mids`
+    maps index -> day-mid price ((day open + day close) / 2, entered in the
+    dashboard). When the selected index has a mid, the chain centres on the
+    ATM (the traded strike nearest the mid, highlighted) and shows only N
+    strikes above and below it — N is the "No. of strikes" input in the
+    page, default 10."""
     # every (expiry|All, index|All) combination is precomputed, so the table
     # swap is a pure lookup in the page's JS
-    seg_set, exp_dates = set(), set()
+    seg_set = {r["segment"] for r in strikes["per_strike"]}
     for r in strikes["by_algo_server"]:
         for contract in r["contracts"]:
             seg_set.add(contract[0])
-            exp_dates.add(contract[1])
-    expiry_labels = [_expiry_label(e) for e in sorted(exp_dates)]
+    label_of = {s: (expiry_map or {}).get(s) or "NA" for s in seg_set}
+    expiry_labels = sorted(set(label_of.values()))
     segments = sorted(seg_set)
 
     def counts_for(exp_label, seg):
@@ -410,7 +410,7 @@ def _strikes_tables(strikes, mids=None):
         per_algo, distinct = {}, set()
         for r in strikes["by_algo_server"]:
             sel = [c for c in r["contracts"]
-                   if (exp_label == "All" or _expiry_label(c[1]) == exp_label)
+                   if (exp_label == "All" or label_of[c[0]] == exp_label)
                    and (seg == "All" or c[0] == seg)]
             if sel:
                 bucket = per_algo.setdefault(r["algo"] or "—", {"servers": [], "contracts": set()})
@@ -455,13 +455,10 @@ def _strikes_tables(strikes, mids=None):
     # sq-off toggles and the algo dropdown can slice it client-side
     # (catIdx: 0=normal, 1=hedge, 2=var, 3=sqoff)
     cat_index = {"normal": 0, "hedge": 1, "var": 2, "sqoff": 3}
-    chains, chain_expiries, chain_algos = {}, [], set()
+    chains, chain_algos = {}, set()
     for r in strikes["per_strike"]:
-        label = _expiry_label(r["expiry"])
-        if label not in chains:
-            chains[label] = {}
-            chain_expiries.append((r["expiry"], label))
-        cell = (chains[label].setdefault(r["segment"], {})
+        label = label_of[r["segment"]]
+        cell = (chains.setdefault(label, {}).setdefault(r["segment"], {})
                 .setdefault(str(r["strike"]), {}))
         for (algo, cat), lots in r.get("breakdown", {}).items():
             algo_label = str(algo) if str(algo) else "—"
@@ -475,7 +472,7 @@ def _strikes_tables(strikes, mids=None):
               for seg, seg_d in exp_d.items()}
         for exp, exp_d in chains.items()
     }
-    chain_expiries = [label for _, label in sorted(chain_expiries)]
+    chain_expiries = sorted(chains)
     chain_algos = sorted(chain_algos, key=lambda a: (0, int(a)) if a.isdigit() else (1, a))
 
     return f"""
@@ -520,6 +517,8 @@ def _strikes_tables(strikes, mids=None):
     var CHAIN_ALGOS = {json.dumps(chain_algos)};
     var CHAIN_MIDS = {json.dumps(mids or {})};
     var AS_COUNTS = {json.dumps(as_counts)};
+    var AS_EXPIRIES = {json.dumps(["All"] + expiry_labels)};
+    var AS_INDEXES = {json.dumps(["All"] + segments)};
     </script>"""
 
 
@@ -634,10 +633,13 @@ _CHAIN_SCRIPT = """
            data.total + '</td></tr>';
     body.innerHTML = out;
   }
-  fillOptions(expirySel, Object.keys(AS_COUNTS));
-  fillOptions(indexSel, Object.keys(AS_COUNTS['All']));
+  // explicit arrays, not Object.keys(): an all-digit expiry label would be
+  // an integer-like key and hoist itself ahead of "All"
+  fillOptions(expirySel, AS_EXPIRIES);
+  fillOptions(indexSel, AS_INDEXES);
   expirySel.addEventListener('change', render);
   indexSel.addEventListener('change', render);
+  render();
 })();
 </script>
 """
@@ -664,10 +666,12 @@ def _metric_cells(r):
     )
 
 
-def _pivot_table(pivot_rows):
+def _pivot_table(pivot_rows, table_id="pivot-table"):
     """Drill-down pivot: one 'Grand Total' row per algo (collapsed default);
     clicking it reveals the Int / Pos+Int sub-total rows, and clicking those
-    reveals the per-server detail. Plain inline JS — no libraries."""
+    reveals the per-server detail. Plain inline JS — no libraries.
+    `table_id` prefixes every drill key so two pivots (one per User MTM
+    file) never cross-expand each other."""
     # Rebuild the hierarchy from the flat rows.
     buckets, order, grand = {}, [], None
     for r in pivot_rows:
@@ -697,7 +701,7 @@ def _pivot_table(pivot_rows):
         total = bucket["total"]
         if total is None:
             continue
-        akey = f"a{i}"
+        akey = f"{table_id}-a{i}"
         body.append(
             f'<tr class="algototal lvl1" data-key="{akey}">'
             f'<td class="txt"><span class="caret">&#9656;</span>Grand Total</td>'
@@ -751,13 +755,13 @@ def _pivot_table(pivot_rows):
         )
 
     return f"""
-    <div class="pivot-tools">
-      <button type="button" id="pivot-expand">Expand all</button>
-      <button type="button" id="pivot-collapse">Collapse all</button>
+    <div class="pivot-tools" data-target="{table_id}">
+      <button type="button">Expand all</button>
+      <button type="button">Collapse all</button>
       <span class="hint">click a row to drill down: Algo &rarr; Int / Pos+Int &rarr; servers
       &rarr; users</span>
     </div>
-    <table class="tbl" id="pivot-table">
+    <table class="tbl pivot-tbl" id="{table_id}">
       <thead><tr>
         <th class="txt">Type</th><th class="txt">Algo</th><th class="txt">Server</th>
         <th>Users</th><th>Max Loss</th><th>Allocation</th>
@@ -770,40 +774,44 @@ def _pivot_table(pivot_rows):
 _PIVOT_SCRIPT = """
 <script>
 (function () {
-  function childrenOf(key) {
-    return document.querySelectorAll('tr[data-parent="' + key + '"]');
-  }
-  function collapse(tr) {
-    tr.classList.remove('open');
-    childrenOf(tr.dataset.key).forEach(function (child) {
-      child.classList.add('hidden');
-      if (child.dataset.key) collapse(child);
+  document.querySelectorAll('.pivot-tools').forEach(function (tools) {
+    var table = document.getElementById(tools.dataset.target);
+    if (!table) return;
+    function childrenOf(key) {
+      return table.querySelectorAll('tr[data-parent="' + key + '"]');
+    }
+    function collapse(tr) {
+      tr.classList.remove('open');
+      childrenOf(tr.dataset.key).forEach(function (child) {
+        child.classList.add('hidden');
+        if (child.dataset.key) collapse(child);
+      });
+    }
+    table.querySelectorAll('tr[data-key]').forEach(function (tr) {
+      tr.addEventListener('click', function () {
+        if (tr.classList.contains('open')) { collapse(tr); return; }
+        tr.classList.add('open');
+        childrenOf(tr.dataset.key).forEach(function (child) { child.classList.remove('hidden'); });
+      });
     });
-  }
-  document.querySelectorAll('#pivot-table tr[data-key]').forEach(function (tr) {
-    tr.addEventListener('click', function () {
-      if (tr.classList.contains('open')) { collapse(tr); return; }
-      tr.classList.add('open');
-      childrenOf(tr.dataset.key).forEach(function (child) { child.classList.remove('hidden'); });
+    var btns = tools.querySelectorAll('button');
+    btns[0].addEventListener('click', function () {
+      table.querySelectorAll('tr[data-key]').forEach(function (tr) { tr.classList.add('open'); });
+      table.querySelectorAll('tr[data-parent]').forEach(function (tr) { tr.classList.remove('hidden'); });
     });
-  });
-  var expandAll = document.getElementById('pivot-expand');
-  var collapseAll = document.getElementById('pivot-collapse');
-  if (expandAll) expandAll.addEventListener('click', function () {
-    document.querySelectorAll('#pivot-table tr[data-key]').forEach(function (tr) { tr.classList.add('open'); });
-    document.querySelectorAll('#pivot-table tr[data-parent]').forEach(function (tr) { tr.classList.remove('hidden'); });
-  });
-  if (collapseAll) collapseAll.addEventListener('click', function () {
-    document.querySelectorAll('#pivot-table tr[data-key]').forEach(collapse);
+    btns[1].addEventListener('click', function () {
+      table.querySelectorAll('tr[data-key]').forEach(collapse);
+    });
   });
 })();
 </script>
 """
 
 
-def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, pivot_rows,
-                   user_obs=None, strikes=None, slippage=None, portfolio=None,
-                   mids=None, excel_bytes=None, excel_filename=None):
+def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_stats=None,
+                   pivot_rows=None, user_obs=None, strikes=None, slippage=None,
+                   portfolio=None, mids=None, excel_bytes=None, excel_filename=None,
+                   seg_sections=None, tv_sections=None, expiry_map=None):
     """Assemble the complete DOR.html document and return it as a string.
     `user_obs` (per-user observations from tradevalue.user_lot_observations)
     feeds the Algo Summary drill-down (outlier user ids); `strikes` (from
@@ -813,11 +821,21 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     `portfolio` (groups from portfolio.portfolio_groups) feeds the portfolio
     analysis — the QS table prerendered plus any-pattern analysis in the
     browser; `mids` ({index: day-mid price}) centres the option chain on the
-    ATM strike; `excel_bytes`/`excel_filename` embed the full workbook as a
-    download button in the masthead. Each section is skipped when its data
-    is omitted."""
+    ATM strike; `expiry_map` ({index: expiry text entered in the dashboard})
+    labels the strike chains; `excel_bytes`/`excel_filename` embed the full
+    workbook as a download button in the masthead. Each section is skipped
+    when its data is omitted.
+
+    When a secondary User MTM is uploaded, pass `seg_sections`
+    ([{"label", "stats", "rows"}, ...]) and `tv_sections` ([{"label",
+    "summary", "obs"}, ...]) — one entry per MTM file — instead of
+    `pivot_stats`/`pivot_rows` and `tv_summary`/`user_obs`; each segregation
+    section and Algo Summary table then renders once per file."""
     generated = datetime.now().strftime("%d-%b-%Y %H:%M")
-    grand = next((r for r in pivot_rows if r["kind"] == "grandtotal"), None)
+    if seg_sections is None:
+        seg_sections = [{"label": None, "stats": pivot_stats, "rows": pivot_rows}]
+    if tv_sections is None:
+        tv_sections = [{"label": None, "summary": tv_summary, "obs": user_obs}]
 
     tv_kpis = _kpi_tiles([
         ("Users", _money(tv_totals["users"])),
@@ -825,18 +843,50 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
         ("Total Lots", _money(tv_totals["lots"])),
         ("Trade Value", format_crore(tv_totals["trade_value"])),
     ])
-    seg_pairs = [
-        ("Accounts", _money(pivot_stats["accounts"])),
-        ("Positional", _money(pivot_stats["positional"])),
-        ("Intraday", _money(pivot_stats["intraday"])),
-    ]
-    if grand:
-        seg_pairs += [
-            ("Allocation", format_crore(grand["Allocation"] * 100)),
-            ("Realized P&L", format_crore(grand["Realized"]), _sign_cls(grand["Realized"])),
-            ("P&L %", _num2(grand["Return"])),
-        ]
-    seg_kpis = _kpi_tiles(seg_pairs)
+
+    seg_blocks = []
+    for i, sec in enumerate(seg_sections):
+        stats, rows = sec["stats"], sec["rows"]
+        grand = next((r for r in rows if r["kind"] == "grandtotal"), None)
+        seg_pairs = [("Accounts", _money(stats["accounts"]))]
+        # no max-loss file -> no Positional / Intraday counts to show
+        if stats.get("positional") is not None:
+            seg_pairs += [
+                ("Positional", _money(stats["positional"])),
+                ("Intraday", _money(stats["intraday"])),
+            ]
+        if grand:
+            seg_pairs += [
+                ("Allocation", format_crore(grand["Allocation"] * 100)),
+                ("Realized P&L", format_crore(grand["Realized"]), _sign_cls(grand["Realized"])),
+                ("P&L %", _num2(grand["Return"])),
+            ]
+        heading = f" &mdash; {_esc(sec['label'])}" if sec.get("label") else ""
+        seg_blocks.append(f"""
+<section>
+  <h2>Intraday / Positional Segregation{heading}</h2>
+  {_kpi_tiles(seg_pairs)}
+  <div class="card scroll">
+    {_pivot_table(rows, table_id=f"pivot-table-{i}")}
+  </div>
+  <div class="footnote">
+    *Sub-Total server counts are per section; algo totals count each server once. The full
+    column set (Unrealized P&amp;L, MTM, P95/P5) is in the Excel workbook&rsquo;s Segregation
+    sheet.
+  </div>
+</section>""")
+    seg_sections_html = "".join(seg_blocks)
+
+    tv_blocks = []
+    for i, sec in enumerate(tv_sections):
+        heading = (f'<h3 class="pf-title">{_esc(sec["label"])}</h3>'
+                   if sec.get("label") else "")
+        tv_blocks.append(f"""
+  {heading}
+  <div class="card scroll">
+    {_tv_summary_table(sec["summary"], sec["obs"], table_id=f"tv-summary-{i}")}
+  </div>""")
+    tv_tables_html = "".join(tv_blocks)
 
     download_btn = ""
     if excel_bytes:
@@ -902,8 +952,9 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     strikes_section = f"""
 <section>
   <h2>Strikes Traded</h2>
-  <div class="section-note">A strike is one contract (index + expiry + strike + CE/PE);
-  the two exchange symbol formats for the same contract are counted once. The algo view is
+  <div class="section-note">A strike is one contract (index + strike + CE/PE);
+  every exchange symbol format for the same contract is counted once, and each
+  index&rsquo;s expiry is the one entered in the dashboard. The algo view is
   the default &mdash; click an algo to see its per-server counts (an algo&rsquo;s count is
   distinct across its servers, not the column sum). Pick an expiry and index to filter, or
   to see the option chain &mdash; CE / PE lots per strike (whole lots, same date-based lot
@@ -911,7 +962,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   (day open + day close) / 2), the chain centres on the <b>ATM</b> strike (highlighted) and
   shows only <b>No. of strikes</b> above and below it &mdash; change the number to widen or
   narrow the view. Users with no MTM entry inherit their server&rsquo;s algo.</div>
-  {_strikes_tables(strikes, mids)}
+  {_strikes_tables(strikes, mids, expiry_map)}
 </section>
 {_CHAIN_SCRIPT}""" if strikes and strikes.get("per_strike") else ""
 
@@ -1052,7 +1103,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
   .bx-lab {{ font-size: 12.5px; font-weight: 600; fill: var(--ink); }}
   .bx-title {{ font-size: 12px; fill: var(--muted); }}
   .hidden {{ display: none; }}
-  #pivot-table tr[data-key] td, .drill-tbl tr[data-key] td {{
+  .pivot-tbl tr[data-key] td, .drill-tbl tr[data-key] td {{
     cursor: pointer; user-select: none; }}
   .caret {{ display: inline-block; width: 15px; color: var(--muted);
             transition: transform .15s ease; }}
@@ -1091,18 +1142,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
 </div>
 <main>
 
-<section>
-  <h2>Intraday / Positional Segregation</h2>
-  {seg_kpis}
-  <div class="card scroll">
-    {_pivot_table(pivot_rows)}
-  </div>
-  <div class="footnote">
-    *Sub-Total server counts are per section; algo totals count each server once. The full
-    column set (Unrealized P&amp;L, MTM, P95/P5) is in the Excel workbook&rsquo;s Segregation
-    sheet.
-  </div>
-</section>
+{seg_sections_html}
 
 {slippage_section}
 
@@ -1118,9 +1158,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary, pivot_stats, p
     allocation carry no flag). Click an algo row to see its outlier user ids.
   </div>
   {tv_kpis}
-  <div class="card scroll">
-    {_tv_summary_table(tv_summary, user_obs)}
-  </div>
+  {tv_tables_html}
   <div class="footnote">
     *Every account is normalised by allocation / 1,00,000 (e.g. 15,60,000 &rarr; 15.6;
     80,000 &rarr; 0.8), so Lots per Cr is comparable across allocation sizes. Expanded rows

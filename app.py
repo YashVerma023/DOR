@@ -47,6 +47,7 @@ from tradevalue import (
     read_allocations,
     read_orderbook,
     report_totals,
+    split_report_rows,
     strike_chain,
     strike_report,
     user_lot_observations,
@@ -63,6 +64,25 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
+# Mode — 0DTE is the full pipeline; Other drops the max-loss inputs
+# ---------------------------------------------------------------------------
+mode = st.sidebar.radio(
+    "Report mode", ["0DTE", "Other"],
+    help="0DTE — the full report: upload the Combined Max Loss file(s) so accounts "
+         "are split Int / Pos+Int and positional Realized P&L carries its addon.\n\n"
+         "Other — same inputs without the max-loss files: no Int / Pos+Int split "
+         "and no addon.",
+)
+st.sidebar.caption(
+    "**0DTE** uses the Combined Max Loss files for the Int / Pos+Int split and the "
+    "Realized P&L addon.\n\n**Other** runs without them — one unsplit block, "
+    "Realized P&L exactly as the MTM sheet reports it."
+    if mode == "0DTE" else
+    "**Other** mode: no max-loss files, so there is no Int / Pos+Int split and no "
+    "addon — Realized P&L is exactly what the MTM sheet reports."
+)
+
+# ---------------------------------------------------------------------------
 # Inputs — everything at the top
 # ---------------------------------------------------------------------------
 in1, in2 = st.columns(2)
@@ -71,20 +91,37 @@ with in1:
 with in2:
     summary_file = st.file_uploader("Compiled User MTM (CSV / Excel)", type=["csv", "xlsx", "xlsm", "xls"])
 
-in3, in4 = st.columns(2)
-with in3:
-    maxloss_1dte = st.file_uploader("Combined Max Loss — 1DTE (required)", type=["xlsx", "xlsm", "xls"])
-with in4:
-    maxloss_4dte = st.file_uploader("Combined Max Loss — 4DTE (optional)", type=["xlsx", "xlsm", "xls"])
+if mode == "0DTE":
+    in3, in4 = st.columns(2)
+    with in3:
+        maxloss_1dte = st.file_uploader("Combined Max Loss — 1DTE (required)",
+                                        type=["xlsx", "xlsm", "xls"])
+    with in4:
+        maxloss_4dte = st.file_uploader("Combined Max Loss — 4DTE (optional)",
+                                        type=["xlsx", "xlsm", "xls"])
+else:
+    # "Other" mode runs without the max-loss files: no Int / Pos+Int
+    # classification and no realized-P&L addon.
+    maxloss_1dte = maxloss_4dte = None
 
-in5, _ = st.columns(2)
+in5, in6 = st.columns(2)
 with in5:
     mlob_file = st.file_uploader(
         "Multileg Orders — MLOB (optional, enables the Portfolio Analysis)",
         type=["xlsx", "xlsm", "xls", "csv"],
     )
+with in6:
+    summary2_file = st.file_uploader(
+        "Secondary index User MTM (optional)",
+        type=["csv", "xlsx", "xlsm", "xls"],
+        help="When two indexes ran on different servers (e.g. 8 NIFTY servers "
+             "+ 2 BANKNIFTY servers), the orderbook is combined but the User "
+             "MTM comes as two files — upload the second one here. The summary "
+             "cards / pivot and the outlier (std deviation) tables are then "
+             "shown separately per MTM file.",
+    )
 
-oc1, oc2, oc3, oc4 = st.columns(4)
+oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
 with oc1:
     nifty_open = st.number_input("NIFTY day open", min_value=0.0, value=0.0, step=50.0,
                                  help="0 = not set. With day close, gives the day-mid "
@@ -95,6 +132,27 @@ with oc3:
     sensex_open = st.number_input("SENSEX day open", min_value=0.0, value=0.0, step=100.0)
 with oc4:
     sensex_close = st.number_input("SENSEX day close", min_value=0.0, value=0.0, step=100.0)
+with oc5:
+    banknifty_open = st.number_input("BANKNIFTY day open", min_value=0.0, value=0.0,
+                                     step=100.0)
+with oc6:
+    banknifty_close = st.number_input("BANKNIFTY day close", min_value=0.0, value=0.0,
+                                      step=100.0)
+
+# the expiry is NOT parsed from the strike symbols (their formats are too
+# ambiguous to trust) — every symbol of an index shares the session's single
+# expiry, entered here and applied as a label in the strikes section
+ex1, ex2, ex3 = st.columns(3)
+with ex1:
+    nifty_expiry = st.text_input("NIFTY expiry", placeholder="e.g. 28JUL26",
+                                 help="The expiry of every NIFTY strike in the orderbook "
+                                      "(one expiry per index per day). Shown as the "
+                                      "chain's expiry label — strikes themselves are "
+                                      "read from the symbols.")
+with ex2:
+    sensex_expiry = st.text_input("SENSEX expiry", placeholder="e.g. 23JUL26")
+with ex3:
+    banknifty_expiry = st.text_input("BANKNIFTY expiry", placeholder="e.g. 30JUL26")
 
 @st.cache_data(show_spinner=False)
 def _algo_options_from_mtm(mtm_bytes, mtm_name):
@@ -122,6 +180,10 @@ def _algo_options_from_mtm(mtm_bytes, mtm_name):
 _known_algos = []
 if summary_file is not None:
     _known_algos = _algo_options_from_mtm(summary_file.getvalue(), summary_file.name)
+if summary2_file is not None:
+    _known_algos = _known_algos + [
+        a for a in _algo_options_from_mtm(summary2_file.getvalue(), summary2_file.name)
+        if a not in _known_algos]
 if not _known_algos:
     _known_algos = st.session_state.get("dor", {}).get("slip_algo_options", [])
 
@@ -154,7 +216,8 @@ with btn_col:
     process_clicked = st.button(
         "Process",
         type="primary",
-        disabled=(orderbook_file is None or summary_file is None or maxloss_1dte is None),
+        disabled=(orderbook_file is None or summary_file is None
+                  or (mode == "0DTE" and maxloss_1dte is None)),
     )
 
 
@@ -162,30 +225,73 @@ with btn_col:
 # Processing — one pass computes both reports
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, one_bytes, four_bytes,
-                 mlob_bytes, mlob_name, deviation_value, schema):
+def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
+                 one_bytes, four_bytes, mlob_bytes, mlob_name, deviation_value, schema):
     # `schema` only serves as part of the cache key: when the report columns
     # change, stale cached rows from an older code version are not reused.
     multiplier = Decimal(str(deviation_value))
 
     # Segregation first — its Int / Positional classification also splits the
-    # trade value users
+    # trade value users. Without max-loss files nothing is classified, so the
+    # trade value rows stay in one group per algo (type_map = None). A
+    # secondary User MTM (its indexes ran on their own servers) is processed
+    # as its own comp so the summary section can render per MTM file; the
+    # max-loss books are ROUTED between the two files first — handing the
+    # full books to both comps would apply the same entry twice whenever a
+    # user id appears in both.
     four = seg.load_combined(io.BytesIO(four_bytes)) if four_bytes else {}
-    one = seg.load_combined(io.BytesIO(one_bytes))
-    comp = seg.prepare_comp(io.BytesIO(mtm_bytes), four, one)
+    one = seg.load_combined(io.BytesIO(one_bytes)) if one_bytes else {}
+    classified = bool(four or one)
+    comp_df = seg.read_compiled(io.BytesIO(mtm_bytes), mtm_name)
+    comp2_df = seg.read_compiled(io.BytesIO(mtm2_bytes), mtm2_name) if mtm2_bytes else None
+    four2 = one2 = {}
+    if comp2_df is not None:
+        def _ids_servers(df):
+            uids = set(df["UserID"].astype(str).str.strip())
+            servers = (set(df["SERVER"].map(seg._server_key))
+                       if "SERVER" in df.columns else set())
+            return uids, servers
+        uids1, servers1 = _ids_servers(comp_df)
+        uids2, servers2_keys = _ids_servers(comp2_df)
+        four, four2 = seg.split_max_loss_books(four, uids1, servers1, uids2, servers2_keys)
+        one, one2 = seg.split_max_loss_books(one, uids1, servers1, uids2, servers2_keys)
+    comp = seg.prepare_comp(comp_df, four, one, classified=classified)
+    comp2 = (seg.prepare_comp(comp2_df, four2, one2, classified=classified)
+             if comp2_df is not None else None)
     report_date = seg.infer_report_date(comp)
-    servers = (comp["SERVER"].map(seg._server_key) if "SERVER" in comp.columns
-               else [""] * len(comp))
-    type_map = {
-        (tv_user_key(uid), srv): ("Int" if t == "Intraday" else "Pos+Int")
-        for uid, srv, t in zip(comp["UserID"], servers, comp["Type"])
-    }
 
-    # Trade value
+    type_map = {}
+    for c in (comp, comp2):
+        if c is None or not seg.is_classified(c):
+            continue
+        servers = (c["SERVER"].map(seg._server_key) if "SERVER" in c.columns
+                   else [""] * len(c))
+        type_map.update({
+            (tv_user_key(uid), srv): ("Int" if t == "Intraday" else "Pos+Int")
+            for uid, srv, t in zip(c["UserID"], servers, c["Type"])
+        })
+    type_map = type_map or None
+
+    # Trade value — allocations merged across both MTMs (the orderbook is
+    # combined); on a (user, server) present in both, the primary wins
     orders = read_orderbook(io.BytesIO(ob_bytes), ob_name)
     allocations = read_allocations(io.BytesIO(mtm_bytes), mtm_name)
+    servers2 = set()
+    if mtm2_bytes:
+        for key, entries in read_allocations(io.BytesIO(mtm2_bytes), mtm2_name).items():
+            existing = allocations.setdefault(key, [])
+            seen = {e["server"] for e in existing}
+            existing.extend(e for e in entries if e["server"] not in seen)
+        if comp2 is not None and "SERVER" in comp2.columns:
+            servers2 = set(comp2["SERVER"].map(seg._server_key))
     deduped = dedup_orders(orders)
     tv_rows = aggregate(deduped, allocations, multiplier, type_map)
+    tv_groups = None
+    if servers2:
+        # each MTM's servers get their own outlier bands — a secondary index's
+        # Lots per Cr sits on a different scale and would corrupt both medians
+        tv_primary, tv_secondary = split_report_rows(tv_rows, servers2, multiplier)
+        tv_groups = {"primary": tv_primary, "secondary": tv_secondary}
     strikes = strike_report(deduped, allocations)
 
     # Portfolio analysis (optional MLOB)
@@ -196,6 +302,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, one_bytes, four_bytes,
 
     return {
         "tv_rows": tv_rows,
+        "tv_groups": tv_groups,
         "order_count": len(orders),
         "allocation_count": len(allocations),
         "strikes": strikes,
@@ -203,6 +310,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, one_bytes, four_bytes,
         "pivot_rows": seg.pivot_rows(comp),
         "pivot_stats": seg.comp_stats(comp),
         "comp": comp,
+        "comp2": comp2,
         "date": report_date,
     }
 
@@ -211,10 +319,12 @@ def _signature():
     return (
         orderbook_file.name if orderbook_file else None,
         summary_file.name if summary_file else None,
+        summary2_file.name if summary2_file else None,
         maxloss_1dte.name if maxloss_1dte else None,
         maxloss_4dte.name if maxloss_4dte else None,
         mlob_file.name if mlob_file else None,
         deviation,
+        mode,
     )
 
 
@@ -224,18 +334,26 @@ if process_clicked:
             result = _process_all(
                 orderbook_file.getvalue(), orderbook_file.name,
                 summary_file.getvalue(), summary_file.name,
-                maxloss_1dte.getvalue(),
+                summary2_file.getvalue() if summary2_file else None,
+                summary2_file.name if summary2_file else None,
+                maxloss_1dte.getvalue() if maxloss_1dte else None,
                 maxloss_4dte.getvalue() if maxloss_4dte else None,
                 mlob_file.getvalue() if mlob_file else None,
                 mlob_file.name if mlob_file else None,
                 deviation,
                 tuple(REPORT_HEADER + STRIKE_ALGO_HEADER + STRIKE_CHAIN_HEADER
-                      + PORTFOLIO_SUMMARY_HEADER + ["chain-breakdown-v1"]),
+                      + PORTFOLIO_SUMMARY_HEADER
+                      # bump when the engine changes shape or parsing rules,
+                      # so cached results from an older build are not reused
+                      + ["chain-breakdown-v1", "strike-only-v3"]),
             )
+        _all_algos = pd.concat(
+            [result["comp"]["ALGO"]]
+            + ([result["comp2"]["ALGO"]] if result["comp2"] is not None else [])
+        ).dropna().unique()
         st.session_state["dor"] = {
             **result, "deviation": deviation, "signature": _signature(),
-            "slip_algo_options": [seg._algo_val(a) for a in
-                                  sorted(result["comp"]["ALGO"].dropna().unique(), key=float)],
+            "slip_algo_options": [seg._algo_val(a) for a in sorted(_all_algos, key=float)],
         }
     except Exception as exc:
         st.error(f"Processing failed: {exc}")
@@ -264,61 +382,16 @@ if not tv_rows:
     st.warning("No completed NIFTY / BANKNIFTY / SENSEX orders found in the orderbook.")
     st.stop()
 
-# ---- Segregation (first) ----
-st.header("Segregation Pivot (Int / Pos+Int)")
-algo_options = dor_state.get("slip_algo_options") or [
-    seg._algo_val(a) for a in sorted(dor_state["comp"]["ALGO"].dropna().unique(), key=float)]
-picked_seg_algos = seg_algos_input or algo_options
-comp_seg = dor_state["comp"][
-    dor_state["comp"]["ALGO"].map(seg._algo_val).isin(picked_seg_algos)]
-stats = seg.comp_stats(comp_seg)
-pivot_rows_view = seg.pivot_rows(comp_seg)
-grand_view = next(r for r in pivot_rows_view if r["kind"] == "grandtotal")
-p1, p2, p3, p4, p5, p6 = st.columns(6)
-p1.metric("Accounts", stats["accounts"])
-p2.metric("Positional", stats["positional"])
-p3.metric("Intraday", stats["intraday"])
-p4.metric("Allocation", format_crore(grand_view["Allocation"] * 100))
-p5.metric("Realized P&L", format_crore(grand_view["Realized"]))
-p6.metric("P&L %", f"{grand_view['Return']:.2f}")
-st.caption(
-    (f"Report date: {report_date} · " if report_date else "")
-    + "Algos included (from the inputs at the top): "
-    + ", ".join(str(a) for a in picked_seg_algos)
-)
-
-pivot_df = pd.DataFrame(
-    [
-        {
-            "Section": r["Section"],
-            "ALGO": r["ALGO"],
-            "SERVER": r["SERVER"],
-            "No. of Users": r["Users"],
-            "MAX LOSS": r["MaxLoss"],
-            # display convention: the stored allocation is in hundreds
-            "ALLOCATION": r["Allocation"] * 100,
-            "Realized P&L": r["Realized"],
-            "P&L %": r["Return"],
-            "No. of SL Hit Users": r["SLHit"],
-        }
-        for r in pivot_rows_view
-    ],
-    columns=PIVOT_COLS,
-)
-row_kinds = [r["kind"] for r in pivot_rows_view]
-
-
-def _pivot_row_style(row):
-    kind = row_kinds[row.name]
-    if kind == "subtotal":
-        style = "background-color:#EDF0F5; color:#1F2937; font-weight:600"
-    elif kind == "algototal":
-        style = "background-color:#DCE3EC; color:#1F2937; font-weight:700"
-    elif kind == "grandtotal":
-        style = "background-color:#D1C9E1; color:#1F2937; font-weight:700"
-    else:
-        return [""] * len(row)
-    return [style] * len(row)
+# ---- MTM groups: a secondary User MTM splits the summary + outlier views ----
+tv_groups = dor_state.get("tv_groups")
+comp2 = dor_state.get("comp2")
+mtm_label1 = mtm_label2 = None
+if tv_groups:
+    # label each MTM file by the indexes its servers actually traded
+    mtm_label1 = ("/".join(sorted({r["segment"] for r in tv_groups["primary"]}))
+                  or "Primary") + " (primary MTM)"
+    mtm_label2 = ("/".join(sorted({r["segment"] for r in tv_groups["secondary"]}))
+                  or "Secondary") + " (secondary MTM)"
 
 
 def _pnl_color(value):
@@ -329,17 +402,86 @@ def _pnl_color(value):
             else "color:#DC2626;font-weight:600")
 
 
-styled = (
-    pivot_df.style
-    .apply(_pivot_row_style, axis=1)
-    .set_properties(**{"text-align": "center"})
-    .map(_pnl_color, subset=["Realized P&L"])
-    .format({
-        "MAX LOSS": format_crore, "ALLOCATION": format_crore,
-        "Realized P&L": format_crore, "P&L %": "{:.2f}",
-    })
+def _styled_pivot(pivot_rows_view):
+    pivot_df = pd.DataFrame(
+        [
+            {
+                "Section": r["Section"],
+                "ALGO": r["ALGO"],
+                "SERVER": r["SERVER"],
+                "No. of Users": r["Users"],
+                "MAX LOSS": r["MaxLoss"],
+                # display convention: the stored allocation is in hundreds
+                "ALLOCATION": r["Allocation"] * 100,
+                "Realized P&L": r["Realized"],
+                "P&L %": r["Return"],
+                "No. of SL Hit Users": r["SLHit"],
+            }
+            for r in pivot_rows_view
+        ],
+        columns=PIVOT_COLS,
+    )
+    row_kinds = [r["kind"] for r in pivot_rows_view]
+
+    def _pivot_row_style(row):
+        kind = row_kinds[row.name]
+        if kind == "subtotal":
+            style = "background-color:#EDF0F5; color:#1F2937; font-weight:600"
+        elif kind == "algototal":
+            style = "background-color:#DCE3EC; color:#1F2937; font-weight:700"
+        elif kind == "grandtotal":
+            style = "background-color:#D1C9E1; color:#1F2937; font-weight:700"
+        else:
+            return [""] * len(row)
+        return [style] * len(row)
+
+    return (
+        pivot_df.style
+        .apply(_pivot_row_style, axis=1)
+        .set_properties(**{"text-align": "center"})
+        .map(_pnl_color, subset=["Realized P&L"])
+        .format({
+            "MAX LOSS": format_crore, "ALLOCATION": format_crore,
+            "Realized P&L": format_crore, "P&L %": "{:.2f}",
+        })
+    )
+
+
+# ---- Segregation (first) — one block per MTM file ----
+st.header("Segregation Pivot (Int / Pos+Int)")
+algo_options = dor_state.get("slip_algo_options") or [
+    seg._algo_val(a) for a in sorted(dor_state["comp"]["ALGO"].dropna().unique(), key=float)]
+picked_seg_algos = seg_algos_input or algo_options
+st.caption(
+    (f"Report date: {report_date} · " if report_date else "")
+    + "Algos included (from the inputs at the top): "
+    + ", ".join(str(a) for a in picked_seg_algos)
 )
-st.dataframe(styled, width="stretch", hide_index=True, height=600)
+
+seg_views = [(None, dor_state["comp"])]
+if comp2 is not None:
+    seg_views = [(mtm_label1, dor_state["comp"]), (mtm_label2, comp2)]
+seg_dor_sections = []
+for sec_label, comp_src in seg_views:
+    comp_seg = comp_src[comp_src["ALGO"].map(seg._algo_val).isin(picked_seg_algos)]
+    sec_stats = seg.comp_stats(comp_seg)
+    sec_rows = seg.pivot_rows(comp_seg)
+    seg_dor_sections.append({"label": sec_label, "stats": sec_stats, "rows": sec_rows})
+    grand_view = next(r for r in sec_rows if r["kind"] == "grandtotal")
+    if sec_label:
+        st.subheader(sec_label)
+    # without max-loss files there is no Positional / Intraday count to show
+    tiles = [("Accounts", str(sec_stats["accounts"]))]
+    if sec_stats["positional"] is not None:
+        tiles += [("Positional", str(sec_stats["positional"])),
+                  ("Intraday", str(sec_stats["intraday"]))]
+    tiles += [("Allocation", format_crore(grand_view["Allocation"] * 100)),
+              ("Realized P&L", format_crore(grand_view["Realized"])),
+              ("P&L %", f"{grand_view['Return']:.2f}")]
+    for col, (label, value) in zip(st.columns(len(tiles)), tiles):
+        col.metric(label, value)
+    st.dataframe(_styled_pivot(sec_rows), width="stretch", hide_index=True,
+                 height=600 if len(seg_views) == 1 else 420)
 
 # ---- Slippage (realized loss % beyond max-loss %) ----
 st.header("Max SL Slippage Analysis")
@@ -355,8 +497,10 @@ all_slip_algos = dor_state.get("slip_algo_options") or [
 picked_slip_algos = slip_algos_input or all_slip_algos
 st.caption(f"Algos analysed (from the inputs at the top): "
            f"{', '.join(str(a) for a in picked_slip_algos)}")
-comp_sel = dor_state["comp"][
-    dor_state["comp"]["ALGO"].map(seg._algo_val).isin(picked_slip_algos)]
+# slippage covers every account — both MTM files together when two are given
+comp_all = (pd.concat([dor_state["comp"], comp2], ignore_index=True)
+            if comp2 is not None else dor_state["comp"])
+comp_sel = comp_all[comp_all["ALGO"].map(seg._algo_val).isin(picked_slip_algos)]
 slip_rows = seg.slippage_rows(comp_sel)
 slip_algo, slip_overall = seg.slippage_summary(slip_rows, comp_sel)
 slip_majors = seg.major_slippages(slip_rows, slip_algo)
@@ -421,7 +565,6 @@ if matched < totals["users"]:
         f"({dor_state['allocation_count']} users in the summary); unmatched users have a blank Allocation."
     )
 
-st.subheader("Algo Summary")
 st.caption(
     "All columns count users. Outliers are judged per user on **Lots per Cr** — combined "
     "lots ÷ normalise, where normalise = allocation / 1,00,000 (sub-1-Cr allocations "
@@ -429,37 +572,49 @@ st.caption(
     "Total Users (only users with no usable allocation carry no flag). Pick an algo below "
     "to see its outlier user ids."
 )
-summary_rows = algo_summary(tv_rows, used_multiplier)
-user_obs = user_lot_observations(tv_rows, used_multiplier)
-df_summary = pd.DataFrame([format_summary_row(s) for s in summary_rows], columns=SUMMARY_HEADER)
-st.dataframe(df_summary.style.set_properties(**{"text-align": "center"}),
-             width="stretch", hide_index=True)
+# one Algo Summary (and outlier bands) per MTM file — a secondary index's
+# Lots per Cr scale must not share a median with the primary's
+tv_view_groups = [(None, tv_rows)]
+if tv_groups:
+    tv_view_groups = [(mtm_label1, tv_groups["primary"]),
+                      (mtm_label2, tv_groups["secondary"])]
+tv_dor_sections = []
+for gi, (group_label, group_rows) in enumerate(tv_view_groups):
+    st.subheader("Algo Summary" + (f" — {group_label}" if group_label else ""))
+    summary_rows = algo_summary(group_rows, used_multiplier)
+    user_obs = user_lot_observations(group_rows, used_multiplier)
+    tv_dor_sections.append({"label": group_label, "summary": summary_rows,
+                            "obs": user_obs})
+    df_summary = pd.DataFrame([format_summary_row(s) for s in summary_rows],
+                              columns=SUMMARY_HEADER)
+    st.dataframe(df_summary.style.set_properties(**{"text-align": "center"}),
+                 width="stretch", hide_index=True)
 
-_summary_labels = [f"Algo {s['algo']}" + (f" · {s['user_type']}" if s["user_type"] else "")
-                   for s in summary_rows]
-algo_pick = st.selectbox(
-    "Outlier users — pick an algo / type",
-    ["—"] + _summary_labels,
-    key="summary_drill",
-)
-if algo_pick != "—":
-    picked = summary_rows[_summary_labels.index(algo_pick)]
-    flagged = [o for o in user_obs
-               if o["algo"] == picked["algo"] and o["trade_date"] == picked["trade_date"]
-               and o["user_type"] == picked["user_type"]
-               and o["outlier"] in ("Below average range", "Above average range")]
-    flagged.sort(key=lambda o: ((0, o["lots_per_cr"]) if o["outlier"].startswith("Below")
-                                else (1, -o["lots_per_cr"])))
-    if flagged:
-        df_flagged = pd.DataFrame(
-            [[o["user_id"], o["server"], round(float(o["lots_per_cr"]), 2),
-              format_indian(o["lots"]), o["outlier"]] for o in flagged],
-            columns=["User ID", "Server", "Lots per Cr", "Lots", "Outlier"],
-        )
-        st.dataframe(df_flagged.style.set_properties(**{"text-align": "center"}),
-                     width="stretch", hide_index=True)
-    else:
-        st.info("No outlier users in this algo.")
+    _summary_labels = [f"Algo {s['algo']}" + (f" · {s['user_type']}" if s["user_type"] else "")
+                       for s in summary_rows]
+    algo_pick = st.selectbox(
+        "Outlier users — pick an algo / type",
+        ["—"] + _summary_labels,
+        key=f"summary_drill_{gi}",
+    )
+    if algo_pick != "—":
+        picked = summary_rows[_summary_labels.index(algo_pick)]
+        flagged = [o for o in user_obs
+                   if o["algo"] == picked["algo"] and o["trade_date"] == picked["trade_date"]
+                   and o["user_type"] == picked["user_type"]
+                   and o["outlier"] in ("Below average range", "Above average range")]
+        flagged.sort(key=lambda o: ((0, o["lots_per_cr"]) if o["outlier"].startswith("Below")
+                                    else (1, -o["lots_per_cr"])))
+        if flagged:
+            df_flagged = pd.DataFrame(
+                [[o["user_id"], o["server"], round(float(o["lots_per_cr"]), 2),
+                  format_indian(o["lots"]), o["outlier"]] for o in flagged],
+                columns=["User ID", "Server", "Lots per Cr", "Lots", "Outlier"],
+            )
+            st.dataframe(df_flagged.style.set_properties(**{"text-align": "center"}),
+                         width="stretch", hide_index=True)
+        else:
+            st.info("No outlier users in this algo.")
 
 # ---- Portfolio analysis (from the MLOB) ----
 def _centered(df):
@@ -556,13 +711,28 @@ for r in strikes["per_strike"]:
 st.caption(
     f"{len(strikes['per_strike'])} distinct strikes traded"
     + (" (" + " · ".join(f"{s}: {n}" for s, n in sorted(seg_counts.items())) + ")" if seg_counts else "")
-    + " — a strike is one contract: index + expiry + strike + CE/PE; "
-    "both symbol formats (e.g. NIFTY21JUL26… and NIFTY26721…) count as one."
+    + " — a strike is one contract: index + strike + CE/PE; every symbol format "
+    "(e.g. NIFTY21JUL26…, NIFTY26721… and the spaced forms) counts as one. The "
+    "expiry per index comes from the expiry inputs at the top."
 )
 chain = strike_chain(strikes["per_strike"])
-expiries = sorted({expiry for _, expiry in chain})
-expiry_labels = [e.strftime("%d%b%y").upper() for e in expiries]
-segments = sorted({seg for seg, _ in chain})
+segments = sorted(chain)
+
+# expiry per index from the inputs at the top — a pure display label (one
+# orderbook holds a single expiry per index); "NA" when not entered
+expiry_map = {}
+for idx_name, entered in (("NIFTY", nifty_expiry), ("SENSEX", sensex_expiry),
+                          ("BANKNIFTY", banknifty_expiry)):
+    entered = entered.strip().upper()
+    if entered:
+        expiry_map[idx_name] = entered
+label_of = {s: expiry_map.get(s, "NA") for s in segments}
+expiry_labels = sorted(set(label_of.values()))
+missing_expiry = sorted(s for s in segments if s not in expiry_map)
+if missing_expiry:
+    st.info("No expiry entered for " + ", ".join(missing_expiry)
+            + " — enter it in the inputs at the top to label the chain "
+              "(shown as NA until then).")
 
 # day-mid per index from the open/close inputs -> the chain's ATM
 mids = {}
@@ -570,6 +740,8 @@ if nifty_open > 0 and nifty_close > 0:
     mids["NIFTY"] = (nifty_open + nifty_close) / 2
 if sensex_open > 0 and sensex_close > 0:
     mids["SENSEX"] = (sensex_open + sensex_close) / 2
+if banknifty_open > 0 and banknifty_close > 0:
+    mids["BANKNIFTY"] = (banknifty_open + banknifty_close) / 2
 
 s1, s2 = st.columns(2)
 with s1:
@@ -583,7 +755,7 @@ with s1:
     for r in strikes["by_algo_server"]:
         selected = [
             c for c in r["contracts"]
-            if (as_expiry == "All" or c[1].strftime("%d%b%y").upper() == as_expiry)
+            if (as_expiry == "All" or label_of.get(c[0], "NA") == as_expiry)
             and (as_index == "All" or c[0] == as_index)
         ]
         if selected:
@@ -617,9 +789,9 @@ with s2:
     c_exp, c_idx, c_n = st.columns(3)
     with c_exp:
         expiry_label = st.selectbox("Expiry", expiry_labels, key="chain_expiry")
-    expiry = expiries[expiry_labels.index(expiry_label)]
     with c_idx:
-        index = st.selectbox("Index", sorted(seg for seg, e in chain if e == expiry),
+        index = st.selectbox("Index",
+                             sorted(s for s in segments if label_of[s] == expiry_label),
                              key="chain_index")
     with c_n:
         n_around = st.number_input("No. of strikes", min_value=1, value=10, key="chain_n",
@@ -646,7 +818,7 @@ with s2:
         include.add("sqoff")
     by_strike = {}
     for r in strikes["per_strike"]:
-        if r["segment"] != index or r["expiry"] != expiry:
+        if r["segment"] != index:
             continue
         total = sum(float(lots) for (a, cat), lots in r.get("breakdown", {}).items()
                     if cat in include
@@ -689,29 +861,34 @@ st.header("Downloads")
 
 workbook = Workbook()
 workbook.remove(workbook.active)
-add_report_sheets(workbook, tv_rows, used_multiplier)
-add_strikes_sheet(workbook, strikes)
+add_report_sheets(workbook, tv_rows, used_multiplier,
+                  summary_groups=([("summary", tv_groups["primary"]),
+                                   ("summary 2", tv_groups["secondary"])]
+                                  if tv_groups else None))
+add_strikes_sheet(workbook, strikes, expiry_map)
 if pf_groups is not None:
     add_portfolio_sheet(workbook, portfolio_report(pf_groups, DEFAULT_PORTFOLIO_PATTERN))
 seg.add_segregation_sheets(workbook, dor_state["comp"], report_date)
+if comp2 is not None:
+    seg.add_segregation_sheets(workbook, comp2, report_date, suffix=" 2")
 excel_buffer = io.BytesIO()
 workbook.save(excel_buffer)
 
 # the report's slippage section carries the algo selection made in the
-# inputs (same as the dashboard); the chain centres on the entered day-mids
+# inputs (same as the dashboard); the chain centres on the entered day-mids;
+# each MTM file gets its own segregation + Algo Summary section
 dor_html = build_dor_html(
     report_date=report_date or "—",
     deviation=float(used_deviation),
     tv_totals=totals,
-    tv_summary=summary_rows,
-    pivot_stats=stats,
-    pivot_rows=pivot_rows_view,
-    user_obs=user_obs,
+    seg_sections=seg_dor_sections,
+    tv_sections=tv_dor_sections,
     strikes=strikes,
     slippage={"summary": slip_algo, "overall": slip_overall, "majors": slip_majors,
               "empty_note": slip_empty_note},
     portfolio=pf_groups,
     mids=mids,
+    expiry_map=expiry_map,
     excel_bytes=excel_buffer.getvalue(),
     excel_filename=f"DOR_{report_date or 'report'}.xlsx",
 )

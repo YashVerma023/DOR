@@ -157,49 +157,77 @@ def _classify_symbol(symbol):
     return ""
 
 
-# The SAME option contract circulates under two symbol formats (different
-# brokers/servers), so both must normalise to one key or a contract would be
-# counted as two distinct strikes:
-#   NIFTY21JUL2624100PE — DDMMMYY expiry (day, month name, 2-digit year)
-#   NIFTY2672124100PE   — YYMDD expiry (2-digit year, month digit, day;
-#                         Oct/Nov/Dec are written as the single letter O/N/D)
-_MONTH_NAMES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-                "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
-_MONTH_BY_NAME = {name: i + 1 for i, name in enumerate(_MONTH_NAMES)}
-_MONTH_BY_CODE = {**{str(i): i for i in range(1, 10)}, "O": 10, "N": 11, "D": 12}
-_CONTRACT_DDMMMYY = re.compile(
-    r"^(BANKNIFTY|NIFTY|SENSEX)(\d{2})(" + "|".join(_MONTH_NAMES) + r")(\d{2})(\d+)(CE|PE)$")
-_CONTRACT_YYMDD = re.compile(
-    r"^(BANKNIFTY|NIFTY|SENSEX)(\d{2})([1-9OND])(\d{2})(\d+)(CE|PE)$")
+# The SAME option contract circulates under several symbol formats (different
+# brokers / servers), so all of them must normalise to one key or a contract
+# would be counted as two distinct strikes. Every format seen in the wild:
+#
+#   spaced, 4-digit year, option type BEFORE strike
+#     NIFTY 27JAN2026 PE 25350        -> NIFTY 25350 PE
+#   spaced, 2-digit year, strike BEFORE option type
+#     SENSEX 16JUL26 77600 CE         -> SENSEX 77600 CE
+#   compact, day + month name + 2-digit year
+#     NIFTY21JUL2624100PE             -> NIFTY 24100 PE
+#   compact monthly, 2-digit year + month name, NO day
+#     NIFTY26JAN26400CE               -> NIFTY 26400 CE
+#   compact, 2-digit year + month code + day (O/N/D = Oct/Nov/Dec)
+#     NIFTY2612024450PE               -> NIFTY 24450 PE
+#     SENSEX25O2388700CE              -> SENSEX 88700 CE
+#
+# The EXPIRY is deliberately NOT parsed from the symbol: one orderbook covers
+# a single session in which every symbol of an index shares the same expiry
+# (all NIFTY rows one date, all SENSEX rows one date, …), and that date is
+# ENTERED in the dashboard — so a symbol only needs to give up its index,
+# strike and option type, and the date ambiguities of the compact forms
+# (NIFTY26JUL… = July-2026 monthly, not 26-Jul) disappear entirely.
+#
+# The strike is found by VALUE: index strikes sit in a known band, so in the
+# compact forms the tail digits that read as a plausible level are the strike
+# (NIFTY26JUL22600CE -> 22600, never the 600 of a "26-Jul-22" misread). The
+# bands are deliberately far wider than today's levels (NIFTY ~20-35k,
+# SENSEX ~65-88k, BANKNIFTY ~40-60k) to tolerate index drift. Strikes are
+# 5 digits today and the 5-wide tail is tried first; should an index ever
+# cross 1,00,000 the compact form turns genuinely ambiguous (the 5-digit
+# tail of a 6-digit strike can itself land in band) and this rule needs
+# revisiting.
+_STRIKE_RANGE = {
+    "NIFTY": (8_000, 60_000),
+    "BANKNIFTY": (20_000, 100_000),
+    "SENSEX": (40_000, 200_000),
+}
+_COMPACT_TAIL = re.compile(r"(\d+)(CE|PE)$")
 
 
-def parse_contract(symbol):
-    """Split an option symbol into its canonical contract key
-    (segment, expiry date, strike, option type) — both expiry formats
-    normalise to the same key. Returns None for anything that isn't a
-    NIFTY / BANKNIFTY / SENSEX option (futures, equity, other formats)."""
-    text = str(symbol or "").upper().replace(" ", "")
-    match = _CONTRACT_DDMMMYY.match(text)
-    if match:
-        segment, dd, mon, yy, strike, opt = match.groups()
-        month = _MONTH_BY_NAME[mon]
-    else:
-        match = _CONTRACT_YYMDD.match(text)
-        if not match:
-            return None
-        segment, yy, mcode, dd, strike, opt = match.groups()
-        month = _MONTH_BY_CODE[mcode]
-    try:
-        expiry = date(2000 + int(yy), month, int(dd))
-    except ValueError:
+def parse_strike(symbol):
+    """(segment, strike, option type) for an option symbol, else None for
+    anything that isn't a NIFTY / BANKNIFTY / SENSEX option (futures, equity)
+    or whose strike falls outside the index's plausible band."""
+    text = " ".join(str(symbol or "").upper().split()).replace("BANK NIFTY", "BANKNIFTY")
+    segment = _classify_symbol(text)
+    # the index must be the symbol's PREFIX — the substring classifier alone
+    # would let FINNIFTY / MIDCPNIFTY options through as NIFTY strikes
+    if not segment or not text.startswith(segment):
         return None
-    return (segment, expiry, int(strike), opt)
-
-
-def contract_label(contract):
-    """Display form of a contract key, e.g. "NIFTY 21JUL26 24100 PE"."""
-    segment, expiry, strike, opt = contract
-    return f"{segment} {expiry.strftime('%d%b%y').upper()} {strike} {opt}"
+    low, high = _STRIKE_RANGE[segment]
+    tokens = text.split()
+    if len(tokens) > 1:
+        # spaced forms: the strike is its own token next to CE/PE —
+        # "… PE 25350" (after) or "… 77600 CE" (before)
+        for i, tok in enumerate(tokens):
+            if tok in ("CE", "PE"):
+                for j in (i + 1, i - 1):
+                    if (0 <= j < len(tokens) and tokens[j].isdigit()
+                            and low <= int(tokens[j]) <= high):
+                        return (segment, int(tokens[j]), tok)
+    # compact forms: the strike is the tail of the digit run before CE/PE.
+    # Strikes are 5 digits today, so try that width first; 6 and 4 keep the
+    # parse working if an index ever crosses 1,00,000 or falls below 10,000.
+    match = _COMPACT_TAIL.search(text.replace(" ", ""))
+    if match:
+        run, opt = match.groups()
+        for width in (5, 6, 4):
+            if len(run) >= width and low <= int(run[-width:]) <= high:
+                return (segment, int(run[-width:]), opt)
+    return None
 
 
 def _user_key(value):
@@ -687,6 +715,23 @@ def _attach_lot_metrics(rows, std_multiplier=None):
     return rows
 
 
+def split_report_rows(rows, server_keys, std_multiplier=None):
+    """Split report rows into (outside, inside) the given server-key set and
+    re-judge each side's outliers on its OWN median ± MAD bands (the split is
+    in place — `rows` keeps the corrected flags).
+
+    Used when a secondary User MTM covers servers that ran a different index
+    (e.g. 8 NIFTY servers in the main MTM, 2 BANKNIFTY servers in the
+    secondary): BANKNIFTY lots per Cr sit on a different scale, so pooling
+    the two sets would corrupt both sides' bands."""
+    inside = [r for r in rows if _server_key(r["server"]) in server_keys]
+    outside = [r for r in rows if _server_key(r["server"]) not in server_keys]
+    for part in (outside, inside):
+        if part:
+            _attach_lot_metrics(part, std_multiplier)
+    return outside, inside
+
+
 def format_row(row):
     return [
         row["trade_date"].strftime("%d-%m-%Y") if row["trade_date"] else "",
@@ -773,12 +818,14 @@ def strike_report(orders, allocations=None):
     """The two strike summaries, computed over (deduped) orders:
 
       * by_algo_server — per (algo, server): how many DISTINCT contracts
-        (segment, expiry, strike, CE/PE) were traded. The algo comes from the
+        (segment, strike, CE/PE) were traded. The algo comes from the
         same MTM allocation matching as the trade value rows; orders whose
         user has no MTM entry land in a blank-algo bucket.
       * per_strike — per contract: total lots (sum |qty| / lot size, the same
         date-based lot math as the trade value rows) and order count.
 
+    A contract has no expiry axis — one orderbook holds a single expiry per
+    index, entered in the dashboard and applied as a display label there.
     Orders whose symbol doesn't parse as an option contract are skipped."""
     allocations = allocations or {}
     # Server -> algo fallback for users with no MTM entry: a server's algo is
@@ -794,13 +841,14 @@ def strike_report(orders, allocations=None):
                    for server, votes in server_algo_votes.items()}
 
     parse_cache = {}
+    for row in orders:
+        if row.symbol not in parse_cache:
+            parse_cache[row.symbol] = parse_strike(row.symbol)
+
     by_algo_server = {}
     per_strike = {}
     for row in orders:
-        if row.symbol in parse_cache:
-            contract = parse_cache[row.symbol]
-        else:
-            contract = parse_cache[row.symbol] = parse_contract(row.symbol)
+        contract = parse_cache[row.symbol]
         if contract is None:
             continue
         entry = _pick_allocation(allocations, _user_key(row.user_id), row.server)
@@ -831,35 +879,36 @@ def strike_report(orders, allocations=None):
         r["server"],
     ))
     strike_rows = [
-        {"segment": c[0], "expiry": c[1], "strike": c[2], "opt_type": c[3],
-         "label": contract_label(c), "lots": g["lots"], "order_count": g["order_count"],
+        {"segment": c[0], "strike": c[1], "opt_type": c[2],
+         "lots": g["lots"], "order_count": g["order_count"],
          "breakdown": g["breakdown"]}
         for c, g in per_strike.items()
     ]
-    strike_rows.sort(key=lambda r: (r["segment"], r["expiry"], r["strike"], r["opt_type"]))
+    strike_rows.sort(key=lambda r: (r["segment"], r["strike"], r["opt_type"]))
     return {"by_algo_server": algo_rows, "per_strike": strike_rows}
 
 
 def strike_chain(per_strike):
     """Pivot the per-strike rows into an option-chain view:
-    {(segment, expiry): [(ce_lots, strike, pe_lots), ...]} — one row per
-    strike price, sorted by strike, CE and PE lots side by side (0 when only
-    one side traded). Keys come out sorted by (segment, expiry)."""
+    {segment: [(ce_lots, strike, pe_lots), ...]} — one row per strike price,
+    sorted by strike, CE and PE lots side by side (0 when only one side
+    traded). Keys come out sorted by segment."""
     by_key = {}
     for row in per_strike:
-        sides = by_key.setdefault((row["segment"], row["expiry"]), {}) \
+        sides = by_key.setdefault(row["segment"], {}) \
                       .setdefault(row["strike"], {"CE": Decimal("0"), "PE": Decimal("0")})
         sides[row["opt_type"]] += row["lots"]
     return {
-        key: [(sides[s]["CE"], s, sides[s]["PE"]) for s in sorted(sides)]
-        for key, sides in sorted(by_key.items())
+        segment: [(sides[s]["CE"], s, sides[s]["PE"]) for s in sorted(sides)]
+        for segment, sides in sorted(by_key.items())
     }
 
 
-def add_strikes_sheet(workbook, strikes):
+def add_strikes_sheet(workbook, strikes, expiry_map=None):
     """Append the "Strikes" sheet: the per-(algo, server) distinct strike
     counts in columns A-C, and one option-chain block (CE | Strike | PE) per
-    (segment, expiry) stacked from column E. Lots are whole numbers."""
+    segment stacked from column E. `expiry_map` ({index: expiry text entered
+    in the dashboard}) captions each block. Lots are whole numbers."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
@@ -884,10 +933,11 @@ def add_strikes_sheet(workbook, strikes):
     for j in range(3):
         sheet.column_dimensions[get_column_letter(offset + j)].width = 12
     r = 1
-    for (segment, expiry), rows in strike_chain(strikes["per_strike"]).items():
+    for segment, rows in strike_chain(strikes["per_strike"]).items():
+        label = (expiry_map or {}).get(segment, "")
         sheet.merge_cells(start_row=r, start_column=offset, end_row=r, end_column=offset + 2)
         title = sheet.cell(row=r, column=offset,
-                           value=f"{segment} {expiry.strftime('%d%b%y').upper()}")
+                           value=f"{segment} {label}".rstrip())
         title.font = bold
         r += 1
         for j, header in enumerate(STRIKE_CHAIN_HEADER):
@@ -945,9 +995,11 @@ def _excel_report_row(row):
     ]
 
 
-def add_report_sheets(workbook, rows, std_multiplier=None):
+def add_report_sheets(workbook, rows, std_multiplier=None, summary_groups=None):
     """Append the "tradevalue" and "summary" sheets to an existing openpyxl
-    workbook (used to combine this report with other reports in one file)."""
+    workbook (used to combine this report with other reports in one file).
+    `summary_groups` ([(sheet title, rows), ...]) writes one summary sheet
+    per group — used when a secondary User MTM splits the outlier bands."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
@@ -956,24 +1008,27 @@ def add_report_sheets(workbook, rows, std_multiplier=None):
     for row in rows:
         sheet.append(_excel_report_row(row))
 
-    summary_sheet = workbook.create_sheet("summary")
-    summary_sheet.append(SUMMARY_HEADER)
-    for srow in algo_summary(rows, std_multiplier):
-        has_stats = srow["median_lots_per_cr"] is not None
-        summary_sheet.append([
-            srow["algo"],
-            srow["user_type"],
-            srow["users"],
-            _excel_number(srow["median_lots_per_cr"]),
-            (f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}"
-             if has_stats else ""),
-            srow["below"],
-            srow["in_range"],
-            srow["above"],
-        ])
-
     bold = Font(bold=True)
-    for ws, header in ((sheet, REPORT_HEADER), (summary_sheet, SUMMARY_HEADER)):
+    sized = [(sheet, REPORT_HEADER)]
+    for title, group_rows in summary_groups or [("summary", rows)]:
+        summary_sheet = workbook.create_sheet(title)
+        summary_sheet.append(SUMMARY_HEADER)
+        for srow in algo_summary(group_rows, std_multiplier):
+            has_stats = srow["median_lots_per_cr"] is not None
+            summary_sheet.append([
+                srow["algo"],
+                srow["user_type"],
+                srow["users"],
+                _excel_number(srow["median_lots_per_cr"]),
+                (f"{_fmt_decimal(srow['band_low'])}–{_fmt_decimal(srow['band_high'])}"
+                 if has_stats else ""),
+                srow["below"],
+                srow["in_range"],
+                srow["above"],
+            ])
+        sized.append((summary_sheet, SUMMARY_HEADER))
+
+    for ws, header in sized:
         for col_idx, title in enumerate(header, start=1):
             ws.cell(row=1, column=col_idx).font = bold
             ws.column_dimensions[get_column_letter(col_idx)].width = max(len(title) + 4, 12)

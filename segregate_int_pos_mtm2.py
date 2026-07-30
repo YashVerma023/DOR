@@ -129,10 +129,51 @@ def _assign_entries(book, user_ids, server_keys):
     return assigned
 
 
-def prepare_comp(compiled_source, four, one):
-    """Read the Updated Compiled User MTM (path or file-like) and enrich it
-    with Type / addons / adjusted realized / per-user return columns."""
-    comp = pd.read_excel(compiled_source, sheet_name="Sheet1")
+def read_compiled(source, name=None):
+    """Read a compiled User MTM into a DataFrame — CSV or Excel, decided by
+    the file name (the uploaders accept both)."""
+    if name and str(name).lower().endswith(".csv"):
+        return pd.read_csv(source)
+    return pd.read_excel(source, sheet_name="Sheet1")
+
+
+def split_max_loss_books(book, uids1, servers1, uids2, servers2):
+    """Route each max-loss entry to the MTM file that owns its account, for
+    runs with TWO compiled MTMs (indexes on different servers). Feeding the
+    full book to both prepare_comp calls would let _assign_entries' single-
+    row fallback apply the same entry in BOTH comps (double-counted addon,
+    wrong file classified Positional) whenever a user id appears in both.
+
+    An entry follows its server when that (id, server) exists in a file;
+    a blank/unmatched server follows the user id, primary winning ties —
+    the same precedence as the allocation merge."""
+    b1, b2 = {}, {}
+    for uid, entries in book.items():
+        for entry in entries:
+            server = entry["server"]
+            if server and server in servers2 and uid in uids2:
+                target = b2
+            elif server and server in servers1 and uid in uids1:
+                target = b1
+            elif uid in uids1:
+                target = b1
+            elif uid in uids2:
+                target = b2
+            else:
+                target = b1  # in neither file — prepare_comp drops it there
+            target.setdefault(uid, []).append(entry)
+    return b1, b2
+
+
+def prepare_comp(compiled_source, four, one, name=None, classified=None):
+    """Read the Updated Compiled User MTM (path, file-like or an already-read
+    DataFrame) and enrich it with Type / addons / adjusted realized /
+    per-user return columns. `classified` forces the Int/Pos split decision —
+    a secondary MTM may legitimately receive EMPTY split books in a 0DTE run
+    (none of its accounts are positional) and must still type its accounts
+    Intraday, not "All"; None keeps the books-present heuristic."""
+    comp = (compiled_source.copy() if isinstance(compiled_source, pd.DataFrame)
+            else read_compiled(compiled_source, name))
     comp["UserID"] = comp["UserID"].astype(str).str.strip()
 
     for col in ["Realized P&L", "ALLOCATION", "MAX LOSS", "Unrealized P&L"]:
@@ -154,12 +195,17 @@ def prepare_comp(compiled_source, four, one):
     four_rows = _assign_entries(four, user_ids, server_keys)
     one_rows  = _assign_entries(one, user_ids, server_keys)
 
+    # With no max-loss data at all nothing can be classified — every account
+    # becomes the single unlabelled "All" type instead of being called
+    # Intraday, which would be a claim the inputs cannot support.
+    unclassified = not (four or one) if classified is None else not classified
+
     def row_meta(i):
         ones, fours = one_rows.get(i, []), four_rows.get(i, [])
         a1 = sum(e["addon"] for e in ones)
         a4 = sum(e["addon"] for e in fours)
         if not ones and not fours:
-            return ("Intraday", "", a4, a1, 0.0)
+            return ("All" if unclassified else "Intraday", "", a4, a1, 0.0)
         utype = (ones or fours)[0]["type"]
         applied = a1 if str(utype).strip().lower() == "noren" else a1 + a4
         return ("Positional", utype, a4, a1, applied)
@@ -178,9 +224,19 @@ def prepare_comp(compiled_source, four, one):
     return comp
 
 
+def is_classified(comp):
+    """False when the report ran without any max-loss file — the accounts
+    then carry the single "All" type and no Int / Pos+Int split exists."""
+    return not (comp["Type"] == "All").any()
+
+
 def comp_stats(comp):
     n_pos   = int((comp["Type"] == "Positional").sum())
     n_noren = int((comp["User Type"].str.lower() == "noren").sum())
+    if not is_classified(comp):
+        # nothing to report per type — the caller hides those tiles
+        return {"accounts": len(comp), "positional": None,
+                "intraday": None, "noren": None}
     return {
         "accounts": len(comp),
         "positional": n_pos,
@@ -475,7 +531,8 @@ def pivot_rows(comp):
         algo_df    = comp[comp["ALGO"] == algo]
         algo_label = f"Algo {int(algo) if float(algo).is_integer() else algo}"
         algo_val   = _algo_val(algo)
-        for ttype, display_label in [("Intraday", "Int"), ("Positional", "Pos+Int")]:
+        for ttype, display_label in [("All", "All"), ("Intraday", "Int"),
+                                     ("Positional", "Pos+Int")]:
             sub = algo_df[algo_df["Type"] == ttype]
             if sub.empty:
                 continue
@@ -599,7 +656,7 @@ SLIP_DETAIL_HEADERS = ["ALGO", "SERVER", "UserID", "Alias", "ALLOCATION", "MAX L
 SLIP_MAJOR_HEADERS = SLIP_DETAIL_HEADERS + ["Algo Avg Slippage %"]
 
 
-def _write_slippage_sheet(wb, comp, report_date):
+def _write_slippage_sheet(wb, comp, report_date, suffix=""):
     """Sheet "Slippage": the per-algo summary on top (accounts / slippage
     accounts / avg slippage %), then every slippage account worst-first with
     the MAJOR rows (Realized ML % above the algo average) highlighted."""
@@ -607,7 +664,7 @@ def _write_slippage_sheet(wb, comp, report_date):
     per_algo, overall = slippage_summary(rows, comp)
     avg_by_algo = {s["ALGO"]: s["avg_slippage"] for s in per_algo}
 
-    ws4 = wb.create_sheet("Slippage")
+    ws4 = wb.create_sheet("Slippage" + suffix)
     n_cols = max(len(SLIP_SUMMARY_HEADERS), len(SLIP_DETAIL_HEADERS))
 
     ws4.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
@@ -696,10 +753,12 @@ def _write_slippage_sheet(wb, comp, report_date):
 
 
 # ====================== WORKBOOK ======================
-def add_segregation_sheets(wb, comp, report_date):
-    """Append the Segregation pivot + Raw_Data_Per_User + Worst 10%ile sheets
-    to an existing openpyxl workbook (used to combine reports in one file)."""
-    ws = wb.create_sheet("Segregation")
+def add_segregation_sheets(wb, comp, report_date, suffix=""):
+    """Append the Segregation pivot + Raw_Data_Per_User + Worst 10%ile +
+    Slippage sheets to an existing openpyxl workbook (used to combine reports
+    in one file). `suffix` (e.g. " 2") renames every sheet so a second MTM
+    file's set can sit beside the first."""
+    ws = wb.create_sheet("Segregation" + suffix)
 
     # Title row
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NCOLS)
@@ -747,7 +806,8 @@ def add_segregation_sheets(wb, comp, report_date):
 
         section_sub_rows = []
 
-        for ttype, display_label in [("Intraday", "Int"), ("Positional", "Pos+Int")]:
+        for ttype, display_label in [("All", "All"), ("Intraday", "Int"),
+                                     ("Positional", "Pos+Int")]:
             sub = algo_df[algo_df["Type"] == ttype]
             if sub.empty:
                 continue
@@ -849,9 +909,9 @@ def add_segregation_sheets(wb, comp, report_date):
         ws.column_dimensions[get_column_letter(j + 2)].width = w
     ws.row_dimensions[1].height = 22
 
-    _write_raw_sheet(wb, comp)
-    _write_worst_sheet(wb, comp, algos, report_date)
-    _write_slippage_sheet(wb, comp, report_date)
+    _write_raw_sheet(wb, comp, suffix)
+    _write_worst_sheet(wb, comp, algos, report_date, suffix)
+    _write_slippage_sheet(wb, comp, report_date, suffix)
 
 
 def build_workbook(comp, report_date):
@@ -864,7 +924,7 @@ def build_workbook(comp, report_date):
 
 
 # ====================== RAW PER-USER DATA SHEET ======================
-def _write_raw_sheet(wb, comp):
+def _write_raw_sheet(wb, comp, suffix=""):
     comp = comp.copy()
     comp["MTM_calc"] = comp["AdjRealized"] + comp["Unrealized P&L"]
     comp["SL Hit"]   = (comp["SL HIT/NOT"] == 1).astype(int)
@@ -891,7 +951,7 @@ def _write_raw_sheet(wb, comp):
     raw.columns = [hdr for hdr, _ in raw_cols]
     raw = raw.sort_values(["ALGO", "Type", "SERVER", "UserID"]).reset_index(drop=True)
 
-    ws2 = wb.create_sheet("Raw_Data_Per_User")
+    ws2 = wb.create_sheet("Raw_Data_Per_User" + suffix)
     for j, hdr in enumerate(raw.columns, start=1):
         cell           = ws2.cell(1, j, hdr)
         cell.fill      = header_fill
@@ -955,11 +1015,11 @@ def group_return(df_block):
     return (df_block["AdjRealized"].sum() / alloc) if alloc else 0.0
 
 
-def _write_worst_sheet(wb, comp, algos, report_date):
+def _write_worst_sheet(wb, comp, algos, report_date, suffix=""):
     comp = comp.copy()
     comp["SL Hit"] = (comp["SL HIT/NOT"] == 1).astype(int)
 
-    ws3 = wb.create_sheet("Worst 10%ile")
+    ws3 = wb.create_sheet("Worst 10%ile" + suffix)
 
     # Title row
     ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=W_NCOLS)
@@ -983,7 +1043,8 @@ def _write_worst_sheet(wb, comp, algos, report_date):
         algo_label = f"Algo {int(algo) if float(algo).is_integer() else algo}"
         d_fill, a_fill, s_fill = _algo_fills(i)
 
-        for ttype, display_label in [("Intraday", "Int"), ("Positional", "Pos")]:
+        for ttype, display_label in [("All", "All"), ("Intraday", "Int"),
+                                     ("Positional", "Pos")]:
             section = algo_df[algo_df["Type"] == ttype]
             worst   = worst_decile(section)
             if worst.empty:

@@ -55,6 +55,16 @@ NORMALISE_BASE = Decimal(100000)
 
 STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
+ORDER_SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Total Orders", "Executed",
+                        "Failed/Cancelled/Rejected", "Pending", "Hedge", "VAR"]
+ORDER_SERVER_HEADER = ["Server", "Users", "Total Orders", "Executed",
+                       "Failed/Cancelled/Rejected", "Pending", "Hedge", "VAR"]
+
+# An order that is still live at end of day is NOT a failure — the real
+# orderbook carries OPEN / OPEN_PENDING alongside CANCELLED and REJECTED, and
+# lumping them together would report live orders as rejected.
+PENDING_STATUSES = {"OPEN", "OPEN_PENDING", "TRIGGER_PENDING", "TRIGGER PENDING",
+                    "AMO_SUBMITTED", "PENDING"}
 
 
 # Outliers are judged per (date, algo, type) group by ROBUST deviation: a
@@ -233,8 +243,21 @@ def parse_strike(symbol):
 def _user_key(value):
     """Canonical user-id key for matching across files. Excel/CSV strips
     leading zeros from numeric ids ("04101961" becomes 4101961), so all-digit
-    ids are keyed without leading zeros; matching is also case-insensitive."""
+    ids are keyed without leading zeros; matching is also case-insensitive.
+
+    An all-numeric id can also come back from Excel as a FLOAT ("6954037.0"):
+    once a sheet holding only numeric ids is opened and saved, the column is
+    typed as a number and pandas renders it with a decimal. That trailing
+    ".0" is a formatting artifact, never part of an id, so it is dropped
+    before the leading-zero rule runs — otherwise "06954037" (text, in one
+    file) and "6954037.0" (float, in another) would key differently and the
+    account would silently go unmatched. Only a purely zero fraction is
+    stripped, so a genuine "1.5" is left alone."""
     key = str(value or "").strip().upper()
+    if "." in key:
+        head, _, tail = key.partition(".")
+        if head.isdigit() and tail and set(tail) == {"0"}:
+            key = head
     if key.isdigit():
         return key.lstrip("0") or "0"
     return key
@@ -380,7 +403,7 @@ def _cell(row, idx):
 Order = namedtuple(
     "Order",
     "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol "
-    "category",
+    "category status",
 )
 
 # Order tags mark the trade kind: "h_..." = hedge, "v_..." = VAR, "s_..." =
@@ -402,11 +425,15 @@ def _order_category(tag):
 FO_EXCHANGES = {"BFO", "NFO"}
 
 
-def read_orderbook(source, name=None):
+def read_orderbook(source, name=None, all_statuses=False):
     """Parse an orderbook CSV/Excel into Order tuples. Rows that never traded
     (status != COMPLETE), sit on a non-F&O exchange (anything but BFO / NFO —
     e.g. NSE cash rows like NIFTYBEES-EQ) or belong to none of the three
-    segments are dropped."""
+    segments are dropped.
+
+    `all_statuses=True` keeps the non-COMPLETE rows (rejected / cancelled /
+    failed) as well — they carry no traded quantity, so they feed only the
+    orders summary, never the trade value or strike math."""
     headers, rows = _read_table(source, name)
     if not headers:
         return []
@@ -434,7 +461,8 @@ def read_orderbook(source, name=None):
     for line_no, raw in enumerate(rows, start=2):
         if i_exchange is not None and _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
             continue
-        if i_status is not None and _cell(raw, i_status).upper() != "COMPLETE":
+        status = _cell(raw, i_status).upper() if i_status is not None else "COMPLETE"
+        if not all_statuses and status != "COMPLETE":
             continue
         symbol = _cell(raw, i_symbol)
         segment = _classify_symbol(symbol)
@@ -456,6 +484,7 @@ def read_orderbook(source, name=None):
             exch_order_id=_cell(raw, i_exch_order_id),
             symbol=sys.intern(symbol),
             category=_order_category(_cell(raw, i_tag)),
+            status=sys.intern(status),
         ))
     return orders
 
@@ -500,6 +529,77 @@ def read_allocations(source, name=None):
             "server": server,
         })
     return allocations
+
+
+def _type_index(type_map):
+    """{user key: its one Int / Pos+Int classification} for users whose every
+    account agrees — the fallback tier for _resolve_type."""
+    seen = {}
+    for (user_key, _server), user_type in (type_map or {}).items():
+        seen.setdefault(user_key, set()).add(user_type)
+    return {user: next(iter(types)) for user, types in seen.items() if len(types) == 1}
+
+
+def _resolve_type(type_map, type_index, user_key, server_key):
+    """An account's Int / Pos+Int, resolved the way _pick_allocation resolves
+    its allocation: the exact (user, server) account first, then the user's
+    own classification when all of their accounts agree.
+
+    Crucially it NEVER invents a default. A plain type_map.get(..., "Int")
+    fabricates an Intraday account whenever the server labels disagree
+    between the orderbook and the MTM — which is how an algo whose accounts
+    are every one of them Positional grew a phantom Int row. An account the
+    segregation genuinely doesn't know stays blank instead."""
+    exact = (type_map or {}).get((user_key, server_key))
+    if exact is not None:
+        return exact
+    return type_index.get(user_key, "")
+
+
+def add_user_aliases(allocations, orders):
+    """Match orderbook ids that drop the MTM's account suffix, in place.
+
+    The orderbook writes the BASE user id while the MTM writes the account:
+    orderbook JSR129 on VS5 is the MTM's JSR129A31, and on VS26 it is
+    JSR129A25 — two distinct accounts under one base id, told apart by the
+    server. Left unmatched these users get no algo and no type at all, so
+    they vanish from the Algo Summary and pile up in the "—" row while their
+    lots still count in the KPI.
+
+    Stripping a trailing "A<digits>" is NOT safe — R7RA1315 would reduce to
+    R7R and 7RA110119 to 7R, colliding with real ids. So the match is by
+    PREFIX WITHIN THE SAME SERVER, and only when exactly one MTM account on
+    that server extends the orderbook id. Anything ambiguous is left
+    unmatched rather than guessed.
+
+    Returns {(user key, server): matched MTM user id} for reporting."""
+    by_server = {}
+    for entries in allocations.values():
+        for entry in entries:
+            by_server.setdefault(entry["server"], []).append(entry)
+
+    unmatched = set()
+    for row in orders:
+        key = _user_key(row.user_id)
+        if _pick_allocation(allocations, key, row.server) is None:
+            unmatched.add((key, _server_key(row.server)))
+
+    resolved = {}
+    for key, server in sorted(unmatched):
+        if not key:
+            continue
+        candidates = [e for e in by_server.get(server, ())
+                      if len(e["user_id"]) > len(key)
+                      and _user_key(e["user_id"]).startswith(key)]
+        if len(candidates) != 1:
+            continue  # none, or ambiguous — never guess
+        entry = candidates[0]
+        bucket = allocations.setdefault(key, [])
+        if any(e["server"] == server for e in bucket):
+            continue
+        bucket.append(entry)
+        resolved[(key, server)] = entry["user_id"]
+    return resolved
 
 
 def _pick_allocation(allocations, user_key, server):
@@ -556,6 +656,7 @@ def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
     Without a map every account is one unlabelled group per algo."""
     allocations = allocations or {}
     type_map = type_map or {}
+    type_index = _type_index(type_map)
     groups = {}
     display = {}
     for row in rows:
@@ -593,8 +694,12 @@ def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
             "user_id": user_id,
             "allocation": entry["allocation"] if entry else None,
             "algo": entry["algo"] if entry else "",
-            "user_type": type_map.get((user_key, _server_key(server)),
-                                      "Int" if type_map else ""),
+            # type comes from the MATCHED MTM account, whose id can carry an
+            # account suffix the orderbook drops (JSR129 -> JSR129A31)
+            "user_type": _resolve_type(
+                type_map, type_index,
+                _user_key(entry["user_id"]) if entry else user_key,
+                _server_key(server)),
             "segment": segment,
             "order_count": group["order_count"],
             "quantity": group["quantity"],
@@ -715,21 +820,38 @@ def _attach_lot_metrics(rows, std_multiplier=None):
     return rows
 
 
-def split_report_rows(rows, server_keys, std_multiplier=None):
-    """Split report rows into (outside, inside) the given server-key set and
-    re-judge each side's outliers on its OWN median ± MAD bands (the split is
-    in place — `rows` keeps the corrected flags).
+def split_rows_by_segment(rows, std_multiplier=None):
+    """{index: rows} — the report rows grouped per index (NIFTY / BANKNIFTY /
+    SENSEX, whichever the orderbook holds), each group's outlier bands
+    RE-JUDGED within that index. The split is in place: `rows` keeps the
+    corrected flags.
 
-    Used when a secondary User MTM covers servers that ran a different index
-    (e.g. 8 NIFTY servers in the main MTM, 2 BANKNIFTY servers in the
-    secondary): BANKNIFTY lots per Cr sit on a different scale, so pooling
-    the two sets would corrupt both sides' bands."""
-    inside = [r for r in rows if _server_key(r["server"]) in server_keys]
-    outside = [r for r in rows if _server_key(r["server"]) not in server_keys]
-    for part in (outside, inside):
-        if part:
-            _attach_lot_metrics(part, std_multiplier)
-    return outside, inside
+    Lot sizes differ per index (NIFTY 65, SENSEX 20, BANKNIFTY 30 today), so
+    lots per Cr sits on a different scale in each — pooling them would give
+    every index a median that belongs to none of them.
+
+    A report row is per (user, segment), so each row lands in exactly one
+    group. NOTE the trade-off: a user trading two indexes now appears in
+    both tables, and in each their lots per Cr is that index's lots over
+    their WHOLE allocation — a partial-exposure figure, not the combined
+    one. multi_index_users() reports how many users that affects."""
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["segment"], []).append(row)
+    for part in groups.values():
+        _attach_lot_metrics(part, std_multiplier)
+    return dict(sorted(groups.items()))
+
+
+def multi_index_users(rows):
+    """How many distinct users traded more than one index, and which — the
+    accounts whose per-index Lots per Cr is a partial exposure (see
+    split_rows_by_segment). Returns (count, {user id: [indexes]})."""
+    by_user = {}
+    for row in rows:
+        by_user.setdefault(row["user_id"], set()).add(row["segment"])
+    multi = {user: sorted(segs) for user, segs in by_user.items() if len(segs) > 1}
+    return len(multi), multi
 
 
 def format_row(row):
@@ -744,9 +866,11 @@ def format_row(row):
         row["order_count"],
         _fmt_decimal(row["quantity"], places=0),
         _fmt_decimal(row["lots"], places=0),
-        _fmt_decimal(row["normalise"]) if row.get("normalise") is not None else "",
-        _fmt_decimal(row["lots_per_cr"]) if row.get("lots_per_cr") is not None else "",
-        _fmt_decimal(row["trade_value"]),
+        # every magnitude in a table is a whole number; only the Cr / Lakh
+        # compact values (format_crore) and the percentages keep decimals
+        _fmt_decimal(row["normalise"], places=0) if row.get("normalise") is not None else "",
+        _fmt_decimal(row["lots_per_cr"], places=0) if row.get("lots_per_cr") is not None else "",
+        _fmt_decimal(row["trade_value"], places=0),
         row.get("outlier", ""),
     ]
 
@@ -806,12 +930,177 @@ def format_summary_row(row):
         row["algo"],
         row["user_type"],
         row["users"],
-        _fmt_decimal(row["median_lots_per_cr"]) if has_stats else "",
-        f"{_fmt_decimal(row['band_low'])}–{_fmt_decimal(row['band_high'])}" if has_stats else "",
+        _fmt_decimal(row["median_lots_per_cr"], places=0) if has_stats else "",
+        (f"{_fmt_decimal(row['band_low'], places=0)}–"
+         f"{_fmt_decimal(row['band_high'], places=0)}") if has_stats else "",
         row["below"],
         row["in_range"],
         row["above"],
     ]
+
+
+def order_summary(orders, allocations=None, type_map=None):
+    """Per (algo, Int / Pos+Int) order counts, each row carrying its server
+    breakdown for the drill-down:
+
+        {"algo", "user_type", "users", "orders", "executed", "failed",
+         "hedge", "var", "servers": [{"server", "users", "orders", ...}]}
+
+    `orders` must come from read_orderbook(..., all_statuses=True) — with
+    only the COMPLETE rows the Failed column is structurally 0.
+
+      * Total Orders — every order the user fired, whatever its outcome
+      * Executed     — status COMPLETE (ties to the Trade Value Orders KPI)
+      * Failed       — rejected / cancelled
+      * Pending      — still live at end of day (OPEN / OPEN_PENDING): NOT
+                       a failure, so it gets its own column
+      * Hedge / VAR  — orders tagged `h_…` / `v_…`, counted across ALL
+                       statuses (they describe intent, not outcome)
+
+    Deduplication matches the trade value exactly: the COMPLETE rows are
+    deduped as their own set (so Executed ties to the KPI), the non-COMPLETE
+    rows as another.
+
+    Only OPTION orders count — the same scope as the strikes section. A
+    futures row is not index-options activity: one rejected
+    BANKNIFTY28JUL26FUT from a NIFTY-algo account would otherwise invent an
+    algo row in an index that algo never traded, and break the user-count
+    reconciliation with the Trade Value tables (which see no executed order
+    from it).
+
+    The (algo, type) of an order is resolved EXACTLY as aggregate() resolves
+    it for the trade value rows, so the two tables always agree. In
+    particular a user with no MTM entry has neither — they collect in one
+    blank "—" group instead of inheriting their server's algo, which would
+    invent an Int block under an algo that is entirely Pos+Int."""
+    allocations = allocations or {}
+    type_map = type_map or {}
+    type_index = _type_index(type_map)
+
+    complete = [o for o in orders if o.status == "COMPLETE"]
+    rest = [o for o in orders if o.status != "COMPLETE"]
+    deduped = dedup_orders(complete) + dedup_orders(rest)
+
+    is_option = {}
+    groups = {}
+    for row in deduped:
+        opt = is_option.get(row.symbol)
+        if opt is None:
+            opt = is_option[row.symbol] = parse_strike(row.symbol) is not None
+        if not opt:
+            continue
+        user_key = _user_key(row.user_id)
+        server_key = _server_key(row.server)
+        entry = _pick_allocation(allocations, user_key, row.server)
+        algo = entry["algo"] if entry else ""
+        user_type = (_resolve_type(type_map, type_index,
+                                   _user_key(entry["user_id"]), server_key)
+                     if entry else "")
+        group = groups.setdefault((algo, user_type), {"users": set(), "servers": {}})
+        group["users"].add(user_key)
+        bucket = group["servers"].setdefault(
+            server_key, {"users": set(), "orders": 0, "executed": 0,
+                         "failed": 0, "pending": 0, "hedge": 0, "var": 0})
+        bucket["users"].add(user_key)
+        bucket["orders"] += 1
+        if row.status == "COMPLETE":
+            bucket["executed"] += 1
+        elif row.status in PENDING_STATUSES:
+            bucket["pending"] += 1     # still live — not a failure
+        else:
+            bucket["failed"] += 1
+        if row.category == "hedge":
+            bucket["hedge"] += 1
+        elif row.category == "var":
+            bucket["var"] += 1
+
+    out = []
+    for (algo, user_type), group in groups.items():
+        servers = [{"server": server, "users": len(b["users"]), "orders": b["orders"],
+                    "executed": b["executed"], "failed": b["failed"],
+                    "pending": b["pending"], "hedge": b["hedge"], "var": b["var"]}
+                   for server, b in sorted(group["servers"].items())]
+        out.append({
+            "algo": algo,
+            "user_type": user_type,
+            # distinct across the algo's servers — a user on two servers counts once
+            "users": len(group["users"]),
+            # the ids themselves, so the blank-algo group can name the users
+            # that fired orders but are in no User MTM
+            "user_ids": sorted(group["users"]),
+            "orders": sum(s["orders"] for s in servers),
+            "executed": sum(s["executed"] for s in servers),
+            "failed": sum(s["failed"] for s in servers),
+            "pending": sum(s["pending"] for s in servers),
+            "hedge": sum(s["hedge"] for s in servers),
+            "var": sum(s["var"] for s in servers),
+            "servers": servers,
+        })
+    # numeric algos first in numeric order, then text algos, blank (unmatched) last
+    out.sort(key=lambda r: (
+        (2, "") if r["algo"] == "" else
+        (0, int(r["algo"])) if str(r["algo"]).isdigit() else (1, str(r["algo"])),
+        r["user_type"],
+    ))
+    return out
+
+
+def order_summary_totals(rows):
+    """The all-algo total row for the orders summary. Users are distinct
+    across algos only in so far as the rows already are — a user belongs to
+    one (algo, type) group, so the counts add up."""
+    return {
+        "users": sum(r["users"] for r in rows),
+        "orders": sum(r["orders"] for r in rows),
+        "executed": sum(r["executed"] for r in rows),
+        "failed": sum(r["failed"] for r in rows),
+        "pending": sum(r["pending"] for r in rows),
+        "hedge": sum(r["hedge"] for r in rows),
+        "var": sum(r["var"] for r in rows),
+    }
+
+
+def format_order_row(row):
+    # blank algo / type = a user with no MTM entry, shown as an explicit dash
+    return [row["algo"] or "—", row["user_type"] or "—", row["users"], row["orders"],
+            row["executed"], row["failed"], row["pending"], row["hedge"], row["var"]]
+
+
+def add_orders_sheet(workbook, order_rows, suffix=""):
+    """Append the "Orders" sheet: one row per (algo, type) with its servers
+    listed underneath, then the grand total. `suffix` (e.g. " 2") names the
+    second User MTM's sheet, matching the Segregation / summary sets."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    sheet = workbook.create_sheet("Orders" + suffix)
+    bold = Font(bold=True)
+    header = ORDER_SUMMARY_HEADER
+    for col_idx, title in enumerate(header, start=1):
+        cell = sheet.cell(row=1, column=col_idx, value=title)
+        cell.font = bold
+        sheet.column_dimensions[get_column_letter(col_idx)].width = max(len(title) + 3, 12)
+
+    r = 2
+    for row in order_rows:
+        for col_idx, value in enumerate(format_order_row(row), start=1):
+            sheet.cell(row=r, column=col_idx, value=value).font = bold
+        r += 1
+        for s in row["servers"]:
+            # server rows sit under their algo, indented in the Type column
+            values = ["", f"  {s['server']}", s["users"], s["orders"],
+                      s["executed"], s["failed"], s["pending"], s["hedge"], s["var"]]
+            for col_idx, value in enumerate(values, start=1):
+                sheet.cell(row=r, column=col_idx, value=value)
+            r += 1
+
+    totals = order_summary_totals(order_rows)
+    for col_idx, value in enumerate(
+            ["Total", "", totals["users"], totals["orders"], totals["executed"],
+             totals["failed"], totals["pending"], totals["hedge"],
+             totals["var"]], start=1):
+        sheet.cell(row=r, column=col_idx, value=value).font = bold
+    sheet.freeze_panes = "A2"
 
 
 def strike_report(orders, allocations=None):

@@ -13,14 +13,23 @@ import json
 from datetime import datetime
 
 from portfolio import DEFAULT_PORTFOLIO_PATTERN, portfolio_json, portfolio_report
-from tradevalue import format_crore, format_indian
+from tradevalue import format_crore, format_indian, order_summary_totals
 
 
 def _money(v):
+    """A magnitude in a table: always a WHOLE number, Indian-grouped. Every
+    count, quantity, lot, allocation and value uses this — decimals in a
+    table are noise. The two exceptions are format_crore() (the compact
+    "5.2 Cr" / "52.36 L" form, whose decimals are the precision) and _num2()
+    below."""
     return format_indian(v)
 
 
 def _num2(v):
+    """A PERCENTAGE — the only plain number that keeps 2 decimals, because
+    the value is a small ratio whose decimals carry the meaning (and the
+    slippage rule is defined at 0.1 granularity: 1.09 is not slippage,
+    1.10 is). Never use this for a magnitude; use _money()."""
     return format_indian(v, places=2)
 
 
@@ -77,7 +86,7 @@ def _tv_summary_table(tv_summary, user_obs=None, table_id="tv-summary"):
             f'<td class="txt"><span class="caret">&#9656;</span>{_esc(s["algo"])}</td>'
             f"<td>{_esc(s['user_type']) or '&mdash;'}</td>"
             f"<td>{s['users']}</td>"
-            f"<td>{_num2(s['median_lots_per_cr']) if has_stats else '&mdash;'}</td>"
+            f"<td>{_money(s['median_lots_per_cr']) if has_stats else '&mdash;'}</td>"
             f'<td class="below">{s["below"]}</td>'
             f"<td>{s['in_range']}</td>"
             f'<td class="above">{s["above"]}</td>'
@@ -85,10 +94,16 @@ def _tv_summary_table(tv_summary, user_obs=None, table_id="tv-summary"):
         )
         for o in flagged:
             cls = "below" if o["outlier"].startswith("Below") else "above"
+            # a user trading several indexes is judged here on this index's
+            # lots alone over their WHOLE allocation — flag that partial
+            # exposure so a "Below" verdict is not read as under-trading
+            others = o.get("also_trades") or []
+            note = (f' <span class="note">&#9888; also trades '
+                    f'{_esc(", ".join(others))}</span>') if others else ""
             body.append(
                 f'<tr class="lvl3 hidden" data-parent="{key}">'
                 f'<td class="txt"></td><td></td>'
-                f"<td>{_esc(o['user_id'])}</td>"
+                f"<td>{_esc(o['user_id'])}{note}</td>"
                 f"<td>{_esc(o['server'])}</td>"
                 f"<td>{_money(o['lots'])} lots</td>"
                 f'<td colspan="2" class="{cls}">{_esc(o["outlier"])}</td>'
@@ -106,6 +121,62 @@ def _tv_summary_table(tv_summary, user_obs=None, table_id="tv-summary"):
       <thead><tr>
         <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Median Lots per Cr</th>
         <th>Below</th><th>In</th><th>Above</th>
+      </tr></thead>
+      <tbody>{''.join(body)}</tbody>
+    </table>"""
+
+
+def _orders_table(order_rows, table_id="orders-summary"):
+    """The Orders Summary as a drill-down pivot — one row per (algo, Int /
+    Pos+Int) group; each row expands into its SERVERS, same column shape one
+    level down (users / total / executed / failed / hedge / VAR)."""
+    body = []
+    for i, r in enumerate(order_rows):
+        key = f"{table_id}-{i}"
+        body.append(
+            f'<tr class="algototal lvl1" data-key="{key}">'
+            f'<td class="txt"><span class="caret">&#9656;</span>{_esc(r["algo"]) or "&mdash;"}</td>'
+            f"<td>{_esc(r['user_type']) or '&mdash;'}</td>"
+            f"<td>{_money(r['users'])}</td>"
+            f"<td>{_money(r['orders'])}</td>"
+            f"<td>{_money(r['executed'])}</td>"
+            f'<td class="above">{_money(r["failed"])}</td>'
+            f"<td>{_money(r.get('pending', 0))}</td>"
+            f"<td>{_money(r['hedge'])}</td>"
+            f"<td>{_money(r['var'])}</td>"
+            "</tr>"
+        )
+        for s in r["servers"]:
+            body.append(
+                f'<tr class="lvl3 hidden" data-parent="{key}">'
+                f'<td class="txt"></td>'
+                f'<td class="txt">{_esc(s["server"]) or "&mdash;"}</td>'
+                f"<td>{_money(s['users'])}</td>"
+                f"<td>{_money(s['orders'])}</td>"
+                f"<td>{_money(s['executed'])}</td>"
+                f'<td class="above">{_money(s["failed"])}</td>'
+                f"<td>{_money(s.get('pending', 0))}</td>"
+                f"<td>{_money(s['hedge'])}</td>"
+                f"<td>{_money(s['var'])}</td>"
+                "</tr>"
+            )
+    totals = order_summary_totals(order_rows)
+    body.append(
+        '<tr class="grand"><td class="txt">Total</td><td class="txt"></td>'
+        f"<td>{_money(totals['users'])}</td>"
+        f"<td>{_money(totals['orders'])}</td>"
+        f"<td>{_money(totals['executed'])}</td>"
+        f"<td>{_money(totals['failed'])}</td>"
+        f"<td>{_money(totals.get('pending', 0))}</td>"
+        f"<td>{_money(totals['hedge'])}</td>"
+        f"<td>{_money(totals['var'])}</td></tr>"
+    )
+    return f"""
+    <table class="tbl drill-tbl" id="{table_id}">
+      <thead><tr>
+        <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Total Orders</th>
+        <th>Executed</th><th>Failed/Cancelled/Rejected</th><th>Pending</th>
+        <th>Hedge</th><th>VAR</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -653,14 +724,15 @@ def _pnl_td(value, crore=False):
 
 
 def _metric_cells(r):
-    # trimmed display set — Unrealized / MTM / P95 / P5 live in the Excel
-    # Segregation sheet, not the report view. Allocation is displayed x100
-    # (the stored value is in hundreds); P&L % keeps the stored basis.
+    # MTM is the only P&L figure in the report — its Realized and Unrealized
+    # parts live in the Excel workbook's Summary / MTM Data sheets.
+    # Allocation is displayed x100 (the stored value is in hundreds);
+    # MTM % = MTM / Allocation, on the stored basis.
     return (
         f"<td>{r['Users']}</td>"
         f"<td>{_esc(format_crore(r['MaxLoss']))}</td>"
         f"<td>{_esc(format_crore(r['Allocation'] * 100))}</td>"
-        f"{_pnl_td(r['Realized'], crore=True)}"
+        f"{_pnl_td(r['MTM'], crore=True)}"
         f"<td>{_num2(r['Return'])}</td>"
         f"<td>{r['SLHit']}</td>"
     )
@@ -740,7 +812,7 @@ def _pivot_table(pivot_rows, table_id="pivot-table"):
                         f'<td class="note">{_esc(u["Alias"])}</td>'
                         f"<td>{_esc(format_crore(u['MaxLoss']))}</td>"
                         f"<td>{_esc(format_crore(u['Allocation'] * 100))}</td>"
-                        f"{_pnl_td(u['Realized'], crore=True)}"
+                        f"{_pnl_td(u['MTM'], crore=True)}"
                         f"<td>{_num2(u['Return'])}</td>"
                         f"<td>{u['SLHit']}</td>"
                         "</tr>"
@@ -765,7 +837,7 @@ def _pivot_table(pivot_rows, table_id="pivot-table"):
       <thead><tr>
         <th class="txt">Type</th><th class="txt">Algo</th><th class="txt">Server</th>
         <th>Users</th><th>Max Loss</th><th>Allocation</th>
-        <th>Realized P&amp;L</th><th>P&amp;L %</th><th>SL Hit</th>
+        <th>MTM</th><th>MTM %</th><th>SL Hit</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -811,20 +883,23 @@ _PIVOT_SCRIPT = """
 def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_stats=None,
                    pivot_rows=None, user_obs=None, strikes=None, slippage=None,
                    portfolio=None, mids=None, excel_bytes=None, excel_filename=None,
-                   seg_sections=None, tv_sections=None, expiry_map=None):
+                   seg_sections=None, tv_sections=None, expiry_map=None,
+                   order_rows=None, order_sections=None, dte="0DTE"):
     """Assemble the complete DOR.html document and return it as a string.
     `user_obs` (per-user observations from tradevalue.user_lot_observations)
     feeds the Algo Summary drill-down (outlier user ids); `strikes` (from
     tradevalue.strike_report) feeds the strikes section; `slippage`
-    ({"summary", "overall", "majors"} from segregate_int_pos_mtm2, all
+    ({"summary", "overall", "majors"} from summary, all
     algos) feeds the slippage section with its in-page algo filter;
     `portfolio` (groups from portfolio.portfolio_groups) feeds the portfolio
     analysis — the QS table prerendered plus any-pattern analysis in the
     browser; `mids` ({index: day-mid price}) centres the option chain on the
     ATM strike; `expiry_map` ({index: expiry text entered in the dashboard})
     labels the strike chains; `excel_bytes`/`excel_filename` embed the full
-    workbook as a download button in the masthead. Each section is skipped
-    when its data is omitted.
+    workbook as a download button in the masthead; `dte` ("0DTE" / "1DTE" /
+    "4DTE") is the account scope the run covered and is shown in the masthead
+    and the segregation note. Each section is skipped when its data is
+    omitted.
 
     When a secondary User MTM is uploaded, pass `seg_sections`
     ([{"label", "stats", "rows"}, ...]) and `tv_sections` ([{"label",
@@ -849,35 +924,64 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
         stats, rows = sec["stats"], sec["rows"]
         grand = next((r for r in rows if r["kind"] == "grandtotal"), None)
         seg_pairs = [("Accounts", _money(stats["accounts"]))]
-        # no max-loss file -> no Positional / Intraday counts to show
+        # nothing matched the All User sheet -> no Positional / Intraday counts
         if stats.get("positional") is not None:
             seg_pairs += [
                 ("Positional", _money(stats["positional"])),
                 ("Intraday", _money(stats["intraday"])),
             ]
+        if stats.get("unclassified"):
+            seg_pairs += [("Unclassified", _money(stats["unclassified"]))]
         if grand:
             seg_pairs += [
                 ("Allocation", format_crore(grand["Allocation"] * 100)),
-                ("Realized P&L", format_crore(grand["Realized"]), _sign_cls(grand["Realized"])),
-                ("P&L %", _num2(grand["Return"])),
+                ("MTM", format_crore(grand["MTM"]), _sign_cls(grand["MTM"])),
+                ("MTM %", _num2(grand["Return"])),
             ]
         heading = f" &mdash; {_esc(sec['label'])}" if sec.get("label") else ""
+        unc_note = ""
+        if stats.get("unclassified"):
+            unc_note = (
+                f' {stats["unclassified"]} account(s) fall outside the '
+                f"{_esc(dte)} scope &mdash; absent from the All User sheet, dropped as "
+                "<code>DLR ACC</code> / <code>NOT RUNNING</code>, or running on other "
+                "days. They are grouped under <b>Unclassified</b> at the bottom of the "
+                "pivot; algo totals cover classified accounts only, the Grand Total "
+                "covers everything.")
         seg_blocks.append(f"""
 <section>
   <h2>Intraday / Positional Segregation{heading}</h2>
+  <div class="section-note">Accounts are typed from the All User sheet&rsquo;s
+  <b>Running Type</b> (INT &rarr; Int, POS &rarr; Pos+Int), narrowed to the accounts the
+  <b>{_esc(dte)}</b> scope covers. <b>MTM = Realized P&amp;L + Unrealized P&amp;L</b>, computed
+  per account from the User MTM sheet; <b>MTM %</b> = MTM / Allocation. The Realized and
+  Unrealized parts are in the Excel workbook&rsquo;s <b>Summary</b> and <b>MTM Data</b>
+  sheets.</div>
   {_kpi_tiles(seg_pairs)}
   <div class="card scroll">
     {_pivot_table(rows, table_id=f"pivot-table-{i}")}
   </div>
   <div class="footnote">
-    *Sub-Total server counts are per section; algo totals count each server once. The full
-    column set (Unrealized P&amp;L, MTM, P95/P5) is in the Excel workbook&rsquo;s Segregation
-    sheet.
+    *Sub-Total server counts are per section; algo totals count each server once. The
+    per-account base table every figure here aggregates (<b>MTM Data</b>) is in the Excel
+    workbook.{unc_note}
   </div>
 </section>""")
     seg_sections_html = "".join(seg_blocks)
 
     tv_blocks = []
+    multi_note = ""
+    if len(tv_sections) > 1 and any(o.get("also_trades")
+                                    for sec in tv_sections for o in (sec.get("obs") or [])):
+        multi_note = (
+            '<div class="footnote">&#9888; Each index is judged '
+            "<b>independently</b>. A user trading more than one index appears in "
+            "several tables, and in each their Lots per Cr is that index&rsquo;s lots "
+            "over their <b>whole</b> allocation &mdash; a partial-exposure figure. Such "
+            "a user reads lower than a single-index peer deploying the same capital and "
+            "can show as <i>Below average range</i> without under-trading; they are "
+            "marked <b>&#9888; also trades &hellip;</b> in the expanded outlier "
+            "rows.</div>")
     for i, sec in enumerate(tv_sections):
         heading = (f'<h3 class="pf-title">{_esc(sec["label"])}</h3>'
                    if sec.get("label") else "")
@@ -887,6 +991,50 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     {_tv_summary_table(sec["summary"], sec["obs"], table_id=f"tv-summary-{i}")}
   </div>""")
     tv_tables_html = "".join(tv_blocks)
+
+    if order_sections is None and order_rows:
+        order_sections = [{"label": None, "rows": order_rows}]
+    order_blocks = []
+    for i, sec in enumerate(order_sections or []):
+        if not sec["rows"]:
+            continue
+        heading = (f'<h3 class="pf-title">{_esc(sec["label"])}</h3>'
+                   if sec.get("label") else "")
+        unattributed = next((r for r in sec["rows"] if not r["algo"]), None)
+        note = ""
+        if unattributed:
+            note = (f'<div class="footnote"><b>&mdash;</b> = '
+                    f'{unattributed["users"]} user(s) that fired orders but appear in no '
+                    "User MTM, so they have no algo and no Int / Pos+Int type (the Trade "
+                    "Value Algo Summary leaves them out entirely): "
+                    + _esc(", ".join(unattributed.get("user_ids", []))) + "</div>")
+        order_blocks.append(f"""
+  {heading}
+  <div class="card scroll">
+    {_orders_table(sec["rows"], table_id=f"orders-summary-{i}")}
+  </div>
+  {note}""")
+    orders_section = f"""
+<section>
+  <h2>Orders Summary</h2>
+  <div class="section-note">Every <b>option</b> order fired, whatever its outcome, per
+  algo and Int / Pos+Int type &mdash; click a row to drill into its <b>servers</b>.
+  Futures rows are excluded (same scope as the strikes section): a rejected FUT order is
+  not index-options activity and would invent an algo row in an index that algo never
+  traded. <b>Executed</b> counts the COMPLETE orders;
+  <b>Failed/Cancelled/Rejected</b> counts the cancelled and rejected
+  ones; <b>Pending</b> counts orders still live at end of day (OPEN / OPEN_PENDING) &mdash;
+  live is not failed, so they are kept apart.
+  <b>Hedge</b> and <b>VAR</b> count the orders tagged <code>h_&hellip;</code> and
+  <code>v_&hellip;</code> across <i>all</i> statuses &mdash; the tag states intent, not
+  outcome, so they are a slice of Total Orders, not an extra column of it. Algo and type
+  are resolved exactly as in the Trade Value rows and the tables are split per index the
+  same way, so the user counts reconcile &mdash; the one legitimate difference is a user
+  whose <i>every</i> order in an index failed: they appear here (orders were fired) but
+  not in that index&rsquo;s Trade Value table (nothing executed). Users with no MTM entry
+  have neither an algo nor a type and collect in the <b>&mdash;</b> row.</div>
+  {''.join(order_blocks)}
+</section>""" if order_blocks else ""
 
     download_btn = ""
     if excel_bytes:
@@ -903,11 +1051,20 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     else:
         slippage_note = """
   <div class="section-note">ML % = MAX LOSS / ALLOCATION; Realized ML % =
-  |Realized P&amp;L| / ALLOCATION &mdash; plain ratios of allocation, same convention as
-  Return %. An account has slippage only when Realized ML % exceeds ML % by at least 0.1
+  |Realized P&amp;L| / ALLOCATION &mdash; measured on the <b>realized</b> loss, not MTM,
+  because a max-loss stop is about what was actually booked. Plain ratios of allocation,
+  same convention as MTM %. An account has slippage only when Realized ML % exceeds ML % by at least 0.1
   (1.00 &rarr; 1.09 is not slippage; 1.10 is). Avg Slippage = average Realized ML % of the
-  algo&rsquo;s slippage accounts; Major = slippage accounts above their algo&rsquo;s
-  average.</div>"""
+  algo&rsquo;s slippage accounts; <b>Major</b> = slippage accounts above their algo&rsquo;s
+  average, plus the lone slippage account of an algo &mdash; with one account the average
+  <i>is</i> that account, so it is that algo&rsquo;s worst by definition.</div>"""
+        no_sl = slippage.get("no_sl") or []
+        if no_sl:
+            slippage_note += f"""
+  <div class="footnote">&#8505; {len(no_sl)} account(s) carry an allocation but
+  <b>MAX LOSS = 0</b>, so no stop-loss is configured &mdash; they are <b>excluded</b> from
+  this analysis and listed in the Excel <b>no_sl_Acc</b> sheet:
+  {_esc(", ".join(n["UserID"] for n in no_sl[:10]))}{" &hellip;" if len(no_sl) > 10 else ""}.</div>"""
         empty_note = slippage.get("empty_note", "-- No slippage today --")
         slippage_body = (_slippage_tables(slippage) if slippage["overall"]["slipped"]
                          else '<div class="card"><div class="empty-note">'
@@ -1134,7 +1291,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
 <body>
 <div class="masthead">
   <div class="inner">
-    <div class="date">Report date<b>{_esc(report_date)}</b></div>
+    <div class="date">Report date<b>{_esc(report_date)}</b>{_esc(dte)}</div>
     <h1>Daily Operations Report</h1>
     <div class="sub">Trade Value &amp; Intraday / Positional Segregation — summary view</div>
     {download_btn}
@@ -1158,6 +1315,7 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     allocation carry no flag). Click an algo row to see its outlier user ids.
   </div>
   {tv_kpis}
+  {multi_note}
   {tv_tables_html}
   <div class="footnote">
     *Every account is normalised by allocation / 1,00,000 (e.g. 15,60,000 &rarr; 15.6;
@@ -1165,6 +1323,8 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     show each outlier user&rsquo;s id &middot; server &middot; actual lots fired &middot; flag.
   </div>
 </section>
+
+{orders_section}
 
 {portfolio_section}
 

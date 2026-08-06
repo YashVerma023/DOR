@@ -1,0 +1,7 @@
+# Streamlit config for the DOR app (applies when run from this folder).
+[server]
+# Default upload cap is 200 MB — the compiled orderbook alone can cross it
+# (28-Jul-2026 was ~145 MB and grows with volume). 500 MB gives headroom;
+# the files are processed in memory, so keep localhost RAM in mind before
+# raising it further.
+maxUploadSize = 500

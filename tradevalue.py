@@ -26,13 +26,17 @@ Usage:
 import argparse
 import csv
 import io
+import logging
 import re
 import statistics
 import sys
 from collections import Counter, namedtuple
+from statistics import NormalDist
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ORDERBOOK_PATTERN = "Compiled_Orderbook_*"
@@ -74,7 +78,25 @@ PENDING_STATUSES = {"OPEN", "OPEN_PENDING", "TRIGGER_PENDING", "TRIGGER PENDING"
 # account cannot widen the range that is meant to catch it. Functions that
 # take a `std_multiplier` accept k as a Decimal (e.g. 1, 1.5, 2); default 1.
 DEFAULT_STD_MULTIPLIER = Decimal("1")
-_MAD_SCALE = Decimal("1.4826")
+
+# The MAD -> std-dev consistency constant, 1 / Phi^-1(0.75) ~ 1.4826.
+#
+# DERIVED, not typed in: on normal data the median absolute deviation lands at
+# 0.6745 sigma, so raw MAD understates spread by a third. Scaling by this
+# recovers sigma, which is what makes the `k` in "median +/- k*MAD" mean the
+# same thing a std-dev multiplier would. It is a mathematical constant, not a
+# tunable — the tunable is k, which is a dashboard input.
+#
+# Computing it from the normal quantile keeps the reason visible in the code
+# rather than in a comment beside a magic number. (The literal 1.4826 changes
+# no flag on real data — the relative difference is 1.5e-6 — so this is for
+# readability, not accuracy.)
+#
+# NOTE the assumption it carries: the 0.6745 relationship holds for a NORMAL
+# distribution. Where an algo's users are near-identical the spread is tiny and
+# "std-dev equivalent" is a loose description, so read such a band as "distance
+# from the median" rather than a true sigma.
+_MAD_SCALE = Decimal(str(1 / NormalDist().inv_cdf(0.75)))
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +425,22 @@ def _cell(row, idx):
 Order = namedtuple(
     "Order",
     "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol "
-    "category status",
+    "category status minute",
 )
+
+# "09:16" from "05-Aug-2026 09:16:00" / "09:16:00" / a datetime cell. The
+# intraday chart buckets on this, so only hours and minutes are kept.
+_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+
+
+def _parse_minute(value):
+    match = _TIME_RE.search(str(value or ""))
+    if not match:
+        return ""
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return f"{hour:02d}:{minute:02d}"
+    return ""
 
 # Order tags mark the trade kind: "h_..." = hedge, "v_..." = VAR, "s_..." =
 # square-off; anything else is a normal trade.
@@ -454,6 +490,9 @@ def read_orderbook(source, name=None, all_statuses=False):
     i_exch_order_id = col("exchg_order_id", "exch_order_id", "exchange_order_id", "exchgorderid")
     i_rowid = col("row_id", "id", "sno")
     i_tag = col("tag")
+    # the clock time the order was placed — feeds the intraday chart only, so a
+    # file without it simply produces no dots rather than failing
+    i_time = col("order time", "order_time", "time", "exchange time")
     if i_symbol is None or i_avg is None or i_qty is None:
         raise ValueError("orderbook is missing the symbol / avg price / quantity columns")
 
@@ -485,6 +524,7 @@ def read_orderbook(source, name=None, all_statuses=False):
             symbol=sys.intern(symbol),
             category=_order_category(_cell(raw, i_tag)),
             status=sys.intern(status),
+            minute=sys.intern(_parse_minute(_cell(raw, i_time))),
         ))
     return orders
 
@@ -625,23 +665,85 @@ def _pick_allocation(allocations, user_key, server):
 # Such ids cannot be used as a dedup key.
 _SCI_NOTATION = re.compile(r"^-?\d+(\.\d+)?E[+-]?\d+$", re.IGNORECASE)
 
+# How many colliding keys to keep for the on-screen report.
+DUP_SAMPLE_SIZE = 5
 
-def dedup_orders(rows):
-    """Drop duplicate orders on (user_id, date, order_id, exchg_order_id),
-    keeping the first occurrence (lowest row id). Rows without a usable order
-    id (missing, or mangled into scientific notation by Excel) can't be keyed
-    and are kept as-is."""
+
+def duplicate_report(keys, label, sample_size=DUP_SAMPLE_SIZE):
+    """Count rows sharing a key, log the result, and return it as a dict.
+
+    `keys` is the per-row key sequence. Returns {"label", "rows", "distinct",
+    "colliding", "surplus", "samples"} where `surplus` is how many rows a
+    dedup on this key would remove.
+
+    Logged at INFO when the file is clean and WARNING when it is not, so a
+    duplicated upload is visible in the log without reading the dashboard."""
+    counts = Counter(keys)
+    colliding = [k for k, n in counts.items() if n > 1]
+    surplus = sum(counts[k] - 1 for k in colliding)
+    report = {
+        "label": label,
+        "rows": len(keys),
+        "distinct": len(counts),
+        "colliding": len(colliding),
+        "surplus": surplus,
+        "samples": [(k, counts[k]) for k in colliding[:sample_size]],
+    }
+    if colliding:
+        logger.warning(
+            "%s: %d duplicate row(s) across %d key(s) — %d of %d rows are "
+            "surplus and will be dropped (sample: %s)",
+            label, surplus, len(colliding), surplus, len(keys),
+            ", ".join(f"{k}x{n}" for k, n in report["samples"]),
+        )
+    else:
+        logger.info("%s: no duplicates — %d rows, all keys distinct",
+                    label, len(keys))
+    return report
+
+
+def _order_key(row):
+    """The orderbook's uniqueness key: user + date + order id + symbol.
+
+    The symbol carries the strike and option type, so this is
+    "userID + Date + Order_id + strike" as the desk states it. Note the raw
+    file is NOT unique on this key — a compiled orderbook repeats rows — but
+    every collision observed is byte-identical across all other columns, so
+    collapsing them is exactly what dedup is for."""
+    return (_user_key(row.user_id), row.trade_date, row.order_id, row.symbol)
+
+
+def dedup_orders(rows, label="orderbook"):
+    """Drop duplicate orders on (user_id, date, order_id, symbol), keeping the
+    first occurrence (lowest row id). Rows without a usable order id (missing,
+    or mangled into scientific notation by Excel) can't be keyed and are kept
+    as-is. The duplicate count is logged; use dedup_orders_with_report when
+    the caller also wants to display it."""
+    return dedup_orders_with_report(rows, label)[0]
+
+
+def dedup_orders_with_report(rows, label="orderbook"):
+    """(deduped rows, duplicate report) — see duplicate_report."""
     best = {}
     keyless = []
+    keys = []
     for row in rows:
         if not row.order_id or _SCI_NOTATION.match(row.order_id):
             keyless.append(row)
             continue
-        key = (_user_key(row.user_id), row.trade_date, row.order_id, row.exch_order_id)
+        key = _order_key(row)
+        keys.append(key)
         current = best.get(key)
         if current is None or row.rowid < current.rowid:
             best[key] = row
-    return list(best.values()) + keyless
+    report = duplicate_report(keys, label)
+    # rows that could not be keyed are passed through untouched — say so,
+    # otherwise the report's row count would silently disagree with the input
+    report["unkeyable"] = len(keyless)
+    if keyless:
+        logger.warning("%s: %d row(s) have no usable order id and bypass the "
+                       "duplicate check entirely", label, len(keyless))
+    return list(best.values()) + keyless, report
 
 
 def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
@@ -979,7 +1081,8 @@ def order_summary(orders, allocations=None, type_map=None):
 
     complete = [o for o in orders if o.status == "COMPLETE"]
     rest = [o for o in orders if o.status != "COMPLETE"]
-    deduped = dedup_orders(complete) + dedup_orders(rest)
+    deduped = (dedup_orders(complete, "orders summary · executed")
+               + dedup_orders(rest, "orders summary · not executed"))
 
     is_option = {}
     groups = {}
@@ -1101,6 +1204,69 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
              totals["var"]], start=1):
         sheet.cell(row=r, column=col_idx, value=value).font = bold
     sheet.freeze_panes = "A2"
+
+
+# Dot colours on the intraday chart. An order carries a STATUS (outcome) and a
+# TAG (intent) independently — 33,439 of the 05-08 orders are both COMPLETE and
+# hedge — so the two dimensions are collapsed into one disjoint category with
+# the TAG taking precedence. Status-first would leave "hedge" describing 2
+# orders out of 33,441, which would make the colour meaningless.
+LOT_CATEGORIES = ("complete", "failed", "hedge", "var")
+
+
+def _lot_category(order):
+    if order.category == "hedge":
+        return "hedge"
+    if order.category == "var":
+        return "var"
+    if order.status == "COMPLETE":
+        return "complete"
+    if order.status in PENDING_STATUSES:
+        return "pending"      # live, not failed — kept out of the four colours
+    return "failed"
+
+
+def lots_timeline(orders, allocations=None, deduped=True):
+    """{index: {"algos", "cats", "rows"}} — lots fired per minute, split by algo
+    and by the colour category above.
+
+    `rows` is [[minute, algo index, category index, lots], ...] with minute as
+    "HH:MM", compact enough to embed and let the browser re-bucket to any
+    timeframe and filter by algo without a round trip.
+
+    Square-off orders are excluded: they close a position rather than place
+    one, and on an expiry day they would otherwise dominate the last buckets.
+    Orders whose file carried no usable time are skipped and counted."""
+    allocations = allocations or {}
+    per_index, skipped = {}, 0
+
+    for row in orders:
+        if not row.minute or row.category == "sqoff":
+            skipped += not row.minute
+            continue
+        cat = _lot_category(row)
+        if cat not in LOT_CATEGORIES:
+            continue
+        entry = _pick_allocation(allocations, _user_key(row.user_id), row.server)
+        algo = str(entry["algo"]) if entry and entry["algo"] else "—"
+        lot_size = _LOT_SIZE_BY_SEGMENT[row.segment](row.trade_date)
+        bucket = per_index.setdefault(row.segment, {})
+        key = (row.minute, algo, cat)
+        bucket[key] = bucket.get(key, Decimal("0")) + abs(row.qty) / lot_size
+
+    out = {}
+    for index, buckets in per_index.items():
+        algos = sorted({k[1] for k in buckets},
+                       key=lambda a: (0, int(a)) if a.isdigit() else (1, a))
+        algo_at = {a: i for i, a in enumerate(algos)}
+        cat_at = {c: i for i, c in enumerate(LOT_CATEGORIES)}
+        rows = [[minute, algo_at[algo], cat_at[cat], round(float(lots), 2)]
+                for (minute, algo, cat), lots in sorted(buckets.items())]
+        out[index] = {"algos": algos, "cats": list(LOT_CATEGORIES), "rows": rows}
+    if skipped:
+        logger.warning("lots timeline: %d order(s) had no readable Order Time "
+                       "and are absent from the chart", skipped)
+    return out
 
 
 def strike_report(orders, allocations=None):

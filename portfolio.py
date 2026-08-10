@@ -17,14 +17,29 @@ report embeds the per-(algo, server, user, portfolio) groups so any other
 portfolio can be analysed instantly in the browser.
 """
 
+import logging
 from collections import Counter
 
 import pandas as pd
 
-from tradevalue import INDIAN_XLSX_FMT, _pick_allocation, _server_key, _user_key
+from tradevalue import (INDIAN_XLSX_FMT, _pick_allocation, _server_key,
+                        _user_key, duplicate_report)
+
+logger = logging.getLogger(__name__)
 
 MLOB_COLS = ["User ID", "Portfolio Name", "Transaction", "Avg Price",
              "Filled Quantity", "Status", "Server"]
+
+# Columns read ONLY to build the uniqueness key below.
+MLOB_KEY_EXTRA_COLS = ["Date", "Order ID", "Symbol"]
+
+# The MLOB's uniqueness key. It is NOT the orderbook's key: a multileg Order ID
+# is reused across legs and portfolios — in the 05-08-2026 file 4,504 order ids
+# span more than one portfolio and 2,213 carry a BUY leg AND a SELL leg. Keying
+# on user+date+order+symbol alone would merge the two sides of 31 pairs and
+# corrupt PnL, which is sell − buy. Adding Portfolio Name makes it unique
+# (verified: 68,228 distinct keys over 68,228 rows).
+MLOB_KEY_COLS = ["User ID", "Date", "Order ID", "Symbol", "Portfolio Name"]
 
 PORTFOLIO_SUMMARY_HEADER = ["Algo", "Server", "Portfolio Executed Users",
                             "No. of Portfolio", "Total Orders", "PnL"]
@@ -34,14 +49,37 @@ DEFAULT_PORTFOLIO_PATTERN = "QS"
 
 def read_mlob(source, name=None):
     """Read the Multileg Orders file (Excel or CSV; path or file-like),
-    keeping only the columns the analysis needs and the COMPLETE rows."""
+    keeping the columns the analysis needs and the COMPLETE rows.
+
+    Returns (dataframe, duplicate report). Duplicates are checked and dropped
+    on MLOB_KEY_COLS BEFORE the COMPLETE filter, so a duplicated row cannot
+    double-count a portfolio's orders or PnL. The key columns that the
+    analysis itself does not use are read only for this check and then
+    dropped."""
     filename = str(name or getattr(source, "name", source)).lower()
+    wanted = MLOB_COLS + [c for c in MLOB_KEY_EXTRA_COLS if c not in MLOB_COLS]
     if filename.endswith(".csv"):
-        df = pd.read_csv(source, usecols=MLOB_COLS)
+        df = pd.read_csv(source, usecols=lambda c: c in wanted)
     else:
-        df = pd.read_excel(source, sheet_name=0, usecols=MLOB_COLS)
+        df = pd.read_excel(source, sheet_name=0, usecols=lambda c: c in wanted)
+
+    missing = [c for c in MLOB_KEY_COLS if c not in df.columns]
+    if missing:
+        # without the key we cannot check — report it rather than pretending
+        logger.warning("MLOB is missing the key column(s) %s — duplicate check "
+                       "skipped", ", ".join(missing))
+        report = {"label": "multileg orders", "rows": len(df), "distinct": len(df),
+                  "colliding": 0, "surplus": 0, "samples": [], "unkeyable": len(df),
+                  "skipped": missing}
+    else:
+        keys = list(df[MLOB_KEY_COLS].astype(str).itertuples(index=False, name=None))
+        report = duplicate_report(keys, "multileg orders")
+        report["unkeyable"] = 0
+        if report["surplus"]:
+            df = df.drop_duplicates(subset=MLOB_KEY_COLS, keep="first")
+
     df = df[df["Status"].astype(str).str.strip().str.upper() == "COMPLETE"].copy()
-    return df
+    return df[[c for c in MLOB_COLS if c in df.columns]], report
 
 
 def portfolio_groups(mlob_df, allocations=None):

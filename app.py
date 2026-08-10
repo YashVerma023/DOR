@@ -15,12 +15,15 @@ and offers exactly two downloads:
 """
 
 import io
+import logging
+from datetime import date
 from decimal import Decimal
 
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 
+import marketdata
 import summary as seg
 from dor import build_dor_html
 from portfolio import (
@@ -45,7 +48,9 @@ from tradevalue import (
     aggregate,
     algo_summary,
     dedup_orders,
+    dedup_orders_with_report,
     format_crore,
+    lots_timeline,
     format_indian,
     format_order_row,
     format_row,
@@ -68,7 +73,16 @@ from tradevalue import _user_key as tv_user_key
 # returned by _process_all gains, loses or renames a field: it both busts the
 # st.cache_data entry and invalidates any session_state result an older build
 # left behind, so a shape change asks for a re-Process instead of crashing.
-STATE_VERSION = "dte-cumulative-v13"
+STATE_VERSION = "multi-chart-v19"
+
+# One-time logging setup. Streamlit re-runs this module on every interaction,
+# so guard against stacking a handler per rerun.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+    )
+logger = logging.getLogger("dor.app")
 
 st.set_page_config(page_title="Daily Operations Report", layout="wide")
 st.title("Daily Operations Report")
@@ -146,6 +160,20 @@ with in5:
         "Multileg Orders — MLOB (optional, enables the Portfolio Analysis)",
         type=["xlsx", "xlsm", "xls", "csv"],
     )
+# One ATM premium file per index, each optional — only the charted index's
+# file is read, so uploading all three costs nothing.
+st.caption("**ATM premium data** (optional) — adds the premium line to the "
+           "intraday chart. Only the charted index's file is used.")
+_prem_cols = st.columns(3)
+premium_files = {}
+for _col, _idx in zip(_prem_cols, marketdata.INDEX_SYMBOLS):
+    with _col:
+        premium_files[_idx] = st.file_uploader(
+            f"{_idx} premium ({marketdata.INDEX_ABBR[_idx]})",
+            type=["csv", "xlsx", "xlsm", "xls"], key=f"prem_file_{_idx}",
+            help="Any CSV/Excel with a time column and a premium value — the "
+                 "columns are auto-detected and correctable below.",
+        )
 with in6:
     summary2_file = st.file_uploader(
         "Secondary index User MTM (optional)",
@@ -157,23 +185,31 @@ with in6:
              "shown separately per MTM file.",
     )
 
-oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-with oc1:
-    nifty_open = st.number_input("NIFTY day open", min_value=0.0, value=0.0, step=50.0,
-                                 help="0 = not set. With day close, gives the day-mid "
-                                      "used as the option chain's ATM.")
-with oc2:
-    nifty_close = st.number_input("NIFTY day close", min_value=0.0, value=0.0, step=50.0)
-with oc3:
-    sensex_open = st.number_input("SENSEX day open", min_value=0.0, value=0.0, step=100.0)
-with oc4:
-    sensex_close = st.number_input("SENSEX day close", min_value=0.0, value=0.0, step=100.0)
-with oc5:
-    banknifty_open = st.number_input("BANKNIFTY day open", min_value=0.0, value=0.0,
-                                     step=100.0)
-with oc6:
-    banknifty_close = st.number_input("BANKNIFTY day close", min_value=0.0, value=0.0,
-                                      step=100.0)
+# ---------------------------------------------------------------------------
+# Market data — day High / Low per index. There is NO date input: the date is
+# read from the data itself (the compiled MTM's Date column, and the premium
+# upload when one is given), so the report can never be built against a date
+# nobody typed correctly.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="Fetching index levels…")
+def _index_levels(day):
+    """Day High / Low per index for `day`. Cached on the date, so changing any
+    other input does not refetch."""
+    return marketdata.fetch_index_levels(day)
+
+
+@st.cache_data(show_spinner="Fetching intraday series…")
+def _index_intraday(day, index_name):
+    """One-minute closes for the charted index. Fetched at 1m and bucketed to
+    the chosen timeframe IN THE BROWSER, so every timeframe comes from a single
+    embedded payload and switching one is instant."""
+    levels, problems = marketdata.fetch_index_levels(
+        day, indexes=[index_name], interval="1m")
+    entry = levels.get(index_name) or {}
+    return ([[bar["t"], round(bar["close"], 2)] for bar in entry.get("series", [])],
+            problems.get(index_name))
+
+
 
 # the expiry is NOT parsed from the strike symbols (their formats are too
 # ambiguous to trust) — every symbol of an index shares the session's single
@@ -350,7 +386,9 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # anything reads an algo, or the user drops out of every algo table
     aliases = add_user_aliases(allocations, all_orders)
 
-    deduped = dedup_orders(orders)
+    # every uploaded orderbook is duplicate-checked on
+    # user + date + order id + symbol before anything is aggregated
+    deduped, ob_dup = dedup_orders_with_report(orders, "orderbook")
     tv_rows = aggregate(deduped, allocations, multiplier, type_map)
     # Trade Value and Orders are reported PER INDEX — lot sizes (and so lots
     # per Cr) differ per index, and one pooled median would belong to none of
@@ -361,6 +399,12 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # the orders summary splits per MTM exactly like the trade value tables —
     # one table over ALL servers would compare a per-MTM Algo Summary against
     # an everything Orders Summary and the user counts could never agree
+    # lots fired per minute / algo / colour category — the intraday chart's
+    # dots. Built from ALL statuses so failed orders are visible, and from the
+    # raw list (not the deduped one) is deliberately avoided: duplicates would
+    # inflate the lots exactly as they would inflate the trade value.
+    lots_chart = lots_timeline(dedup_orders(all_orders), allocations)
+
     order_rows = order_summary(all_orders, allocations, type_map)
     orders_by_segment = {}
     for segment in sorted({o.segment for o in all_orders}):
@@ -369,8 +413,9 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
 
     # Portfolio analysis (optional MLOB)
     pf_groups = None
+    mlob_dup = None
     if mlob_bytes:
-        mlob = read_mlob(io.BytesIO(mlob_bytes), mlob_name)
+        mlob, mlob_dup = read_mlob(io.BytesIO(mlob_bytes), mlob_name)
         pf_groups = portfolio_groups(mlob, allocations)
 
     return {
@@ -382,6 +427,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         "allocation_count": len(allocations),
         "strikes": strikes,
         "order_rows": order_rows,
+        "lots_chart": lots_chart,
         "orders_by_segment": orders_by_segment,
         "portfolio_groups": pf_groups,
         "pivot_rows": seg.pivot_rows(comp),
@@ -390,6 +436,9 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         # only filled where Unrealized != 0, so it is recomputed — surfaced so
         # the correction is visible rather than silent
         "mtm_check": seg.mtm_column_mismatch(comp_df),
+        # duplicate checks on the two files that can carry repeats; the User
+        # MTM and All User sheets are pre-checked upstream and not tested here
+        "dup_checks": [r for r in (ob_dup, mlob_dup) if r],
         # diagnostic lookup for the "unclassified" sheet — covers every All
         # User row, dropped ones included, so it can say WHY an account fell out
         "all_user_ref": seg.all_user_reference(all_users),
@@ -415,6 +464,9 @@ def _signature():
         all_user_file.name if all_user_file else None,
         alias_file.name if alias_file else None,
         mlob_file.name if mlob_file else None,
+        # one premium upload per index, so the signature carries them all;
+        # `premium_file` (the charted index's one) does not exist yet here
+        tuple(sorted((idx, f.name) for idx, f in premium_files.items() if f)),
         deviation,
         dte,
     )
@@ -484,10 +536,73 @@ if dor_state.get("state_version") != STATE_VERSION:
 if dor_state["signature"] != _signature():
     st.warning("Inputs changed since the last run — click **Process** to refresh the results.")
 
+# Downloads sit here, right under the inputs — but the workbook and the HTML
+# can only be built once every section below has been computed. A container
+# reserves the slot now and is filled at the very end of the script, so the
+# buttons render at the top without moving the work that produces them.
+downloads_slot = st.container()
+
 tv_rows = dor_state["tv_rows"]
 used_deviation = dor_state["deviation"]
 used_multiplier = Decimal(str(used_deviation))
 report_date = dor_state["date"]
+
+# ---- Index day High / Low ----
+# The date is PRE-FILLED from the data (the compiled MTM's Date column) but
+# stays editable: the index series is fetched per date, so a missing or wrong
+# Date column must not strand the report, and a past day can be re-charted
+# without touching the uploads.
+st.subheader("Market data")
+_dc1, _dc2 = st.columns([1, 3])
+with _dc1:
+    try:
+        _default_date = marketdata._as_date(report_date) if report_date else date.today()
+    except ValueError:
+        _default_date = date.today()
+    market_date = st.date_input(
+        "Market date", value=_default_date, format="DD-MM-YYYY",
+        help="Which trading day's index data to fetch. Pre-filled from the "
+             "User MTM's Date column — change it only to override.",
+    )
+_market_date_text = f"{market_date:%d-%m-%Y}"
+if report_date and _market_date_text != report_date:
+    st.warning(
+        f"⚠️ Market date **{_market_date_text}** differs from the report date "
+        f"**{report_date}** read from the User MTM. The index levels and the "
+        "chart will describe a different day than the book below."
+    )
+
+_levels, _level_problems = _index_levels(market_date)
+if _levels:
+    with _dc2:
+        lvl_cols = st.columns(len(_levels))
+        for col, (idx_name, lv) in zip(lvl_cols, _levels.items()):
+            col.metric(
+                f"{idx_name} mid", f"{lv['mid']:,.2f}",
+                help=f"High {lv['high']:,.2f} · Low {lv['low']:,.2f} · "
+                     f"Open {lv['open']:,.2f} · Close {lv['close']:,.2f} ({lv['symbol']})",
+            )
+    st.caption(f"Index day High / Low for **{_market_date_text}** · "
+               "ATM anchor = (High + Low) / 2.")
+if _level_problems:
+    st.warning(
+        "Could not fetch " + ", ".join(sorted(_level_problems))
+        + f" for {_market_date_text} — " + list(_level_problems.values())[0]
+        + ". Enter the day mid manually below to still centre the chain."
+    )
+
+# manual override — only for the indexes the fetch could not resolve
+_manual_mids = {}
+if _level_problems:
+    man_cols = st.columns(len(_level_problems))
+    for col, idx_name in zip(man_cols, sorted(_level_problems)):
+        with col:
+            _manual_mids[idx_name] = st.number_input(
+                f"{idx_name} day mid (manual)", min_value=0.0, value=0.0,
+                step=50.0, key=f"manual_mid_{idx_name}",
+                help="0 = not set; the chain then simply is not centred for "
+                     "this index.",
+            )
 
 if not tv_rows:
     st.warning("No completed NIFTY / BANKNIFTY / SENSEX orders found in the orderbook.")
@@ -593,6 +708,30 @@ st.caption(
 # different shape must degrade to "no note" rather than a raw traceback. The
 # STATE_VERSION guard above is the real defence — this is the seatbelt for the
 # next time that bump is forgotten.
+# ---- Duplicate checks on the uploaded files ----
+for _dup in dor_state.get("dup_checks") or []:
+    if _dup.get("skipped"):
+        st.caption(
+            f"⚠️ **{_dup['label']}** — duplicate check skipped, the file is "
+            f"missing the key column(s): {', '.join(_dup['skipped'])}."
+        )
+    elif _dup["colliding"]:
+        _samples = ", ".join(f"`{' | '.join(str(p) for p in k)}` ×{n}"
+                             for k, n in _dup["samples"][:3])
+        st.caption(
+            f"🔁 **{_dup['label']}** — {format_indian(_dup['surplus'])} duplicate "
+            f"row(s) across {format_indian(_dup['colliding'])} key(s), removed "
+            f"before any aggregation. {format_indian(_dup['rows'])} rows in → "
+            f"{format_indian(_dup['distinct'])} unique. Sample: {_samples}"
+            + (f" · ⚠️ {_dup['unkeyable']} row(s) had no usable order id and "
+               "bypassed the check" if _dup.get("unkeyable") else "")
+        )
+    else:
+        st.caption(
+            f"✅ **{_dup['label']}** — no duplicates "
+            f"({format_indian(_dup['rows'])} rows, all keys distinct)."
+        )
+
 _mtm = dor_state.get("mtm_check")
 if isinstance(_mtm, dict) and _mtm.get("mismatch"):
     # report what was measured — the gap in rupees, not two crore-rounded
@@ -1041,14 +1180,144 @@ if missing_expiry:
             + " — enter it in the inputs at the top to label the chain "
               "(shown as NA until then).")
 
-# day-mid per index from the open/close inputs -> the chain's ATM
-mids = {}
-if nifty_open > 0 and nifty_close > 0:
-    mids["NIFTY"] = (nifty_open + nifty_close) / 2
-if sensex_open > 0 and sensex_close > 0:
-    mids["SENSEX"] = (sensex_open + sensex_close) / 2
-if banknifty_open > 0 and banknifty_close > 0:
-    mids["BANKNIFTY"] = (banknifty_open + banknifty_close) / 2
+# day-mid per index -> the chain's ATM. Fetched (High + Low) / 2 first, with
+# any manual entry filling in the indexes the fetch could not resolve.
+mids = marketdata.mids_from(_levels, _manual_mids)
+
+# ---- Intraday charts — ONE PER INDEX that traded ----
+# Normally NIFTY and SENSEX; a third appears on days BANKNIFTY is in the book.
+st.header("Intraday Charts")
+_chart_choices = [s for s in marketdata.INDEX_SYMBOLS if s in segments]
+chart_payloads = []
+if not _chart_choices:
+    st.info("No index traded in this orderbook, so there is nothing to chart.")
+for chart_index in _chart_choices:
+    st.markdown(f"**{chart_index}**")
+    chart_payload = None
+    _points, _chart_problem = _index_intraday(market_date, chart_index)
+    if _chart_problem:
+        st.warning(f"No intraday series for {chart_index} on "
+                   f"{_market_date_text} — {_chart_problem}. The chart is "
+                   "omitted from the report.")
+        chart_payload = None
+    elif not _points:
+        st.warning(
+            f"No 1-minute bars for {chart_index} on {_market_date_text}. "
+            "Yahoo keeps 1-minute history for roughly 30 days, so an older "
+            "report date returns nothing at this granularity."
+        )
+        chart_payload = None
+    else:
+        # series is a LIST so the premium line (and the algo-driven series
+        # after it) are appended here without touching the renderer
+        chart_payload = {
+            "index": chart_index,
+            "date": _market_date_text,
+            # tooltip reads "Index (SX)" / "Premium" — the short forms are far
+            # easier to scan at a hover point than the full index names
+            "series": [{"name": f"Index ({marketdata.INDEX_ABBR.get(chart_index, chart_index)})",
+                        "axis": "left", "points": _points}],
+            "shade": ["15:15", "15:40"],
+            "shade_label": "auction / extended window",
+            # axis ticks snap to these: index to the nearest 50, premium to 1
+            "axis_step": {"left": 50, "right": 1},
+            # dots: lots fired per minute, split by algo and colour category
+            "lots": (dor_state.get("lots_chart") or {}).get(chart_index),
+        }
+        st.caption(
+            f"📈 {chart_index} — {format_indian(len(_points))} one-minute bars "
+            f"({_points[0][0]} → {_points[-1][0]}), bucketed to the timeframe "
+            "chosen in the report."
+        )
+
+    # ---- Premium line — the charted index's own upload ----
+    premium_file = premium_files.get(chart_index)
+    if premium_file is None and chart_payload is not None:
+        st.caption(f"No premium file uploaded for **{chart_index}** — the chart "
+                   "shows the index and the lots dots only.")
+    if premium_file is not None and chart_payload is not None:
+        try:
+            _pdf, _guess = marketdata.read_premium(
+                io.BytesIO(premium_file.getvalue()), premium_file.name)
+        except Exception as exc:
+            st.error(f"Could not read the premium file: {exc}")
+            _pdf = None
+        if _pdf is not None and not _pdf.empty:
+            st.markdown("**Premium data — column mapping**")
+            _cols = list(_pdf.columns)
+            _none = "— none —"
+
+            def _pick(label, key, guessed, optional=False):
+                opts = ([_none] + _cols) if optional else _cols
+                default = guessed if guessed in opts else opts[0]
+                return st.selectbox(label, opts, index=opts.index(default),
+                                    key=f"prem_{key}_{chart_index}")
+
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            with pc1:
+                _t_col = _pick("Time column", "time", _guess["time"])
+            with pc2:
+                _v_col = _pick("Premium column", "value", _guess["value"])
+            with pc3:
+                _d_col = _pick("Date column", "date", _guess["date"], optional=True)
+            with pc4:
+                _i_col = _pick("Index column", "index", _guess["index"], optional=True)
+
+            # the file was uploaded into a named slot, so the index is already
+            # known — detection is used only to catch a file in the wrong slot
+            _prem_index = chart_index
+            _detected, _how = marketdata.detect_index(
+                _pdf, _guess, premium_file.name)
+            if _detected and _detected != chart_index:
+                st.warning(
+                    f"⚠️ This file was uploaded under **{chart_index}** but "
+                    f"looks like **{_detected}** ({_how}). Check you have not "
+                    "swapped the premium files."
+                )
+            elif _detected:
+                st.caption(f"🔎 Confirmed as **{_detected}** from {_how}.")
+
+            _prem_points, _prem_meta = marketdata.premium_series(
+                _pdf, _t_col, _v_col,
+                date_col=None if _d_col == _none else _d_col,
+                index_col=None if _i_col == _none else _i_col,
+                index_name=None if _i_col == _none else _prem_index,
+            )
+
+            if _prem_meta["dates"] and _market_date_text not in _prem_meta["dates"]:
+                st.warning(
+                    f"⚠️ The premium file's date(s) "
+                    f"({', '.join(_prem_meta['dates'])}) do not include the "
+                    f"market date **{_market_date_text}** — the two lines would "
+                    "describe different days."
+                )
+            if not _prem_points:
+                st.error(
+                    "No usable rows in the premium file with that mapping — "
+                    f"{_prem_meta['dropped_time']} row(s) had no readable time "
+                    f"and {_prem_meta['dropped_value']} no numeric value. "
+                    "Check the Time and Premium columns above."
+                )
+            else:
+                chart_payload["series"].append({
+                    "name": "Premium", "axis": "right", "points": _prem_points,
+                })
+                st.caption(
+                    f"💹 Premium: {format_indian(_prem_meta['used'])} minute(s) "
+                    f"from {format_indian(_prem_meta['rows'])} row(s) "
+                    f"({_prem_points[0][0]} → {_prem_points[-1][0]}, "
+                    f"{_prem_points[0][1]:,.2f} → {_prem_points[-1][1]:,.2f})"
+                    + (f" · {format_indian(_prem_meta['filtered_out'])} row(s) "
+                       f"for other indexes ignored"
+                       if _prem_meta["filtered_out"] else "")
+                )
+                with st.expander("Preview the parsed premium series"):
+                    st.dataframe(
+                        pd.DataFrame(_prem_points, columns=["Time", "Premium"]),
+                        width="stretch", hide_index=True, height=240)
+
+    if chart_payload is not None:
+        chart_payloads.append(chart_payload)
 
 s1, s2 = st.columns(2)
 with s1:
@@ -1103,7 +1372,7 @@ with s2:
     with c_n:
         n_around = st.number_input("No. of strikes", min_value=1, value=10, key="chain_n",
                                    help="Strikes shown above and below the ATM — applies "
-                                        "when the index has a day open/close entered.")
+                                        "when the index has a fetched day High / Low.")
     f_algo, f_h, f_v, f_s = st.columns([1.4, 1, 1, 1])
     breakdown_algos = sorted(
         {str(a) or "—" for r in strikes["per_strike"] for (a, _c) in r.get("breakdown", {})},
@@ -1162,10 +1431,9 @@ st.dataframe(df.style.set_properties(**{"text-align": "center"}),
              width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
-# Downloads — one Excel (all 5 sheets) + the shareable DOR.html
+# Build the Excel workbook and the shareable DOR.html. Both are rendered into
+# `downloads_slot` at the top of the page once assembled.
 # ---------------------------------------------------------------------------
-st.header("Downloads")
-
 workbook = Workbook()
 workbook.remove(workbook.active)
 add_report_sheets(workbook, tv_rows, used_multiplier,
@@ -1194,7 +1462,7 @@ workbook.save(excel_buffer)
 _file_stem = f"DOR_{_used_dte}_{report_date or 'report'}"
 
 # the report's slippage section carries the algo selection made in the
-# inputs (same as the dashboard); the chain centres on the entered day-mids;
+# inputs (same as the dashboard); the chain centres on the fetched day-mids;
 # each MTM file gets its own segregation + Algo Summary section
 dor_html = build_dor_html(
     report_date=report_date or "—",
@@ -1212,26 +1480,35 @@ dor_html = build_dor_html(
     excel_bytes=excel_buffer.getvalue(),
     excel_filename=f"{_file_stem}.xlsx",
     dte=_used_dte,
+    charts=chart_payloads,
 )
 
-d1, d2 = st.columns(2)
-with d1:
-    st.download_button(
-        "Download Excel — all data",
-        data=excel_buffer.getvalue(),
-        file_name=f"{_file_stem}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-    st.caption("tradevalue · summary · Strikes"
-               + (" · Portfolio QS" if pf_groups is not None else "")
-               + " · unclassified · Summary · MTM Data · Slippage · no_sl_Acc")
-with d2:
-    st.download_button(
-        "Download DOR.html — shareable summary report",
-        data=dor_html.encode("utf-8"),
-        file_name=f"{_file_stem}.html",
-        mime="text/html",
-        type="primary",
-    )
-    st.caption("Self-contained styled report (summary only) — share with any user or client.")
+# rendered into the slot reserved just under the inputs, so both buttons are
+# reachable without scrolling past the whole dashboard
+with downloads_slot:
+    st.subheader("Downloads")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download Excel — all data",
+            data=excel_buffer.getvalue(),
+            file_name=f"{_file_stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            width="stretch",
+        )
+        st.caption("tradevalue · summary · Strikes"
+                   + (" · Portfolio QS" if pf_groups is not None else "")
+                   + " · unclassified · Summary · MTM Data · Slippage · no_sl_Acc")
+    with d2:
+        st.download_button(
+            "Download DOR.html — shareable summary report",
+            data=dor_html.encode("utf-8"),
+            file_name=f"{_file_stem}.html",
+            mime="text/html",
+            type="primary",
+            width="stretch",
+        )
+        st.caption("Self-contained styled report (summary only) — "
+                   "share with any user or client.")
+    st.divider()

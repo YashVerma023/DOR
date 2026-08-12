@@ -596,7 +596,79 @@ def _resolve_type(type_map, type_index, user_key, server_key):
     return type_index.get(user_key, "")
 
 
-def add_user_aliases(allocations, orders):
+ACCOUNT_ALIAS_FILE = SCRIPT_DIR / "account_aliases.json"
+
+
+def load_account_aliases(path=None):
+    """{(orderbook user key, server key): MTM account id} from
+    account_aliases.json.
+
+    Keyed on the SERVER as well as the id, because one base id is a different
+    account per server — TB2433 is TB2433A41 on VS8 and TB2433A42 on VS29.
+    Missing file -> empty map, and matching falls back to prefix inference."""
+    import json
+
+    path = Path(path) if path else ACCOUNT_ALIAS_FILE
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.error("account_aliases.json could not be read (%s) — falling back "
+                     "to prefix inference", exc)
+        return {}
+    out = {}
+    for base, per_server in raw.items():
+        if str(base).startswith("_") or not isinstance(per_server, dict):
+            continue                       # the "_comment" block
+        for server, account in per_server.items():
+            out[(_user_key(base), _server_key(server))] = str(account)
+    return out
+
+
+def add_user_aliases(allocations, orders, account_aliases=None):
+    """See below. `account_aliases` (from load_account_aliases) is applied
+    FIRST; anything it does not cover falls back to prefix inference."""
+    explicit = (load_account_aliases() if account_aliases is None
+                else account_aliases)
+    resolved = _apply_explicit_aliases(allocations, orders, explicit)
+    resolved.update(_infer_user_aliases(allocations, orders))
+    return resolved
+
+
+def _apply_explicit_aliases(allocations, orders, explicit):
+    """Attach the stated (id, server) -> account mappings. An entry whose
+    account is not in the User MTM is logged and skipped rather than inventing
+    an allocation."""
+    if not explicit:
+        return {}
+    by_account = {}
+    for entries in allocations.values():
+        for entry in entries:
+            by_account[(_user_key(entry["user_id"]), entry["server"])] = entry
+
+    seen = {(_user_key(o.user_id), _server_key(o.server)) for o in orders}
+    resolved = {}
+    for (key, server), account in explicit.items():
+        if (key, server) not in seen:
+            continue                       # not trading today — nothing to do
+        entry = by_account.get((_user_key(account), server))
+        if entry is None:
+            logger.warning("account_aliases: %s on %s -> %s, but %s is not in "
+                           "the User MTM for that server — skipped",
+                           key, server, account, account)
+            continue
+        bucket = allocations.setdefault(key, [])
+        if any(e["server"] == server for e in bucket):
+            continue                       # already matched on its own id
+        bucket.append(entry)
+        resolved[(key, server)] = entry["user_id"]
+        logger.info("account_aliases: %s on %s -> %s (algo %s)",
+                    key, server, entry["user_id"], entry["algo"] or "-")
+    return resolved
+
+
+def _infer_user_aliases(allocations, orders):
     """Match orderbook ids that drop the MTM's account suffix, in place.
 
     The orderbook writes the BASE user id while the MTM writes the account:
@@ -1056,8 +1128,10 @@ def order_summary(orders, allocations=None, type_map=None):
       * Failed       — rejected / cancelled
       * Pending      — still live at end of day (OPEN / OPEN_PENDING): NOT
                        a failure, so it gets its own column
-      * Hedge / VAR  — orders tagged `h_…` / `v_…`, counted across ALL
-                       statuses (they describe intent, not outcome)
+      * Hedge / VAR  — EXECUTED orders tagged `h_…` / `v_…`, so both are
+                       slices of Executed and never exceed it. A cancelled
+                       hedge placed nothing in the market and is counted in
+                       Failed, with every other cancellation
 
     Deduplication matches the trade value exactly: the COMPLETE rows are
     deduped as their own set (so Executed ties to the KPI), the non-COMPLETE
@@ -1106,16 +1180,21 @@ def order_summary(orders, allocations=None, type_map=None):
                          "failed": 0, "pending": 0, "hedge": 0, "var": 0})
         bucket["users"].add(user_key)
         bucket["orders"] += 1
+        # STATUS first, then the tag sub-divides only what executed — so Hedge
+        # and VAR are slices of Executed, never of Total Orders. Counting the
+        # tag across all statuses (the previous behaviour) reported hedge
+        # orders that were cancelled as hedge activity: on 11-08 that read
+        # 1,82,855 hedge against 3,09,760 executed.
         if row.status == "COMPLETE":
             bucket["executed"] += 1
+            if row.category == "hedge":
+                bucket["hedge"] += 1
+            elif row.category == "var":
+                bucket["var"] += 1
         elif row.status in PENDING_STATUSES:
             bucket["pending"] += 1     # still live — not a failure
         else:
             bucket["failed"] += 1
-        if row.category == "hedge":
-            bucket["hedge"] += 1
-        elif row.category == "var":
-            bucket["var"] += 1
 
     out = []
     for (algo, user_type), group in groups.items():
@@ -1206,24 +1285,41 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
     sheet.freeze_panes = "A2"
 
 
-# Dot colours on the intraday chart. An order carries a STATUS (outcome) and a
-# TAG (intent) independently — 33,439 of the 05-08 orders are both COMPLETE and
-# hedge — so the two dimensions are collapsed into one disjoint category with
-# the TAG taking precedence. Status-first would leave "hedge" describing 2
-# orders out of 33,441, which would make the colour meaningless.
-LOT_CATEGORIES = ("complete", "failed", "hedge", "var")
+# Dot series on the intraday chart. STATUS decides first — an order that never
+# executed placed nothing in the market — and the TAG then sub-divides only the
+# orders that did complete:
+#
+#     complete = every executed lot            (= stoxxo + hedge + var)
+#       stoxxo   executed, normal tag
+#       hedge    executed, h_ tag
+#       var      executed, v_ tag
+#     failed   = every cancelled / rejected lot, WHATEVER the tag
+#
+# These OVERLAP by design: `complete` is the total and the next three are its
+# parts, so the legend must not be summed. An earlier version checked the tag
+# first, which put failed hedges into `hedge` — on 11-08 that inflated hedge to
+# 15.6 lakh lots against a 5.6 lakh executed book, and left `failed` showing
+# 1.1% of real failures because only normal-tagged failures reached it.
+LOT_CATEGORIES = ("complete", "stoxxo", "hedge", "var", "failed")
+
+# The parts of `complete`; used to assert the split adds back up.
+LOT_EXECUTED_PARTS = ("stoxxo", "hedge", "var")
 
 
-def _lot_category(order):
-    if order.category == "hedge":
-        return "hedge"
-    if order.category == "var":
-        return "var"
+def _lot_categories(order):
+    """Every series an order belongs to — a list, because `complete` overlaps
+    its own parts. Pending orders are still live and belong to none of them,
+    the same way the Orders Summary treats them as neither executed nor
+    failed."""
     if order.status == "COMPLETE":
-        return "complete"
+        if order.category == "hedge":
+            return ["complete", "hedge"]
+        if order.category == "var":
+            return ["complete", "var"]
+        return ["complete", "stoxxo"]
     if order.status in PENDING_STATUSES:
-        return "pending"      # live, not failed — kept out of the four colours
-    return "failed"
+        return []
+    return ["failed"]
 
 
 def lots_timeline(orders, allocations=None, deduped=True):
@@ -1244,15 +1340,17 @@ def lots_timeline(orders, allocations=None, deduped=True):
         if not row.minute or row.category == "sqoff":
             skipped += not row.minute
             continue
-        cat = _lot_category(row)
-        if cat not in LOT_CATEGORIES:
-            continue
+        cats = _lot_categories(row)
+        if not cats:
+            continue                      # pending: live, in none of the series
         entry = _pick_allocation(allocations, _user_key(row.user_id), row.server)
         algo = str(entry["algo"]) if entry and entry["algo"] else "—"
         lot_size = _LOT_SIZE_BY_SEGMENT[row.segment](row.trade_date)
+        lots = abs(row.qty) / lot_size
         bucket = per_index.setdefault(row.segment, {})
-        key = (row.minute, algo, cat)
-        bucket[key] = bucket.get(key, Decimal("0")) + abs(row.qty) / lot_size
+        for cat in cats:                  # `complete` AND the part it belongs to
+            key = (row.minute, algo, cat)
+            bucket[key] = bucket.get(key, Decimal("0")) + lots
 
     out = {}
     for index, buckets in per_index.items():

@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Orderbook base id -> User MTM account id, PER SERVER.",
+    "",
+    "Format:  \"<orderbook UserID>\": { \"<SERVER>\": \"<MTM UserID>\" }",
+    "",
+    "The orderbook records the base id while the User MTM records the full",
+    "account id with its A<nn> suffix. The same base id is a DIFFERENT account",
+    "on each server, so the mapping has to be keyed on the server too:",
+    "TB2433 on VS8 is TB2433A41 (algo 1), but on VS29 it is TB2433A42 (algo 7).",
+    "",
+    "add_user_aliases() can already infer these by prefix when exactly one MTM",
+    "account on that server extends the orderbook id. This file is the EXPLICIT",
+    "form, applied first: inference is a guess that silently stops working the",
+    "day a second account shares the prefix (TB2433A41 and TB2433A43 on one",
+    "server would be ambiguous, and the orders would fall to the '-' row).",
+    "Anything listed here is never guessed.",
+    "",
+    "Ids are matched case-insensitively and leading zeros are ignored, the same",
+    "as everywhere else. An entry whose server or account is absent from the",
+    "User MTM is reported and skipped, never silently applied.",
+    "",
+    "This file is optional: if it is missing, matching falls back to inference."
+  ],
+
+  "TB2433": {
+    "VS8": "TB2433A41",
+    "VS29": "TB2433A42"
+  },
+  "JSR129": {
+    "VS5": "JSR129A31",
+    "VS26": "JSR129A25"
+  }
+}

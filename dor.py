@@ -734,15 +734,17 @@ def _charts_section(charts):
   during the closing auction, so its line ends at 15:29 while order-driven series run to
   15:40 &mdash; the shaded band marks that auction / extended window rather than hiding the
   gap.
-  <br>The lower panel is <b>lots fired</b> per bucket:
-  <span class="dot-key" style="background:#15803D"></span>completed,
-  <span class="dot-key" style="background:#DC2626"></span>failed / cancelled / rejected,
-  <span class="dot-key" style="background:#EA580C"></span>hedge,
-  <span class="dot-key" style="background:#9333EA"></span>VAR.
-  An order carries a status and a tag independently, so the <b>tag wins</b>: a completed
-  hedge counts as hedge, never as completed, which keeps the four groups disjoint and the
-  totals reconciled. Square-off orders are excluded &mdash; they close a position rather
-  than place one.</div>
+  <br>The lower panel is <b>lots fired</b> per bucket.
+  <span class="dot-key" style="background:#15803D"></span><b>Completed</b> is every executed
+  lot and equals the Trade Value lots for that index;
+  <span class="dot-key" style="background:#0891B2"></span>Stoxxo,
+  <span class="dot-key" style="background:#EA580C"></span>Hedge and
+  <span class="dot-key" style="background:#9333EA"></span>VAR are its three parts, so
+  <b>Stoxxo + Hedge + VAR = Completed</b> &mdash; do not add the legend up.
+  <span class="dot-key" style="background:#DC2626"></span><b>Failed / cancelled</b> counts
+  every order that did not execute, whatever its tag. Orders still live at the close belong
+  to none of the five, and square-off orders are excluded &mdash; they close a position
+  rather than place one.</div>
   {''.join(blocks)}
 </section>
 {_CHART_SCRIPT}"""
@@ -780,10 +782,13 @@ _CHART_SCRIPT = """
 (function () {
   var NS = 'http://www.w3.org/2000/svg';
   var LINE = ['#1E40AF', '#B45309', '#0F766E', '#9333EA'];
-  var CAT_COLOR = {complete: '#15803D', failed: '#DC2626',
-                   hedge: '#EA580C', var: '#9333EA'};
-  var CAT_LABEL = {complete: 'Completed', failed: 'Failed',
-                   hedge: 'Hedge', var: 'VAR'};
+  // `complete` is the TOTAL executed; stoxxo/hedge/var are its three parts, so
+  // the legend must not be added up. `failed` is every non-executed lot.
+  var CAT_COLOR = {complete: '#15803D', stoxxo: '#0891B2',
+                   hedge: '#EA580C', var: '#9333EA', failed: '#DC2626'};
+  var CAT_LABEL = {complete: 'Completed (total)', stoxxo: 'Stoxxo',
+                   hedge: 'Hedge', var: 'VAR', failed: 'Failed / cancelled'};
+  var CAT_ORDER = ['complete', 'stoxxo', 'hedge', 'var', 'failed'];
   // two stacked panels sharing one time axis: prices above, lots below
   var W = 1080, H = 560, L = 76, R = 70, T = 20, B = 44;
   var LOTS_H = 150, GAP = 34;
@@ -996,7 +1001,7 @@ _CHART_SCRIPT = """
       });
 
       // ---- the dots, on stems so they read as activity off the baseline ----
-      var cats = Object.keys(lots);
+      var cats = CAT_ORDER.filter(function (c) { return lots[c] && lots[c].length; });
       var spread = Math.min(2.6, (W - L - R) / Math.max(x1 - x0, 1) * 0.5);
       cats.forEach(function (cat, ci) {
         var dx = (ci - (cats.length - 1) / 2) * spread;   // nudge so dots at the
@@ -1397,9 +1402,10 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
   <b>Failed/Cancelled/Rejected</b> counts the cancelled and rejected
   ones; <b>Pending</b> counts orders still live at end of day (OPEN / OPEN_PENDING) &mdash;
   live is not failed, so they are kept apart.
-  <b>Hedge</b> and <b>VAR</b> count the orders tagged <code>h_&hellip;</code> and
-  <code>v_&hellip;</code> across <i>all</i> statuses &mdash; the tag states intent, not
-  outcome, so they are a slice of Total Orders, not an extra column of it. Algo and type
+  <b>Hedge</b> and <b>VAR</b> count the <b>executed</b> orders tagged
+  <code>h_&hellip;</code> and <code>v_&hellip;</code> &mdash; both are slices of
+  <b>Executed</b>, never of Total Orders, so a cancelled hedge is counted in Failed with
+  every other cancellation. Algo and type
   are resolved exactly as in the Trade Value rows and the tables are split per index the
   same way, so the user counts reconcile &mdash; the one legitimate difference is a user
   whose <i>every</i> order in an index failed: they appear here (orders were fired) but

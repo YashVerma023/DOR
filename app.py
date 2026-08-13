@@ -54,6 +54,7 @@ from tradevalue import (
     format_indian,
     format_order_row,
     format_row,
+    fill_missing_servers,
     format_summary_row,
     indexes_in_orderbook,
     reference_bands_from_symbols,
@@ -76,7 +77,7 @@ from tradevalue import _user_key as tv_user_key
 # returned by _process_all gains, loses or renames a field: it both busts the
 # st.cache_data entry and invalidates any session_state result an older build
 # left behind, so a shape change asks for a re-Process instead of crashing.
-STATE_VERSION = "derived-strike-band-v20"
+STATE_VERSION = "orderbook-v2-format-v21"
 
 # One-time logging setup. Streamlit re-runs this module on every interaction,
 # so guard against stacking a handler per rerun.
@@ -385,6 +386,11 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
             existing = allocations.setdefault(key, [])
             seen = {e["server"] for e in existing}
             existing.extend(e for e in entries if e["server"] not in seen)
+    # a newer export carries no SERVER column — recover it per user from the
+    # User MTM before anything matches on it
+    all_orders, server_fill = fill_missing_servers(all_orders, allocations)
+    orders = [o for o in all_orders if o.status == "COMPLETE"]
+
     # the orderbook writes the BASE user id where the MTM writes the account
     # (JSR129 vs JSR129A31) — resolve those by prefix within the server before
     # anything reads an algo, or the user drops out of every algo table
@@ -461,6 +467,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         # duplicate checks on the two files that can carry repeats; the User
         # MTM and All User sheets are pre-checked upstream and not tested here
         "dup_checks": [r for r in (ob_dup, mlob_dup) if r],
+        "server_fill": server_fill,
         # diagnostic lookup for the "unclassified" sheet — covers every All
         # User row, dropped ones included, so it can say WHY an account fell out
         "all_user_ref": seg.all_user_reference(all_users),

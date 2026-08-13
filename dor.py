@@ -1220,6 +1220,34 @@ def _pivot_table(pivot_rows, table_id="pivot-table"):
     </table>"""
 
 
+_NOTE_SCRIPT = """
+<script>
+(function () {
+  // Collapse every explanatory block behind a small toggle. Done here rather
+  // than in the templates so each note keeps its position in the flow and no
+  // section markup has to change.
+  var LABEL = {'section-note': 'Description', 'footnote': 'Note'};
+  Object.keys(LABEL).forEach(function (cls) {
+    document.querySelectorAll('.' + cls).forEach(function (note, i) {
+      if (!note.textContent.trim()) return;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'note-toggle';
+      btn.setAttribute('aria-expanded', 'false');
+      btn.innerHTML = '<span class="caret">&#9656;</span>' + LABEL[cls];
+      note.classList.add('note-hidden');
+      note.parentNode.insertBefore(btn, note);
+      btn.addEventListener('click', function () {
+        var open = note.classList.toggle('note-hidden') === false;
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      });
+    });
+  });
+})();
+</script>
+"""
+
+
 _PIVOT_SCRIPT = """
 <script>
 (function () {
@@ -1536,6 +1564,24 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     font-size: 16px; font-weight: 700; margin-bottom: 4px; color: var(--header);
   }}
   .section-note {{ color: var(--muted); font-size: 12.5px; margin-bottom: 12px; }}
+  /* Explanatory blocks are collapsed behind a small toggle — the report is
+     dense enough without a paragraph above every table. The button is injected
+     by script, so no template needs to know about it. */
+  .note-toggle {{
+    display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+    border-radius: 999px; padding: 2px 10px; font-size: 11.5px; font-weight: 600;
+    margin-bottom: 10px; line-height: 1.7; font-family: inherit;
+  }}
+  .note-toggle:hover {{ border-color: var(--header-2); color: var(--ink); }}
+  .note-toggle .caret {{ font-size: 9px; transition: transform .12s; }}
+  .note-toggle[aria-expanded="true"] .caret {{ transform: rotate(90deg); }}
+  .note-hidden {{ display: none; }}
+  /* printing a report without its definitions would be worse than the clutter */
+  @media print {{
+    .note-toggle {{ display: none; }}
+    .note-hidden {{ display: block !important; }}
+  }}
   .card {{
     background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
     padding: 16px 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, .05);
@@ -1742,5 +1788,6 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
 </footer>
 {_DRILL_SCRIPT}
 {_PIVOT_SCRIPT}
+{_NOTE_SCRIPT}
 </body>
 </html>"""

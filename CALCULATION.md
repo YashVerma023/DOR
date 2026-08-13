@@ -123,6 +123,21 @@ Never guesses between accounts.
 
 ## 3. Deduplication
 
+> ### 🔑 The two dedup keys — at a glance
+>
+> **Orderbook**
+> ```
+> User ID + Order ID + Order Time + Exchg Order ID + Exchange Time + Tag
+> ```
+>
+> **Multileg orders (MLOB)** — deliberately different
+> ```
+> User ID + Date + Order ID + Symbol + Portfolio Name
+> ```
+>
+> They differ because a multileg Order ID is **reused across legs**. Applying the
+> orderbook key to the MLOB would merge a BUY leg with a SELL leg and corrupt PnL.
+
 A compiled orderbook repeats rows — on 05-08-2026, **67% of rows** were part of an exact
 duplicate pair.
 
@@ -144,7 +159,7 @@ price 0 with blank or non-index symbols, which the exchange filter discards anyw
 An Order ID in scientific notation is still **logged as a warning**: the parse survives it,
 but the source file should be exported with that column as text.
 
-**MLOB uses a different key:** `(User ID, Date, Order ID, Symbol, Portfolio Name)`.
+**Why the MLOB key differs** — `(User ID, Date, Order ID, Symbol, Portfolio Name)`.
 A multileg Order ID is reused across legs — on 05-08, 4,504 order ids spanned more than
 one portfolio and 2,213 carried a BUY leg *and* a SELL leg. The orderbook key would merge
 the two sides and corrupt PnL, which is `sell − buy`.
@@ -584,6 +599,34 @@ shaded and labelled rather than the gap being hidden or filled with invented dat
 ---
 
 ## 13. Portfolio analysis
+
+> ### Where the Multileg Orders (MLOB) sheet is used
+>
+> **The MLOB feeds the Portfolio Analysis and nothing else.**
+>
+> | Calculation | Uses MLOB? |
+> |---|---|
+> | Portfolio summary — orders, PnL, algo → server → user drill-down | ✅ |
+> | `Portfolio QS` Excel sheet | ✅ |
+> | Any-pattern portfolio analysis inside DOR.html | ✅ |
+> | Trade Value, lots, Lots per Cr, outliers | ❌ orderbook |
+> | Strikes / option chain | ❌ orderbook |
+> | Orders Summary | ❌ orderbook |
+> | Intraday chart — index, premium, lot dots | ❌ orderbook + market data |
+> | Segregation pivot, MTM, MTM % | ❌ User MTM + All User |
+> | Slippage, `no_sl_Acc` | ❌ User MTM |
+>
+> Omitting the MLOB removes the Portfolio section entirely; every other figure in the
+> report is unchanged.
+>
+> **Columns the analysis uses** (7): `User ID`, `Portfolio Name`, `Transaction`,
+> `Avg Price`, `Filled Quantity`, `Status`, `Server`.
+> **Read only to build the dedup key** (3): `Date`, `Order ID`, `Symbol`.
+> Everything else in the file — `Leg ID`, `Quantity`, `Exchg Order ID`, `Tag`, `Remarks`,
+> `Order Time`, … — is ignored.
+>
+> Note `Filled Quantity` is used, not `Quantity`: PnL must reflect what actually traded.
+> Lots are **not** derived from the MLOB — that comes from the orderbook.
 
 From the MLOB, **COMPLETE rows only**:
 

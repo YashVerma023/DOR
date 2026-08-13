@@ -68,7 +68,45 @@ ORDER_SERVER_HEADER = ["Server", "Users", "Total Orders", "Executed",
 # orderbook carries OPEN / OPEN_PENDING alongside CANCELLED and REJECTED, and
 # lumping them together would report live orders as rejected.
 PENDING_STATUSES = {"OPEN", "OPEN_PENDING", "TRIGGER_PENDING", "TRIGGER PENDING",
-                    "AMO_SUBMITTED", "PENDING"}
+                    "AMO_SUBMITTED", "PENDING", "NEW"}
+
+# The newer export writes "Filled" where the compiled orderbook wrote
+# "COMPLETE", and both spellings of cancelled appear. Normalised on read so
+# every downstream test can keep comparing against one vocabulary — without
+# this, 80% of the executed orders in the 12-08-2026 file would be counted as
+# failures.
+STATUS_ALIASES = {
+    "FILLED": "COMPLETE",
+    "COMPLETED": "COMPLETE",
+    "EXECUTED": "COMPLETE",
+    "CANCELED": "CANCELLED",
+}
+
+
+def _normalise_status(value):
+    text = str(value or "").strip().upper()
+    return STATUS_ALIASES.get(text, text)
+
+
+# One column can carry two orderings — 55,659 rows of the 12-08-2026 file read
+# "12-08-2026 09:16:00" and 14,101 read "09:15:23 12-08-2026", as if two source
+# systems were concatenated. The dedup key uses the timestamp, so both are
+# rewritten to "DD-MM-YYYY HH:MM:SS" or the same order would not collapse.
+_TS_DATE_FIRST = re.compile(r"^(\d{2}[-/]\d{2}[-/]\d{4})[ T]+(\d{1,2}:\d{2}(?::\d{2})?)")
+_TS_TIME_FIRST = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?)[ T]+(\d{2}[-/]\d{2}[-/]\d{4})")
+
+
+def _normalise_timestamp(value):
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return ""
+    match = _TS_DATE_FIRST.match(text)
+    if match:
+        return f"{match.group(1).replace('/', '-')} {match.group(2)}"
+    match = _TS_TIME_FIRST.match(text)
+    if match:
+        return f"{match.group(2).replace('/', '-')} {match.group(1)}"
+    return text
 
 
 # Outliers are judged per (date, algo, type) group by ROBUST deviation: a
@@ -557,24 +595,36 @@ def read_orderbook(source, name=None, all_statuses=False):
         found = _pick_column(headers, *candidates)
         return headers.index(found) if found else None
 
-    i_date = col("date", "trade_date")
+    # Both layouts are auto-detected: the compiled orderbook ("User ID",
+    # "Symbol", "Tag") and the newer export ("user_id", "traiding_symbol",
+    # "order_unique_identifier"). Candidate order matters — the first match
+    # wins — so where a file carries BOTH spellings the wanted one is listed
+    # first.
+    i_date = col("date", "_date", "trade_date")
     i_server = col("server")
     i_user = col("user_id", "userid", "user id", "UserID")
     i_exchange = col("exchange", "exch", "exchg")
-    i_symbol = col("symbol", "tradingsymbol", "trading_symbol")
-    i_avg = col("avg_price", "avg price", "OrderAverageTradedPrice", "AveragePrice", "price")
-    i_qty = col("quantity", "qty", "order_quantity", "OrderQuantity")
+    # note the misspelling in the newer export: "traiding_symbol"
+    i_symbol = col("symbol", "traiding_symbol", "trading_symbol", "tradingsymbol")
+    i_avg = col("avg_price", "avg price", "avg_traded_price",
+                "OrderAverageTradedPrice", "AveragePrice", "price")
+    # order_quantity is the quantity PLACED; `quantity` in the newer export is
+    # the quantity FILLED, which collapses a cancelled order to near zero.
+    # "lots fired" means placed, so order_quantity is preferred where both exist.
+    i_qty = col("order_quantity", "quantity", "qty", "OrderQuantity")
     i_status = col("status", "order_status", "OrderStatus")
-    i_order_id = col("order_id", "orderid", "order id")
-    i_exch_order_id = col("exchg_order_id", "exch_order_id", "exchange_order_id", "exchgorderid")
-    i_rowid = col("row_id", "id", "sno")
-    i_tag = col("tag")
+    i_order_id = col("order_id", "orderid", "order id", "broker_order_id")
+    i_exch_order_id = col("exchg_order_id", "exch_order_id", "exchange_order_id",
+                          "exchgorderid")
+    i_rowid = col("row_id", "sno", "id")
+    i_tag = col("tag", "order_unique_identifier")
     # the clock time the order was placed — feeds the intraday chart only, so a
     # file without it simply produces no dots rather than failing
-    i_time = col("order time", "order_time", "time")
+    i_time = col("order time", "order_time", "order_generated_time", "time")
     # the dedup key needs the exchange timestamp too; a file without it simply
     # contributes a blank component rather than failing
-    i_exch_time = col("exchange time", "exchange_time", "exchg time")
+    i_exch_time = col("exchange time", "exchange_time", "exchange_transact_time",
+                      "exchg time")
     if i_symbol is None or i_avg is None or i_qty is None:
         raise ValueError("orderbook is missing the symbol / avg price / quantity columns")
 
@@ -587,7 +637,8 @@ def read_orderbook(source, name=None, all_statuses=False):
     for line_no, raw in enumerate(rows, start=2):
         if i_exchange is not None and _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
             continue
-        status = _cell(raw, i_status).upper() if i_status is not None else "COMPLETE"
+        status = (_normalise_status(_cell(raw, i_status))
+                  if i_status is not None else "COMPLETE")
         if not all_statuses and status != "COMPLETE":
             continue
         symbol = _cell(raw, i_symbol)
@@ -599,7 +650,7 @@ def read_orderbook(source, name=None, all_statuses=False):
         except (ValueError, TypeError):
             rowid = line_no
         raw_tag = _cell(raw, i_tag)
-        raw_order_time = _cell(raw, i_time)
+        raw_order_time = _normalise_timestamp(_cell(raw, i_time))
         orders.append(Order(
             rowid=rowid,
             trade_date=_parse_date(_cell(raw, i_date)),
@@ -615,10 +666,55 @@ def read_orderbook(source, name=None, all_statuses=False):
             status=sys.intern(status),
             minute=sys.intern(_parse_minute(raw_order_time)),
             order_time=sys.intern(raw_order_time),
-            exchange_time=sys.intern(_cell(raw, i_exch_time)),
+            exchange_time=sys.intern(_normalise_timestamp(_cell(raw, i_exch_time))),
             tag=sys.intern(raw_tag),
         ))
     return orders
+
+
+def fill_missing_servers(orders, allocations, label="orderbook"):
+    """Backfill a blank SERVER from the User MTM, for exports that omit it.
+
+    The newer orderbook has no server column at all, but the MTM does and the
+    order's user id matches it, so the server can be recovered per user.
+
+    Only filled when the user has EXACTLY ONE server in the MTM. A user id
+    that exists on two servers is two distinct accounts with their own algo and
+    allocation, and guessing between them is precisely what `_pick_allocation`
+    refuses to do — those orders keep their blank server and stay unmatched,
+    which is visible rather than wrong. `account_aliases.json` is keyed on
+    (id, server) and therefore cannot resolve them either; the count is logged.
+
+    Returns (orders, report). Orders already carrying a server are untouched.
+    """
+    by_user = {}
+    for key, entries in (allocations or {}).items():
+        servers = {e["server"] for e in entries if e["server"]}
+        if len(servers) == 1:
+            by_user[key] = servers.pop()
+
+    filled = ambiguous = already = 0
+    out = []
+    for row in orders:
+        if _server_key(row.server):
+            already += 1
+            out.append(row)
+            continue
+        server = by_user.get(_user_key(row.user_id))
+        if server:
+            filled += 1
+            out.append(row._replace(server=sys.intern(server)))
+        else:
+            ambiguous += 1
+            out.append(row)
+
+    report = {"already": already, "filled": filled, "unresolved": ambiguous}
+    if filled or ambiguous:
+        logger.info("%s: server backfilled from the User MTM for %d order(s); "
+                    "%d already had one; %d could not be resolved (user absent "
+                    "from the MTM, or present on more than one server)",
+                    label, filled, already, ambiguous)
+    return out, report
 
 
 def indexes_in_orderbook(orders):

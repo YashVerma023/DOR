@@ -83,6 +83,12 @@ A raw order row survives only if **all** of these hold:
 
 ## 1.3 Deduplication
 
+> ### 🔑 Orderbook dedup key
+> ```
+> User ID + Order ID + Order Time + Exchg Order ID + Exchange Time + Tag
+> ```
+> The MLOB uses a **different** key — see §4.0.
+
 Duplicate orders are dropped on the key
 **User ID + Order ID + Order Time + Exchg Order ID + Exchange Time + Tag**, keeping the
 occurrence with the **lowest row id / SNO**.
@@ -394,6 +400,39 @@ otherwise stays out of the HTML.
 ---
 
 # Part 4 — Portfolio Analysis (`portfolio.py`)
+
+## 4.0 Where the MLOB is used — and where it is not
+
+**The Multileg Orders sheet feeds the Portfolio Analysis only.** No other figure in the
+report touches it:
+
+| Calculation | Source |
+|---|---|
+| Portfolio summary / `Portfolio QS` sheet / in-HTML any-pattern analysis | **MLOB** |
+| Trade Value, lots, Lots per Cr, outliers | orderbook |
+| Strikes / option chain | orderbook |
+| Orders Summary | orderbook |
+| Intraday chart (index, premium, lot dots) | orderbook + market data |
+| Segregation pivot, MTM, MTM % | User MTM + All User |
+| Slippage, `no_sl_Acc` | User MTM |
+
+Omit the MLOB and the Portfolio section simply disappears; nothing else changes.
+
+**Columns used** (7): `User ID`, `Portfolio Name`, `Transaction`, `Avg Price`,
+`Filled Quantity`, `Status`, `Server`. **Read only for the dedup key** (3): `Date`,
+`Order ID`, `Symbol`. Everything else (`Leg ID`, `Quantity`, `Tag`, `Remarks`, …) is ignored.
+
+> ### 🔑 MLOB dedup key — deliberately NOT the orderbook key
+> ```
+> User ID + Date + Order ID + Symbol + Portfolio Name
+> ```
+> A multileg Order ID is **reused across legs**: on 05-08, 4,504 order ids spanned more than
+> one portfolio and 2,213 carried a BUY leg *and* a SELL leg. The orderbook key would merge
+> the two sides and corrupt PnL, which is `sell − buy`.
+
+`Filled Quantity` is used rather than `Quantity`, so PnL reflects what actually traded.
+Lots are **not** derived from the MLOB — those come from the orderbook.
+
 
 Driven by the optional **Multileg Orders (MLOB)** input; shown just above the Strikes section.
 

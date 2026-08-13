@@ -7,21 +7,22 @@ A Streamlit app (plus standalone CLIs) that turns four raw inputs into the daily
    per-(algo, type) summary (a drill-down that reveals the outlier user ids), and the
    strikes-traded views (algo → server counts + a CE/Strike/PE option chain with ATM
    centring and hedge/VAR/sq-off/algo filters).
-2. **Intraday / Positional segregation** (§2) — a pivot of Realized/Unrealized P&L per algo →
-   Int / Pos+Int → server, with max-loss addons applied to positional accounts, the worst-10%ile
-   exception report, and the **slippage** view (accounts whose realized loss / allocation
-   overshoots their max-loss / allocation by ≥ 0.1).
+2. **Intraday / Positional segregation** (§2) — a pivot of MTM per algo →
+   Int / Pos+Int → server, classified from the **All User** sheet's `Running Type` and
+   narrowed by the **DTE** selected in the sidebar, plus the **slippage** view (accounts
+   whose realized loss / allocation overshoots their max-loss / allocation by ≥ 0.1).
+   `MTM = Realized P&L + Unrealized P&L`, always computed.
 
 3. **Portfolio analysis** (§4, optional — needs the Multileg Orders / MLOB input) — per
    (algo, server) portfolio summary with per-user drill-down for the "QS" portfolios by
    default, plus instant any-portfolio analysis inside the HTML report itself.
 
-Outputs: one Excel workbook `DOR_<date>.xlsx` (sheets: `tradevalue`, `summary`, `Strikes`,
-`Portfolio QS` when the MLOB is given, `Segregation`, `Raw_Data_Per_User`, `Worst 10%ile`,
-`Slippage`) and one self-contained, client-shareable `DOR_<date>.html` (all tables
+Outputs: one Excel workbook `DOR_<DTE>_<date>.xlsx` (sheets: `unclassified`, `tradevalue`,
+`summary`, `Strikes`, `Orders`, `Portfolio QS` when the MLOB is given, `Summary`,
+`MTM Data`, `Slippage`, `no_sl_Acc`) and one self-contained, client-shareable `DOR_<date>.html` (all tables
 center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,536`).
 When a **secondary index User MTM** is uploaded (§below) the workbook carries a second set —
-`summary 2`, `Segregation 2`, `Raw_Data_Per_User 2`, `Worst 10%ile 2`, `Slippage 2` — and the
+`summary 2`, `Summary 2`, `MTM Data 2`, `Slippage 2` — and the
 dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once **per MTM file**.
 
 ## Files
@@ -30,7 +31,11 @@ dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once 
 |---|---|
 | `app.py` | Streamlit UI — upload the inputs, set the outlier deviation, one **Process** click computes everything. Run with `streamlit run app.py`. |
 | `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1`). |
-| `segregate_int_pos_mtm2.py` | Segregation engine: pivot, raw per-user sheet, worst 10%ile, slippage (also an interactive CLI). |
+| `summary.py` | Summary engine: All User classification, DTE scope, MTM, pivot, `MTM Data`, slippage, `no_sl_Acc` (also an interactive CLI). |
+| `marketdata.py` | Index day High/Low + intraday series (yfinance), premium-file parsing. |
+| `user_aliases.json` | All User id ↔ MTM id, when the two files name an account differently. |
+| `account_aliases.json` | Orderbook base id → MTM account id, per server. |
+| `CALCULATION.md` | Every formula and constant, with the reasoning. |
 | `portfolio.py` | Portfolio analysis engine over the Multileg Orders (MLOB): per-portfolio / per-user PnL, QS summary, any-pattern reports. |
 | `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters, the drill-downs and the in-page portfolio analysis are plain inline JS). |
 
@@ -41,8 +46,8 @@ dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once 
 | Compiled Orderbook (CSV/Excel) | Trade value rows |
 | Compiled User MTM (CSV/Excel) | Allocations + algo for trade value; the account universe for segregation |
 | Secondary index User MTM (optional, CSV/Excel) | When two indexes ran on **different servers** (e.g. 8 NIFTY servers + 2 BANKNIFTY servers) the orderbook is combined but the User MTM comes as two files — the second file's accounts join the allocation matching, and its servers get their **own** segregation cards/pivot, Algo Summary and outlier (median ± MAD) bands, so one index's Lots-per-Cr scale never corrupts the other's |
-| Combined Max Loss — 1DTE (required in 0DTE mode) | Positional classification + realized-P&L addon |
-| Combined Max Loss — 4DTE (optional) | Extra addon for non-Noren positional accounts |
+| All User Details (Excel, tab `Main`) — **required** | Int / Pos+Int classification via `Running Type`, DTE scope via `Running Days` |
+| ATM premium file per index (optional) | The premium line on the intraday chart |
 | Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
 | Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (median ± k × MAD, per algo + type group) — drives the flags and the Algo Summary Range |
 | NIFTY / SENSEX / BANKNIFTY day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
@@ -78,10 +83,19 @@ A raw order row survives only if **all** of these hold:
 
 ## 1.3 Deduplication
 
-Duplicate orders are dropped on the key **(user key, trade date, order_id, exchg_order_id)**,
-keeping the occurrence with the **lowest row id / SNO**. Rows whose order id is missing **or was
-mangled into scientific notation by Excel** (e.g. `2.60623E+13` — which would collapse many
-distinct orders onto one key) cannot be keyed and are kept as-is.
+Duplicate orders are dropped on the key
+**User ID + Order ID + Order Time + Exchg Order ID + Exchange Time + Tag**, keeping the
+occurrence with the **lowest row id / SNO**.
+
+Six components rather than four because a compiled orderbook that has been through Excel
+cannot be keyed on Order ID alone — in the 11-08-2026 file **21% of Order IDs came back in
+scientific notation** (`2.60811E+13`), which collapses thousands of distinct orders onto one
+value. The exchange fields survive Excel intact, so the key stays discriminating and **every
+row can be keyed** (no bypass path). A corrupted Order ID is logged as a warning; the source
+file should be exported with that column as text.
+
+Measured on 11-08: the key collapses 2,28,704 rows, of which 2,28,719 are byte-identical
+duplicates — it removes duplicates and essentially nothing else.
 
 ## 1.4 Lot-size history
 
@@ -152,8 +166,32 @@ MAD    = 1.4826 × median( |lots_per_cr − median| )   (std-dev equivalent, out
 range  = [ median − k·MAD , median + k·MAD ]         (k = the chosen deviation, default 1)
 ```
 
-- `lots_per_cr < mean − k·std` → **"Below average range"**
-- `lots_per_cr > mean + k·std` → **"Above average range"**
+### What the 1.4826 is
+
+**2.54 converts inches to centimetres. 1.4826 converts MAD to standard deviation.** It is a
+unit conversion between two rulers for the same thing, nothing more.
+
+MAD is literally *"the middle distance from the middle"* — half the users are closer than
+it, half further — so **MAD covers 50% of the data by definition**, while one standard
+deviation covers **68%**. A MAD reading therefore has to be scaled up before it can be read
+as a std-dev. For bell-shaped data that factor is always ~1.4826, whatever the units
+(σ=20 → ratio 1.4915; σ=3 → 1.4812).
+
+Formally it is `1 / Φ⁻¹(0.75)` = 1/0.6745, and it is **derived in code, not typed**:
+`Decimal(str(1 / NormalDist().inv_cdf(0.75)))`. It is the standard convention — R's `mad()`
+default and scipy's `median_abs_deviation(scale="normal")` use the same number.
+
+**Without it the band would be a third too narrow.** On 05-08 at k=1: **175 users flagged
+without, 118 with** — 57 ordinary users wrongly called outliers, and `k=1` would secretly
+mean 0.67.
+
+**Caveat:** the 0.6745 relationship holds for a *normal* distribution only. On flat data the
+ratio is ~1.05, not 1.48. Where an algo's users are near-clones the band is legitimately
+tiny (algo 8: ±1.9 on a median of 250) and is better read as plain *distance from the
+median* than as a true sigma.
+
+- `lots_per_cr < median − k·MAD` → **"Below average range"**
+- `lots_per_cr > median + k·MAD` → **"Above average range"**
 - otherwise → **"In range"**
 - users with no allocation or no algo can't be judged → blank flag
 
@@ -232,153 +270,105 @@ are skipped. Both summaries are computed over the **deduped** orders:
   report and the dashboard have the same controls; the per-(algo, kind) split is embedded in
   the page so filtering never recomputes.
 
-# Part 2 — Int / Pos Segregation (`segregate_int_pos_mtm2.py`)
+# Part 2 — Int / Pos Segregation (`summary.py`)
 
-## 2.1 Classification
+## 2.1 Classification — from the All User sheet
 
-Every account (row) of the Compiled User MTM is either:
+Classification comes from the **All User Details** workbook, tab `Main`. Six columns are
+read: `userId`, `server`, `algo`, `max_loss`, `Running Type`, `Running Days`.
 
-- **Positional** — its User ID appears in **either** Combined Max Loss file (1DTE or 4DTE);
-- **Intraday** — otherwise.
+**Step 1 — drop on upload.** A row is dropped when **any** of `server`, `Running Type` or
+`Running Days` reads `DLR ACC` or `NOT RUNNING`. Dealer and stopped accounts belong to no
+report, whatever the DTE.
 
-A user id on several servers is several **distinct accounts**: max-loss entries are assigned to
-exactly **one** compiled row each — matched on server when the id is ambiguous, falling back to
-the user's first row when the entry's server is blank/unmatched — so an addon is **never
-double-counted**.
+**Step 2 — DTE scope.** `Running Days` states the days an account *runs on*, so the scopes
+are **cumulative**:
 
-## 2.2 Addons and adjusted Realized P&L
+| DTE | Running Days included |
+|---|---|
+| 0DTE | all — `0DTE` + `1DTE/0DTE` + `DAILY` |
+| 1DTE | `1DTE/0DTE` **+ `DAILY`** |
+| 4DTE | `DAILY` |
 
-From each max-loss file, per (User ID, Server) (duplicates: last row wins):
+A `DAILY` account trades every day, including 1DTE days.
+
+**Step 3 — type.** `INT` → **Int**, `POS` → **Pos+Int**. Matching is on the canonical user
+id alone (`userId` is unique in the sheet). An account the scope does not cover is
+**Unclassified** and reported in its own section at the bottom of the pivot, so each Algo
+Total covers only that algo's classified accounts and
+`Grand Total = Σ Algo Totals + Unclassified`.
+
+> The Combined Max Loss files, the realized-P&L addon, the Noren rule and the hardcoded
+> positional algos (19/27) were **removed** — classification is now entirely from
+> `Running Type`.
+
+## 2.2 MTM
 
 ```
-addon = Realized PNL + Net Settlement Value
+MTM   = Realized P&L + Unrealized P&L      per account, ALWAYS computed
+MTM % = MTM / ALLOCATION
 ```
 
-Then per account:
+The compiled sheet ships its own `MTM` column and it is **ignored** — it is only populated
+where Unrealized is non-zero (577 of 633 rows blank on 30-07-2026, understating the book by
+₹4.17 Cr). A dashboard note reports what was measured: rows differing, blank vs wrong value,
+and the rupee gap.
 
-```
-Addon Applied = Addon 1DTE               if User Type == "Noren"
-              = Addon 1DTE + Addon 4DTE  otherwise (non-Noren positional)
-              = 0                        for intraday accounts
-
-Realized P&L (Final) = compiled Realized P&L + Addon Applied     ("AdjRealized")
-MTM                  = Realized P&L (Final) + Unrealized P&L
-UserReturn           = Realized P&L (Final) / ALLOCATION         (0 when allocation is 0)
-```
+MAX LOSS comes from the compiled MTM's own column; the All User `max_loss` is carried as a
+reference column only.
 
 ## 2.3 Pivot aggregation (per algo → Int / Pos+Int → server)
 
-Within each algo the accounts are split into an **Int** block (intraday) and a **Pos+Int** block
-(positional), each grouped by server. Per group:
+Per block: `Users`, `SL Hit`, `MAX LOSS`, `ALLOCATION`, `Realized P&L`, `Unrealized P&L`,
+`MTM`, `MTM %`. Allocation is displayed **×100** (stored in hundreds); `MTM %` uses the
+stored basis. In Excel `MTM %` is the live formula `=IF(G=0,0,J/G)` so it survives editing.
 
-```
-No. of Users        = row count
-No. of SL Hit Users = count of rows with SL HIT/NOT == 1
-MAX LOSS            = Σ MAX LOSS
-ALLOCATION          = Σ ALLOCATION
-Realized P&L        = Σ Realized P&L (Final)
-Unrealized P&L      = Σ Unrealized P&L
-MTM                 = Realized + Unrealized
-P&L %               = Realized / Allocation        (0 when allocation is 0)
-95% (P95) / 5% (P5) = 95th / 5th percentile of UserReturn within the group,
-                      computed only over accounts with ALLOCATION > 0
-```
+The P95/P5 percentile columns and the **Worst 10%ile** sheet were removed — neither appeared
+anywhere in the HTML report.
 
-P5/P95 stand in for min/max **deliberately** — they control for data aberrations (intraday
-pauses/stops, under/over-funded accounts, suboptimal allocations) that would make the true
-min/max misleading.
+## 2.4 Slippage (`Slippage` sheet)
 
-**Server counts:** the Sub-Total row's server count is per section; the algo total counts each
-**distinct** server once (a server running both Int and Pos appears in both blocks but is counted
-once for the algo); the Grand Total sums the per-algo counts.
-
-**KPI tiles:** `Accounts` = all rows, `Positional` = classified positional, `Intraday` =
-accounts − positional, plus `Allocation` (× 100, Cr), `Realized P&L` (Cr) and `P&L %` from the
-grand total. Tiles are centered and flow in a single row.
-
-**Algo selection:** the dashboard inputs carry a "Segregation — algos to include" multiselect
-(empty = all). The pivot and its KPI tiles — in the dashboard **and** in DOR.html — cover only
-the selected algos; the Excel `Segregation` / `Raw_Data_Per_User` / `Worst 10%ile` sheets always
-keep every algo (the workbook is the full audit trail).
-
-**Displayed columns:** the dashboard and DOR.html pivot show a trimmed set —
-`Algo · Server · Users · SL Hit · Max Loss · Allocation · Realized P&L · P&L %` (plus the
-Type/Section row label; the ratio field is titled **P&L %** everywhere, including the Excel
-header). `Unrealized P&L`, `MTM` and `P95/P5` stay in the Excel Segregation sheet, where the
-full column set and live formulas remain.
-
-**Compact money display:** `Allocation` (× 100 — the stored value is in hundreds) and
-`Realized P&L` render in compact Indian units (`403.8 Cr`, `53.5 L`) in the pivot and the KPI
-cards; the Trade Value KPI uses the same format. `P&L %` and every calculation keep the stored
-basis; the Excel sheet keeps full stored values.
-
-## 2.4 Excel formulas (Segregation sheet)
-
-Aggregate cells are written as live formulas so the sheet stays auditable in Excel:
-Sub-Totals use `=SUM(...)` over their data block, Algo/Grand Totals add the sub-total rows,
-and every `P&L %` cell is `=IF(G{row}=0,0,H{row}/G{row})` (Realized ÷ Allocation).
-P5/P95 are written as computed values. The Realized / Unrealized / MTM columns carry
-conditional formatting — profit green, loss red — that keeps recolouring as the formulas
-recalculate.
-
-## 2.5 Raw_Data_Per_User sheet
-
-One row per account with the full audit trail: Type, User Type, algo, server, id, alias, SL Hit
-(0/1), MAX LOSS, ALLOCATION, Compiled Realized P&L, Addon 4DTE, Addon 1DTE, Addon Applied,
-Realized P&L (Final), Unrealized P&L, and `MTM = Final Realized + Unrealized`.
-
-## 2.6 Worst 10%ile sheet
-
-Per **Algo × Int/Pos** group:
-
-- Rank accounts by `UserReturn`; keep those **at or below the group's 10th percentile**.
-  Only accounts with `ALLOCATION > 0` are ranked (zero-allocation returns are undefined).
-- `Algo Avg Return %` shown next to each user = the **group-level** return
-  `Σ Realized (Final) / Σ Allocation` — the same value as that section's sub-total P&L %.
-- `Reason` is auto-inferred (first match wins, editable afterwards in Excel):
-  1. SL Hit == 1 → **"SL Hit"**
-  2. allocation ≤ 0 → **"Zero/low allocation"**
-  3. return < 0 → **"Negative return"**
-  4. otherwise → **"Low relative return"**
-
-## 2.7 Slippage (`Slippage` sheet)
-
-Evaluated over **all** accounts with `ALLOCATION > 0`, both limits expressed as plain **ratios**
-of the account's allocation (positive numbers = loss; the same unit convention as the pivot's
-`P&L %` — **not** multiplied by 100):
+Plain ratios of allocation, not multiplied by 100:
 
 ```
 ML %          = MAX LOSS / ALLOCATION
-Realized ML % = |compiled Realized P&L| / ALLOCATION
+Realized ML % = -Realized P&L / ALLOCATION       (positive = loss)
+slippage when   Realized ML % - ML % >= 0.1      (1e-9 float guard)
 ```
 
-An account **has slippage** only when its realized loss overshoots the configured max-loss by
-**at least 0.1**:
+Measured on **realized** loss, not MTM, because a max-loss stop is about what was booked.
 
-```
-Realized ML % − ML % ≥ 0.1
-```
+**Eligibility:** allocation > 0 **and** MAX LOSS > 0. Accounts with an allocation but no
+configured stop would have ML % = 0, so any loss past the threshold would read as slippage
+against a limit that never existed — they are listed in the **`no_sl_Acc`** sheet and
+excluded from the analysis and from the account counts.
 
-so ML% 1.00 → Realized 1.09 is *not* slippage, 1.10 is; a profit or a loss inside the limit is
-never slippage. The **compiled** Realized P&L is used (no positional addons). Per-order slippage
-(trigger vs fill) is not derivable from the orderbook: it carries no stop-loss orders.
+**Major slippage** = Realized ML % above that algo's average, **or** the algo has exactly
+one slippage account (with one account it *is* the average, so a strict `>` could never
+fire).
 
-- **Avg slippage** — per algo + overall: total accounts, slippage accounts, and
-  `Avg Slippage % = mean Realized ML %` over the algo's **slippage accounts** ("—" when none).
-- **Major slippages** — the slippage accounts whose `Realized ML %` is **greater than their
-  algo's Avg Slippage %**, sorted worst-first. The Excel sheet lists **all** slippage accounts
-  with the major rows highlighted; the dashboard and DOR.html show the major table alongside
-  the per-algo summary.
-- **Algo filter** — the algos to analyse are picked in the **dashboard inputs** (multiselect,
-  empty = all); both the dashboard section and the DOR.html report show the selection, with the
-  Overall row computed over it.
-- A day with no slippage accounts shows **"-- No slippage today --"** in all three outputs.
+## 2.5 `MTM Data` sheet
 
-## 2.8 Report date
+The per-account base table every summary figure aggregates, replacing the old
+`Raw_Data_Per_User`:
 
-Inferred from the first non-empty `Date` value in the compiled MTM sheet, formatted `dd-mm-YYYY`.
+`UserID · Alias · ALLOCATION · MAX LOSS · Total Orders · Total Lots · SERVER · ALGO ·
+Running Type · Running Days · OPERATOR · EXPIRY · Date · Month · Day · INDEX · MTM ·
+Realized P&L · Unrealized P&L · SL HIT/NOT`
 
----
+## 2.6 `unclassified` sheet
+
+First sheet in the workbook: `UserID · Alias · ALGO · SERVER · Running Type · Running Days`
+for every account the DTE scope did not cover. Running Type / Running Days read
+**`Not Found`** when the row was dropped on upload or is absent from the sheet — a dropped
+row is gone and is not resurrected.
+
+## 2.7 Report date
+
+Read from the compiled MTM's `Date` column and pre-filled into the **Market date** input,
+which stays editable. It drives the index High/Low fetch, the chain's ATM anchor and the
+chart.
+
 
 # Part 3 — DOR.html (`dor.py`)
 

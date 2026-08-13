@@ -55,6 +55,9 @@ from tradevalue import (
     format_order_row,
     format_row,
     format_summary_row,
+    indexes_in_orderbook,
+    reference_bands_from_symbols,
+    strike_bands,
     order_summary,
     order_summary_totals,
     read_allocations,
@@ -73,7 +76,7 @@ from tradevalue import _user_key as tv_user_key
 # returned by _process_all gains, loses or renames a field: it both busts the
 # st.cache_data entry and invalidates any session_state result an older build
 # left behind, so a shape change asks for a re-Process instead of crashing.
-STATE_VERSION = "multi-chart-v19"
+STATE_VERSION = "derived-strike-band-v20"
 
 # One-time logging setup. Streamlit re-runs this module on every interaction,
 # so guard against stacking a handler per rerun.
@@ -192,10 +195,11 @@ with in6:
 # nobody typed correctly.
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Fetching index levels…")
-def _index_levels(day):
-    """Day High / Low per index for `day`. Cached on the date, so changing any
-    other input does not refetch."""
-    return marketdata.fetch_index_levels(day)
+def _index_levels(day, indexes=None):
+    """Day High / Low for the given indexes on `day` — only the ones the
+    orderbook traded, so BANKNIFTY is not fetched on the days it is absent.
+    Cached on the arguments, so changing any other input does not refetch."""
+    return marketdata.fetch_index_levels(day, indexes=list(indexes) if indexes else None)
 
 
 @st.cache_data(show_spinner="Fetching intraday series…")
@@ -388,6 +392,22 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
 
     # every uploaded orderbook is duplicate-checked on
     # user + date + order id + symbol before anything is aggregated
+    # Strike validation band, derived from the day's own High / Low rather
+    # than a hardcoded rupee range. Only the indexes the orderbook actually
+    # traded are fetched — BANKNIFTY is absent most days. If the fetch fails
+    # the band comes from the orderbook's own unambiguous spaced symbols.
+    ob_indexes = indexes_in_orderbook(all_orders)
+    band_levels, _band_problems = ({}, {})
+    if report_date and ob_indexes:
+        band_levels, _band_problems = marketdata.fetch_index_levels(
+            report_date, indexes=ob_indexes)
+    bands = strike_bands(band_levels)
+    if len(bands) < len(ob_indexes):
+        fallback = reference_bands_from_symbols(o.symbol for o in all_orders)
+        for name in ob_indexes:
+            if name not in bands and name in fallback:
+                bands[name] = fallback[name]
+
     deduped, ob_dup = dedup_orders_with_report(orders, "orderbook")
     tv_rows = aggregate(deduped, allocations, multiplier, type_map)
     # Trade Value and Orders are reported PER INDEX — lot sizes (and so lots
@@ -395,7 +415,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # them. Each index's outlier bands are computed within that index.
     tv_by_segment = split_rows_by_segment(tv_rows, multiplier)
     multi_count, multi_map = multi_index_users(tv_rows)
-    strikes = strike_report(deduped, allocations)
+    strikes = strike_report(deduped, allocations, bands)
     # the orders summary splits per MTM exactly like the trade value tables —
     # one table over ALL servers would compare a per-MTM Algo Summary against
     # an everything Orders Summary and the user counts could never agree
@@ -405,11 +425,12 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # inflate the lots exactly as they would inflate the trade value.
     lots_chart = lots_timeline(dedup_orders(all_orders), allocations)
 
-    order_rows = order_summary(all_orders, allocations, type_map)
+    order_rows = order_summary(all_orders, allocations, type_map, bands)
     orders_by_segment = {}
     for segment in sorted({o.segment for o in all_orders}):
         orders_by_segment[segment] = order_summary(
-            [o for o in all_orders if o.segment == segment], allocations, type_map)
+            [o for o in all_orders if o.segment == segment], allocations,
+            type_map, bands)
 
     # Portfolio analysis (optional MLOB)
     pf_groups = None
@@ -428,6 +449,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         "strikes": strikes,
         "order_rows": order_rows,
         "lots_chart": lots_chart,
+        "ob_indexes": ob_indexes,
         "orders_by_segment": orders_by_segment,
         "portfolio_groups": pf_groups,
         "pivot_rows": seg.pivot_rows(comp),
@@ -572,7 +594,8 @@ if report_date and _market_date_text != report_date:
         "chart will describe a different day than the book below."
     )
 
-_levels, _level_problems = _index_levels(market_date)
+_levels, _level_problems = _index_levels(
+    market_date, tuple(dor_state.get("ob_indexes") or ()))
 if _levels:
     with _dc2:
         lvl_cols = st.columns(len(_levels))

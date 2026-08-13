@@ -221,25 +221,85 @@ def _classify_symbol(symbol):
 # cross 1,00,000 the compact form turns genuinely ambiguous (the 5-digit
 # tail of a 6-digit strike can itself land in band) and this rule needs
 # revisiting.
-_STRIKE_RANGE = {
-    "NIFTY": (8_000, 60_000),
-    "BANKNIFTY": (20_000, 100_000),
-    "SENSEX": (40_000, 200_000),
-}
+# How far from the day's own High / Low a strike may sit and still be accepted.
+# Index options list strikes well outside the day's range, so the window is
+# deliberately generous — it exists only to reject a MIS-PARSE (reading
+# "1124050" out of NIFTY2681124050PE instead of "24050"), not to judge whether
+# a strike is sensibly priced. A mis-parse is out by an order of magnitude, so
+# nothing this wide can let one through.
+STRIKE_BAND_LOW = 0.5
+STRIKE_BAND_HIGH = 1.5
+
 _COMPACT_TAIL = re.compile(r"(\d+)(CE|PE)$")
 
 
-def parse_strike(symbol):
-    """(segment, strike, option type) for an option symbol, else None for
-    anything that isn't a NIFTY / BANKNIFTY / SENSEX option (futures, equity)
-    or whose strike falls outside the index's plausible band."""
+def strike_bands(levels):
+    """{index: (low, high)} derived from the FETCHED day High / Low.
+
+    `levels` is marketdata.fetch_index_levels()'s first return value. There is
+    no hardcoded rupee range: an index drifts, and a fixed band silently starts
+    rejecting real strikes (or accepting mis-parses) as it does. The day's own
+    High / Low is the correct reference because every strike traded that day
+    sits near it.
+
+    An index with no fetched level gets no band and falls back to the
+    self-derived reference in parse_strike."""
+    bands = {}
+    for name, entry in (levels or {}).items():
+        low, high = entry.get("low"), entry.get("high")
+        if low and high:
+            bands[name] = (float(low) * STRIKE_BAND_LOW,
+                           float(high) * STRIKE_BAND_HIGH)
+    return bands
+
+
+def reference_bands_from_symbols(symbols):
+    """Fallback when market data is unavailable: derive the band from the
+    orderbook itself.
+
+    SPACED symbols are unambiguous — the strike is its own token next to
+    CE/PE — so they anchor the scale without any assumption. Their median
+    becomes the reference. Only if a file has no spaced symbol at all does
+    this return nothing, and parse_strike then takes the widest candidate
+    that is a plausible strike step."""
+    per_index = {}
+    for symbol in symbols:
+        text = " ".join(str(symbol or "").upper().split()).replace("BANK NIFTY", "BANKNIFTY")
+        segment = _classify_symbol(text)
+        if not segment or not text.startswith(segment):
+            continue
+        tokens = text.split()
+        if len(tokens) < 2:
+            continue
+        for i, tok in enumerate(tokens):
+            if tok in ("CE", "PE"):
+                for j in (i + 1, i - 1):
+                    if 0 <= j < len(tokens) and tokens[j].isdigit():
+                        per_index.setdefault(segment, []).append(int(tokens[j]))
+    bands = {}
+    for segment, values in per_index.items():
+        mid = statistics.median(values)
+        bands[segment] = (mid * STRIKE_BAND_LOW, mid * STRIKE_BAND_HIGH)
+    return bands
+
+
+def parse_strike(symbol, bands=None):
+    """(segment, strike, option type) for an option symbol, else None.
+
+    `bands` ({index: (low, high)}) validates the parse. With no band for the
+    index, the compact form falls back to the widest candidate that looks like
+    a real strike step — see _plausible_strike."""
     text = " ".join(str(symbol or "").upper().split()).replace("BANK NIFTY", "BANKNIFTY")
     segment = _classify_symbol(text)
     # the index must be the symbol's PREFIX — the substring classifier alone
     # would let FINNIFTY / MIDCPNIFTY options through as NIFTY strikes
     if not segment or not text.startswith(segment):
         return None
-    low, high = _STRIKE_RANGE[segment]
+    band = (bands or {}).get(segment)
+
+    def ok(value):
+        return band is None or band[0] <= value <= band[1]
+
     tokens = text.split()
     if len(tokens) > 1:
         # spaced forms: the strike is its own token next to CE/PE —
@@ -248,18 +308,37 @@ def parse_strike(symbol):
             if tok in ("CE", "PE"):
                 for j in (i + 1, i - 1):
                     if (0 <= j < len(tokens) and tokens[j].isdigit()
-                            and low <= int(tokens[j]) <= high):
+                            and ok(int(tokens[j]))):
                         return (segment, int(tokens[j]), tok)
     # compact forms: the strike is the tail of the digit run before CE/PE.
-    # Strikes are 5 digits today, so try that width first; 6 and 4 keep the
-    # parse working if an index ever crosses 1,00,000 or falls below 10,000.
+    # Strikes are 5 digits today; 6 and 4 keep the parse working if an index
+    # crosses 1,00,000 or falls below 10,000.
     match = _COMPACT_TAIL.search(text.replace(" ", ""))
     if match:
         run, opt = match.groups()
-        for width in (5, 6, 4):
-            if len(run) >= width and low <= int(run[-width:]) <= high:
-                return (segment, int(run[-width:]), opt)
+        candidates = [int(run[-w:]) for w in (5, 6, 4) if len(run) >= w]
+        if band is not None:
+            for value in candidates:
+                if ok(value):
+                    return (segment, value, opt)
+            return None
+        value = _plausible_strike(candidates)
+        if value is not None:
+            return (segment, value, opt)
     return None
+
+
+# Index strikes are listed on a round step (50 / 100 / 500), so a correctly
+# parsed strike is a multiple of at least 50 while a mis-parse — digits of the
+# expiry dragged in — almost never is. Used only when no band is available.
+_STRIKE_STEP = 50
+
+
+def _plausible_strike(candidates):
+    for value in candidates:
+        if value and value % _STRIKE_STEP == 0:
+            return value
+    return candidates[0] if candidates else None
 
 
 def _user_key(value):
@@ -425,7 +504,7 @@ def _cell(row, idx):
 Order = namedtuple(
     "Order",
     "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol "
-    "category status minute",
+    "category status minute order_time exchange_time tag",
 )
 
 # "09:16" from "05-Aug-2026 09:16:00" / "09:16:00" / a datetime cell. The
@@ -492,9 +571,17 @@ def read_orderbook(source, name=None, all_statuses=False):
     i_tag = col("tag")
     # the clock time the order was placed — feeds the intraday chart only, so a
     # file without it simply produces no dots rather than failing
-    i_time = col("order time", "order_time", "time", "exchange time")
+    i_time = col("order time", "order_time", "time")
+    # the dedup key needs the exchange timestamp too; a file without it simply
+    # contributes a blank component rather than failing
+    i_exch_time = col("exchange time", "exchange_time", "exchg time")
     if i_symbol is None or i_avg is None or i_qty is None:
         raise ValueError("orderbook is missing the symbol / avg price / quantity columns")
+
+    if i_time is None or i_exch_time is None:
+        logger.warning("orderbook has no %s column — the dedup key loses that "
+                       "component and may merge distinct orders",
+                       "Order Time" if i_time is None else "Exchange Time")
 
     orders = []
     for line_no, raw in enumerate(rows, start=2):
@@ -511,6 +598,8 @@ def read_orderbook(source, name=None, all_statuses=False):
             rowid = int(_cell(raw, i_rowid))
         except (ValueError, TypeError):
             rowid = line_no
+        raw_tag = _cell(raw, i_tag)
+        raw_order_time = _cell(raw, i_time)
         orders.append(Order(
             rowid=rowid,
             trade_date=_parse_date(_cell(raw, i_date)),
@@ -522,11 +611,24 @@ def read_orderbook(source, name=None, all_statuses=False):
             order_id=_cell(raw, i_order_id),
             exch_order_id=_cell(raw, i_exch_order_id),
             symbol=sys.intern(symbol),
-            category=_order_category(_cell(raw, i_tag)),
+            category=_order_category(raw_tag),
             status=sys.intern(status),
-            minute=sys.intern(_parse_minute(_cell(raw, i_time))),
+            minute=sys.intern(_parse_minute(raw_order_time)),
+            order_time=sys.intern(raw_order_time),
+            exchange_time=sys.intern(_cell(raw, i_exch_time)),
+            tag=sys.intern(raw_tag),
         ))
     return orders
+
+
+def indexes_in_orderbook(orders):
+    """The indexes the orderbook actually traded, in report order.
+
+    Used to fetch market data for those alone — BANKNIFTY is absent on most
+    days, and fetching it anyway costs a network round trip and produces a
+    spurious "no data" warning."""
+    seen = {row.segment for row in orders if row.segment}
+    return [name for name in ("NIFTY", "BANKNIFTY", "SENSEX") if name in seen]
 
 
 def read_allocations(source, name=None):
@@ -775,47 +877,61 @@ def duplicate_report(keys, label, sample_size=DUP_SAMPLE_SIZE):
 
 
 def _order_key(row):
-    """The orderbook's uniqueness key: user + date + order id + symbol.
+    """The orderbook's uniqueness key:
 
-    The symbol carries the strike and option type, so this is
-    "userID + Date + Order_id + strike" as the desk states it. Note the raw
-    file is NOT unique on this key — a compiled orderbook repeats rows — but
-    every collision observed is byte-identical across all other columns, so
-    collapsing them is exactly what dedup is for."""
-    return (_user_key(row.user_id), row.trade_date, row.order_id, row.symbol)
+        User ID + Order ID + Order Time + Exchg Order ID + Exchange Time + Tag
+
+    Six components rather than four because a compiled orderbook that has been
+    through Excel cannot be keyed on Order ID alone. In the 11-08-2026 file
+    **21% of Order IDs came back in scientific notation** ("2.60811E+13"),
+    which collapses thousands of distinct orders onto one value. The earlier
+    key (user + date + order id + symbol) had to skip those rows entirely,
+    so 16,519 genuine duplicates among them were counted twice.
+
+    The exchange fields survive Excel intact, so including Exchg Order ID and
+    both timestamps keeps the key discriminating even when Order ID is
+    corrupted. Measured on 11-08: this key collapses 228,722 rows, of which
+    228,719 are byte-identical duplicates — it removes duplicates and almost
+    nothing else.
+    """
+    return (_user_key(row.user_id), row.order_id, row.order_time,
+            row.exch_order_id, row.exchange_time, row.tag)
 
 
 def dedup_orders(rows, label="orderbook"):
-    """Drop duplicate orders on (user_id, date, order_id, symbol), keeping the
-    first occurrence (lowest row id). Rows without a usable order id (missing,
-    or mangled into scientific notation by Excel) can't be keyed and are kept
-    as-is. The duplicate count is logged; use dedup_orders_with_report when
-    the caller also wants to display it."""
+    """Drop duplicate orders on the six-part key above, keeping the first
+    occurrence (lowest row id). The duplicate count is logged; use
+    dedup_orders_with_report when the caller also wants to display it."""
     return dedup_orders_with_report(rows, label)[0]
 
 
 def dedup_orders_with_report(rows, label="orderbook"):
-    """(deduped rows, duplicate report) — see duplicate_report."""
+    """(deduped rows, duplicate report) — see duplicate_report.
+
+    Every row can be keyed: the key no longer depends on Order ID being
+    intact, so there is no bypass path. A row whose Order ID is corrupted is
+    still separated by its exchange id and timestamps."""
     best = {}
-    keyless = []
     keys = []
+    corrupt = 0
     for row in rows:
-        if not row.order_id or _SCI_NOTATION.match(row.order_id):
-            keyless.append(row)
-            continue
+        if row.order_id and _SCI_NOTATION.match(row.order_id):
+            corrupt += 1
         key = _order_key(row)
         keys.append(key)
         current = best.get(key)
         if current is None or row.rowid < current.rowid:
             best[key] = row
     report = duplicate_report(keys, label)
-    # rows that could not be keyed are passed through untouched — say so,
-    # otherwise the report's row count would silently disagree with the input
-    report["unkeyable"] = len(keyless)
-    if keyless:
-        logger.warning("%s: %d row(s) have no usable order id and bypass the "
-                       "duplicate check entirely", label, len(keyless))
-    return list(best.values()) + keyless, report
+    report["unkeyable"] = 0
+    report["corrupt_order_ids"] = corrupt
+    if corrupt:
+        logger.warning(
+            "%s: %d row(s) carry an Order ID mangled into scientific notation "
+            "by Excel — the key still separates them by Exchg Order ID and the "
+            "timestamps, but the source file should be exported as text",
+            label, corrupt)
+    return list(best.values()), report
 
 
 def aggregate(rows, allocations=None, std_multiplier=None, type_map=None):
@@ -1113,7 +1229,7 @@ def format_summary_row(row):
     ]
 
 
-def order_summary(orders, allocations=None, type_map=None):
+def order_summary(orders, allocations=None, type_map=None, bands=None):
     """Per (algo, Int / Pos+Int) order counts, each row carrying its server
     breakdown for the drill-down:
 
@@ -1163,7 +1279,7 @@ def order_summary(orders, allocations=None, type_map=None):
     for row in deduped:
         opt = is_option.get(row.symbol)
         if opt is None:
-            opt = is_option[row.symbol] = parse_strike(row.symbol) is not None
+            opt = is_option[row.symbol] = parse_strike(row.symbol, bands) is not None
         if not opt:
             continue
         user_key = _user_key(row.user_id)
@@ -1367,7 +1483,7 @@ def lots_timeline(orders, allocations=None, deduped=True):
     return out
 
 
-def strike_report(orders, allocations=None):
+def strike_report(orders, allocations=None, bands=None):
     """The two strike summaries, computed over (deduped) orders:
 
       * by_algo_server — per (algo, server): how many DISTINCT contracts
@@ -1396,7 +1512,7 @@ def strike_report(orders, allocations=None):
     parse_cache = {}
     for row in orders:
         if row.symbol not in parse_cache:
-            parse_cache[row.symbol] = parse_strike(row.symbol)
+            parse_cache[row.symbol] = parse_strike(row.symbol, bands)
 
     by_algo_server = {}
     per_strike = {}

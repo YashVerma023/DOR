@@ -1,2 +1,3 @@
 /data/
 fyers_credentials.json
+.streamlit/secrets.toml

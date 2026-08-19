@@ -26,10 +26,16 @@ message — never an exception — so the dashboard can offer manual entry and t
 report still builds.
 """
 
+import base64
+import json
 import logging
+import os
+import time
 from datetime import date, datetime, timedelta
 
 logger = logging.getLogger(__name__)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Report index name -> Yahoo Finance ticker.
 INDEX_SYMBOLS = {
@@ -94,19 +100,28 @@ def fetch_index_levels(day, indexes=None, interval=None):
     except ValueError as exc:
         return {}, {name: str(exc) for name in wanted}
 
+    # Fyers first: it is the same feed the volume panel already uses, it agrees
+    # with Yahoo to the paisa on every index tested, and it has today's and
+    # yesterday's session when Yahoo still returns nothing. Yahoo stays as the
+    # fallback for days when no Fyers token has been issued.
+    levels, problems = _fyers_levels(day, wanted, interval)
+    wanted = [name for name in wanted if name not in levels]
+    if not wanted:
+        return levels, {}
+
     try:
         import yfinance as yf
     except ImportError:
         reason = ("yfinance is not installed — run `pip install yfinance` "
                   "or enter the levels manually")
         logger.error("market data unavailable: %s", reason)
-        return {}, {name: reason for name in wanted}
+        problems.update({name: f"{problems.get(name, reason)}" for name in wanted})
+        return levels, problems
 
     if day > date.today():
         reason = f"{day:%d-%m-%Y} is in the future"
-        return {}, {name: reason for name in wanted}
-
-    levels, problems = {}, {}
+        problems.update({name: reason for name in wanted})
+        return levels, problems
     # yfinance's end is exclusive, so ask for a single day as [day, day+1)
     start, end = day.isoformat(), (day + timedelta(days=1)).isoformat()
 
@@ -142,6 +157,64 @@ def fetch_index_levels(day, indexes=None, interval=None):
         logger.info("%s (%s) %s: H=%.2f L=%.2f mid=%.2f", name, symbol, day,
                     entry["high"], entry["low"], entry["mid"])
 
+    return levels, problems
+
+
+def _fyers_levels(day, wanted, interval):
+    """({index: levels}, {index: reason}) from Fyers — one call per index.
+
+    The day's OHLC is derived from the 1-minute candles rather than asking for
+    the daily bar: the two were verified identical to the paisa, and the daily
+    endpoint returns None intermittently, so deriving costs nothing and removes
+    a failure mode. Never raises — anything unavailable falls back to Yahoo."""
+    creds = load_fyers_credentials()
+    if not creds:
+        return {}, {name: "no Fyers token" for name in wanted}
+    try:
+        from fyers_apiv3 import fyersModel
+        client = fyersModel.FyersModel(client_id=creds["client_id"],
+                                       token=creds["access_token"],
+                                       is_async=False)
+    except Exception as exc:
+        return {}, {name: f"Fyers unavailable ({type(exc).__name__})"
+                    for name in wanted}
+
+    # the report speaks Yahoo's "5m"; Fyers wants "5"
+    resolution = str(interval or "1").rstrip("m") or "1"
+    levels, problems = {}, {}
+    for name in wanted:
+        symbol = FYERS_INDEX_SYMBOLS.get(name)
+        if not symbol:
+            problems[name] = f"no Fyers symbol for {name}"
+            continue
+        resp = _throttled(client.history,
+                          {"symbol": symbol, "resolution": resolution,
+                           "date_format": "1", "range_from": day.isoformat(),
+                           "range_to": day.isoformat(), "cont_flag": "1"})
+        candles = [c for c in (resp.get("candles") or []) if len(c) >= 6]
+        if not candles:
+            problems[name] = (resp.get("message")
+                              or f"Fyers has no {day:%d-%m-%Y} bar for {name}")
+            continue
+        entry = {
+            "symbol": symbol,
+            "open": float(candles[0][1]),
+            "high": float(max(c[2] for c in candles)),
+            "low": float(min(c[3] for c in candles)),
+            "close": float(candles[-1][4]),
+            "volume": float(sum(c[5] for c in candles)),
+        }
+        entry["mid"] = day_mid(entry)
+        if interval in INTRADAY_INTERVALS:
+            entry["series"] = [
+                {"t": datetime.fromtimestamp(c[0]).strftime("%H:%M"),
+                 "open": float(c[1]), "high": float(c[2]),
+                 "low": float(c[3]), "close": float(c[4])}
+                for c in candles
+            ]
+        levels[name] = entry
+        logger.info("fyers %s (%s) %s: H=%.2f L=%.2f mid=%.2f", name, symbol,
+                    day, entry["high"], entry["low"], entry["mid"])
     return levels, problems
 
 
@@ -364,6 +437,152 @@ def premium_series(df, time_col, value_col, date_col=None, index_col=None,
     return [[t, round(v, 2)] for t, v in series], meta
 
 
+# ---------------------------------------------------------------------------
+# Market volume — Fyers History API
+# ---------------------------------------------------------------------------
+
+FYERS_CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, "fyers_credentials.json")
+
+# Fyers index symbols, for the market-volume fetch.
+FYERS_INDEX_SYMBOLS = {
+    "NIFTY": "NSE:NIFTY50-INDEX",
+    "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+    "SENSEX": "BSE:SENSEX-INDEX",
+}
+
+
+# Credentials supplied by the running app rather than the file. A hosted
+# deployment (Streamlit Community Cloud) has an EPHEMERAL filesystem and the
+# gitignored fyers_credentials.json is not even in the repo, so the token has
+# to live in the app's own state and be pushed in here.
+_RUNTIME_CREDENTIALS = {}
+
+
+def set_fyers_credentials(client_id=None, access_token=None):
+    """Use these credentials instead of the JSON file. Call with nothing to
+    clear and fall back to the file."""
+    global _RUNTIME_CREDENTIALS
+    if client_id and access_token:
+        _RUNTIME_CREDENTIALS = {"client_id": str(client_id).strip(),
+                                "access_token": str(access_token).strip()}
+    else:
+        _RUNTIME_CREDENTIALS = {}
+    return _RUNTIME_CREDENTIALS
+
+
+def load_fyers_credentials(path=None):
+    """{'client_id', 'access_token'} from fyers_credentials.json, or {}.
+
+    The access token is issued per day by Fyers' OAuth flow — it is NOT a
+    static secret, so it has to be refreshed daily by whatever runs that flow.
+    Missing file -> market volume is simply absent from the chart."""
+    if _RUNTIME_CREDENTIALS:
+        expiry = token_expiry(_RUNTIME_CREDENTIALS["access_token"])
+        if expiry and expiry <= datetime.now():
+            logger.error("Fyers access_token expired at %s",
+                         expiry.strftime("%d-%m-%Y %H:%M"))
+            return {}
+        return dict(_RUNTIME_CREDENTIALS)
+
+    path = path or FYERS_CREDENTIALS_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.error("fyers_credentials.json unreadable (%s)", exc)
+        return {}
+    creds = {k: str(data.get(k, "")).strip() for k in ("client_id", "access_token")}
+    if not all(creds.values()):
+        return {}
+    expiry = token_expiry(creds["access_token"])
+    if expiry and expiry <= datetime.now():
+        logger.error("Fyers access_token expired at %s — run `python "
+                     "fyers_auth.py` to issue today's token",
+                     expiry.strftime("%d-%m-%Y %H:%M"))
+        return {}
+    return creds
+
+
+def token_expiry(access_token):
+    """When the Fyers JWT stops working, or None if it cannot be read.
+
+    Fyers tokens expire at 06:00 the following morning, not 24h after issue,
+    so a token minted at 21:00 is good for nine hours. Reading the claim is
+    the only way to say that honestly — it is a plain unsigned base64 read,
+    NOT a signature check, which only Fyers can do."""
+    try:
+        body = access_token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(body))["exp"]
+    except (IndexError, KeyError, ValueError, TypeError):
+        return None
+    return datetime.fromtimestamp(exp)
+
+
+def fetch_market_volume(day, symbols, interval="1"):
+    """({symbol: [[minute, volume], ...]}, reason) from the Fyers History API.
+
+    `symbols` are Fyers symbols — an index for index volume, or option
+    contracts to sum a strike range. Candle timestamps mark the START of the
+    interval, matching how the chart buckets everything else.
+
+    Verified against a live Fyers account on 18-08-2026. NOTE this is the
+    CASH-MARKET volume of the index constituents, not options volume — it is
+    ~1000x an options figure and must never be compared with MS volume.
+    Returns ({}, reason) for every failure so the chart degrades to MS volume
+    alone rather than breaking the report.
+    """
+    creds = load_fyers_credentials()
+    if not creds:
+        return {}, ("no Fyers client_id + access_token in "
+                    "fyers_credentials.json — run `python fyers_auth.py` "
+                    "to issue today's token")
+    try:
+        from fyers_apiv3 import fyersModel
+    except ImportError:
+        return {}, "fyers-apiv3 is not installed (`pip install fyers-apiv3`)"
+
+    try:
+        day = _as_date(day)
+    except ValueError as exc:
+        return {}, str(exc)
+
+    try:
+        client = fyersModel.FyersModel(client_id=creds["client_id"],
+                                       token=creds["access_token"], is_async=False)
+    except Exception as exc:                                  # auth / construction
+        return {}, f"Fyers client failed to start ({type(exc).__name__}: {exc})"
+
+    out, failures = {}, []
+    for symbol in symbols:
+        payload = {"symbol": symbol, "resolution": interval, "date_format": "1",
+                   "range_from": day.isoformat(), "range_to": day.isoformat(),
+                   "cont_flag": "1"}
+        try:
+            resp = client.history(payload) or {}
+        except Exception as exc:
+            failures.append(f"{symbol}: {type(exc).__name__}")
+            continue
+        candles = resp.get("candles")
+        if not candles:
+            failures.append(f"{symbol}: {resp.get('message') or 'no candles'}")
+            continue
+        # candle = [epoch, open, high, low, close, volume]
+        out[symbol] = [
+            [datetime.fromtimestamp(c[0]).strftime("%H:%M"), float(c[5])]
+            for c in candles if len(c) >= 6
+        ]
+        logger.info("fyers %s: %d candles, volume %s", symbol, len(candles),
+                    f"{sum(c[5] for c in candles):,.0f}")
+    reason = "; ".join(failures) if failures and not out else None
+    if failures:
+        logger.warning("fyers: %d symbol(s) returned nothing — %s",
+                       len(failures), "; ".join(failures[:3]))
+    return out, reason
+
+
 def mids_from(levels, manual=None):
     """{index: day mid} for the chain's ATM, fetched values first and any
     manual entry filling the gaps. A zero or blank manual value counts as
@@ -377,3 +596,166 @@ def mids_from(levels, manual=None):
         if name not in mids and value:
             mids[name] = float(value)
     return mids
+
+
+# ---------------------------------------------------------------------------
+# Index option volume — everything traded in one index's option chain
+# ---------------------------------------------------------------------------
+#
+# This is the market side of the volume panel: the exchange's per-minute volume
+# summed over EVERY strike of one index's expiry. MS volume is the desk's slice
+# of exactly this number, in the same unit (contracts), so MS / Index is a real
+# share of that index's options flow.
+#
+# Symbols are ENUMERATED from Fyers' own option chain rather than constructed.
+# Fyers spells weeklies and monthlies differently (NSE:NIFTY2681824100CE vs
+# NSE:NIFTY26AUG24100PE) and getting that wrong does not fail loudly — a wrong
+# guess can resolve to a real but DIFFERENT contract and report its volume as
+# yours. Asking the chain removes the guess.
+#
+# Two hard limits, both reported rather than papered over:
+#   * Fyers delists an expiry once it has passed, so a report built after its
+#     own expiry gets no market volume at all.
+#   * The data API is rate limited (HTTP 429 "request limit reached") at
+#     roughly 10/second and 200/minute, so a 200-strike chain is paced and
+#     takes about a minute. Un-paced it silently returns short.
+
+def parse_expiry(text, day=None):
+    """The dashboard's free-text expiry ("28JUL26", "13-08-2026") as a date.
+
+    A 2-digit year is read in the report's own century rather than blindly
+    20xx, so the map cannot silently land a hundred years out."""
+    text = str(text or "").strip().upper().replace("-", "").replace("/", "")
+    if not text:
+        return None
+    for fmt in ("%d%b%y", "%d%b%Y", "%d%m%Y", "%d%m%y", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+        if fmt.endswith("%y") and day is not None:
+            century = _as_date(day).year // 100 * 100
+            parsed = parsed.replace(year=century + parsed.year % 100)
+        return parsed
+    return None
+
+
+_FYERS_MIN_INTERVAL = 0.35        # ~170 calls/min, inside the 200/min ceiling
+_FYERS_RETRIES = 3
+
+
+def _throttled(call, *args):
+    """One Fyers call, paced and retried past 429. Returns {} if it never lands."""
+    for attempt in range(_FYERS_RETRIES):
+        resp = call(*args) or {}
+        if resp.get("code") != 429:
+            return resp
+        wait = 2 ** attempt
+        logger.warning("fyers rate limit — waiting %ss", wait)
+        time.sleep(wait)
+    logger.error("fyers still rate limited after %d retries", _FYERS_RETRIES)
+    return {}
+
+
+def _chain_symbols(client, index, day, expiry):
+    """(option symbols, expiry date, reason) for one index's expiry.
+
+    The chain is a LIVE endpoint: it lists only expiries that have not passed.
+    `expiry` (a date, optional) picks one; without it the nearest is used."""
+    underlying = FYERS_INDEX_SYMBOLS.get(index)
+    if not underlying:
+        return [], None, f"{index} has no Fyers underlying symbol"
+
+    chain = _throttled(client.optionchain,
+                       {"symbol": underlying, "strikecount": 50, "timestamp": ""})
+    expiries = (chain.get("data") or {}).get("expiryData") or []
+    if not expiries:
+        return [], None, (f"Fyers returned no expiries for {index} "
+                          f"({chain.get('message') or 'empty option chain'})")
+
+    stamp, chosen = "", None
+    if expiry:
+        for entry in expiries:
+            if _as_date(entry["date"].replace("-", "/")) == expiry:
+                stamp, chosen = entry["expiry"], expiry
+                break
+        if chosen is None:
+            listed = ", ".join(e["date"] for e in expiries[:4])
+            return [], None, (f"{index} {expiry:%d-%b-%Y} is not listed by Fyers "
+                              f"— expired contracts are delisted (listed: {listed})")
+    else:
+        chosen = _as_date(expiries[0]["date"].replace("-", "/"))
+        stamp = expiries[0]["expiry"]
+
+    if stamp:
+        chain = _throttled(client.optionchain,
+                           {"symbol": underlying, "strikecount": 50,
+                            "timestamp": stamp})
+    symbols = [row["symbol"]
+               for row in (chain.get("data") or {}).get("optionsChain") or []
+               if row.get("strike_price", -1) != -1]
+    if not symbols:
+        return [], chosen, f"Fyers returned no strikes for {index} {chosen}"
+    return symbols, chosen, None
+
+
+def fetch_index_option_volume(day, index, expiry=None, interval="1"):
+    """([[minute, volume], ...], reason) — the whole option chain of one index.
+
+    Volume is in CONTRACTS, the same unit as tradevalue.volume_timeline, so the
+    two can share a scale. One paced API call per strike, so a full chain runs
+    about a minute — the caller is expected to cache it."""
+    creds = load_fyers_credentials()
+    if not creds:
+        return [], ("no Fyers client_id + access_token in "
+                    "fyers_credentials.json — run `python fyers_auth.py` "
+                    "to issue today's token")
+    try:
+        from fyers_apiv3 import fyersModel
+        day = _as_date(day)
+        client = fyersModel.FyersModel(client_id=creds["client_id"],
+                                       token=creds["access_token"],
+                                       is_async=False)
+    except ImportError:
+        return [], "fyers-apiv3 is not installed (`pip install fyers-apiv3`)"
+    except Exception as exc:
+        return [], f"Fyers client failed to start ({type(exc).__name__}: {exc})"
+
+    symbols, resolved, reason = _chain_symbols(client, index, day, expiry)
+    if reason:
+        return [], reason
+
+    per_minute, blank, failed = {}, 0, []
+    for symbol in symbols:
+        time.sleep(_FYERS_MIN_INTERVAL)
+        resp = _throttled(client.history,
+                          {"symbol": symbol, "resolution": interval,
+                           "date_format": "1", "range_from": day.isoformat(),
+                           "range_to": day.isoformat(), "cont_flag": "1"})
+        candles = resp.get("candles")
+        if not candles:
+            # a strike that simply did not trade is normal; a REFUSED call is
+            # not, and the two must not be conflated or a throttled run looks
+            # like a quiet day
+            if resp.get("s") == "error" and "Invalid symbol" not in str(resp.get("message")):
+                failed.append(f"{symbol}: {resp.get('message')}")
+            else:
+                blank += 1
+            continue
+        for row in candles:
+            if len(row) >= 6:
+                minute = datetime.fromtimestamp(row[0]).strftime("%H:%M")
+                per_minute[minute] = per_minute.get(minute, 0.0) + float(row[5])
+
+    total = sum(per_minute.values())
+    logger.info("fyers %s %s option chain: %d strikes, %d quiet, %d failed, "
+                "volume %s", index, resolved, len(symbols), blank, len(failed),
+                f"{total:,.0f}")
+    if failed:
+        # a partial sum is a WRONG number, not a small one — say so
+        return ([[m, v] for m, v in sorted(per_minute.items())],
+                f"{len(failed)} of {len(symbols)} {index} strikes failed "
+                f"({failed[0]}) — the volume line is incomplete")
+    if not per_minute:
+        return [], f"no {index} option volume on {day:%d-%b-%Y}"
+    return [[m, v] for m, v in sorted(per_minute.items())], None

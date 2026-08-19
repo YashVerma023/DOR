@@ -770,7 +770,7 @@ def _chart_section(chart):
       <span class="c-legend chip-group"></span>
     </div>
     <div class="chart-wrap">
-      <svg class="c-svg" viewBox="0 0 1080 560" preserveAspectRatio="xMidYMid meet"></svg>
+      <svg class="c-svg" viewBox="0 0 1080 700" preserveAspectRatio="xMidYMid meet"></svg>
       <div class="chart-tip"></div>
     </div>
     <script type="application/json" class="c-data">{json.dumps(chart)}</script>
@@ -790,10 +790,12 @@ _CHART_SCRIPT = """
                    hedge: 'Hedge', var: 'VAR', failed: 'Failed / cancelled'};
   var CAT_ORDER = ['complete', 'stoxxo', 'hedge', 'var', 'failed'];
   // two stacked panels sharing one time axis: prices above, lots below
-  var W = 1080, H = 560, L = 76, R = 70, T = 20, B = 44;
-  var LOTS_H = 150, GAP = 34;
-  var P1B = H - B - LOTS_H - GAP;   // price panel bottom
-  var P2T = P1B + GAP;              // lots panel top
+  var W = 1080, H = 700, L = 76, R = 70, T = 20, B = 44;
+  var LOTS_H = 150, VOL_H = 120, GAP = 34;
+  var P1B = H - B - LOTS_H - VOL_H - GAP * 2;  // price panel bottom
+  var P2T = P1B + GAP;                         // lots panel top
+  var P2B = P2T + LOTS_H;                      // lots panel bottom
+  var P3T = P2B + GAP;                         // volume panel top
 
   function mins(s) { var p = s.split(':'); return +p[0] * 60 + +p[1]; }
   function label(m) {
@@ -920,22 +922,48 @@ _CHART_SCRIPT = """
         lots[c].forEach(function (p) { if (p[1] > lotMax) lotMax = p[1]; });
       });
       LY = function (v) {
-        if (lotMax <= 0) return H - B;
+        if (lotMax <= 0) return P2B;
         var t = useLog
           ? Math.log10(Math.max(v, 1)) / Math.log10(Math.max(lotMax, 10))
           : v / lotMax;
-        return (H - B) - t * (H - B - P2T);
+        return P2B - t * (P2B - P2T);
+      };
+
+      // ---- volume panel: our own (MS) and, when a feed is configured, market
+      // Both series are option CONTRACTS on one shared scale. Index volume is
+      // the whole chain of this index; MS volume is the desk's slice of it, so
+      // the shared scale is the point — it reads directly as a market share.
+      var VOL = C.volume || {};
+      var volSeries = [['index', 'Index volume', '#7C3AED'],
+                       ['ms', 'MS volume', '#0F766E']]
+        .filter(function (s) { return (VOL[s[0]] || []).length; })
+        .map(function (s) {
+          return {key: s[0], name: s[1], color: s[2],
+                  data: resample(VOL[s[0]], step)};
+        });
+      var volMax = 0;
+      volSeries.forEach(function (s) {
+        s.data.forEach(function (p) { if (p[1] > volMax) volMax = p[1]; });
+      });
+      var anyVol = volSeries.length;
+      var VY = function (v) {
+        if (volMax <= 0) return H - B;
+        return (H - B) - (v / volMax) * (H - B - P3T);
       };
 
       // ---- panel backgrounds: one card, two clearly bounded regions ----
       svg.appendChild(el('rect', {x: L, y: T, width: W - L - R, height: P1B - T,
                                   fill: '#FFFFFF'}));
-      svg.appendChild(el('rect', {x: L, y: P2T, width: W - L - R, height: (H - B) - P2T,
+      svg.appendChild(el('rect', {x: L, y: P2T, width: W - L - R, height: P2B - P2T,
                                   fill: '#F8FAFC', rx: 3}));
+      if (anyVol) {
+        svg.appendChild(el('rect', {x: L, y: P3T, width: W - L - R, height: (H - B) - P3T,
+                                    fill: '#F8FAFC', rx: 3}));
+      }
 
       if (C.shade) {
         var sa = X(mins(C.shade[0])), sb = X(mins(C.shade[1]));
-        [[T, P1B], [P2T, H - B]].forEach(function (band) {
+        [[T, P1B], [P2T, P2B], [P3T, H - B]].forEach(function (band) {
           svg.appendChild(el('rect', {x: sa, y: band[0], width: Math.max(sb - sa, 1),
                                       height: band[1] - band[0],
                                       fill: '#94A3B8', 'fill-opacity': '.13'}));
@@ -980,15 +1008,44 @@ _CHART_SCRIPT = """
       for (var m = Math.ceil(x0 / 30) * 30; m <= x1; m += 30) {
         svg.appendChild(el('line', {x1: X(m), y1: T, x2: X(m), y2: P1B,
                                     stroke: '#F1F5F9'}));
-        svg.appendChild(el('line', {x1: X(m), y1: P2T, x2: X(m), y2: H - B,
+        svg.appendChild(el('line', {x1: X(m), y1: P2T, x2: X(m), y2: P2B,
                                     stroke: '#F1F5F9'}));
+        if (anyVol) {
+          svg.appendChild(el('line', {x1: X(m), y1: P3T, x2: X(m), y2: H - B,
+                                      stroke: '#F1F5F9'}));
+        }
         svg.appendChild(el('line', {x1: X(m), y1: H - B, x2: X(m), y2: H - B + 4,
                                     stroke: '#9CA3AF'}));
         svg.appendChild(el('text', {x: X(m), y: H - B + 17, 'text-anchor': 'middle',
                                     'font-size': '11', fill: '#6B7280'}, label(m)));
       }
       svg.appendChild(el('line', {x1: L, y1: P1B, x2: W - R, y2: P1B, stroke: '#CBD5E1'}));
+      svg.appendChild(el('line', {x1: L, y1: P2B, x2: W - R, y2: P2B, stroke: '#CBD5E1'}));
       svg.appendChild(el('line', {x1: L, y1: H - B, x2: W - R, y2: H - B, stroke: '#9CA3AF'}));
+
+      // ---- volume panel: caption, ticks, lines ----
+      if (anyVol) {
+        svg.appendChild(el('text', {x: L, y: P3T - 9, 'font-size': '11',
+                                    fill: '#475569', 'font-weight': '600'},
+                           'Volume (contracts)'));
+
+        [volMax, volMax / 2].forEach(function (v) {
+          if (v <= 0) return;
+          var yy = VY(v);
+          svg.appendChild(el('line', {x1: L, y1: yy, x2: W - R, y2: yy,
+                                      stroke: '#E2E8F0', 'stroke-dasharray': '2 4'}));
+          svg.appendChild(el('text', {x: L - 8, y: yy + 4, 'text-anchor': 'end',
+                                      'font-size': '10', fill: '#94A3B8'}, lotFmt(v)));
+        });
+        volSeries.forEach(function (s) {
+          if (!s.data.length) return;
+          var d = s.data.map(function (p, i) {
+            return (i ? 'L' : 'M') + X(p[0]).toFixed(1) + ' ' + VY(p[1]).toFixed(1);
+          }).join(' ');
+          svg.appendChild(el('path', {d: d, fill: 'none', stroke: s.color,
+                                      'stroke-width': 1.6, 'stroke-linejoin': 'round'}));
+        });
+      }
 
       // ---- the lines ----
       state.forEach(function (s) {
@@ -1009,7 +1066,9 @@ _CHART_SCRIPT = """
         lots[cat].forEach(function (p) {
           if (!p[1]) return;
           var cx = X(p[0]) + dx, cy = LY(p[1]);
-          svg.appendChild(el('line', {x1: cx, y1: H - B, x2: cx, y2: cy,
+          // stems stop at the LOTS baseline, not the chart floor — running them
+          // to H - B draws them straight through the volume panel below
+          svg.appendChild(el('line', {x1: cx, y1: P2B, x2: cx, y2: cy,
                                       stroke: col, 'stroke-width': 1,
                                       'stroke-opacity': '.32'}));
           svg.appendChild(el('circle', {cx: cx, cy: cy, r: 3,
@@ -1027,6 +1086,10 @@ _CHART_SCRIPT = """
                (CAT_COLOR[cat] || '#64748B') + '"></span>' +
                (CAT_LABEL[cat] || cat) + ' <span class="note">' + lotFmt(tot) +
                ' lots</span></label>';
+      })).concat(volSeries.map(function (s) {
+        var tot = s.data.reduce(function (a, p) { return a + p[1]; }, 0);
+        return '<label class="chip"><span class="sw2" style="background:' + s.color +
+               '"></span>' + s.name + ' <span class="note">' + lotFmt(tot) + '</span></label>';
       })).join('');
 
       var hover = el('g', {});
@@ -1069,6 +1132,24 @@ _CHART_SCRIPT = """
                     (CAT_COLOR[cat] || '#64748B') + '"></span>' + (CAT_LABEL[cat] || cat) +
                     '</span><span class="v">' + lotFmt(hit[1]) + ' lots</span></div>');
         });
+        var atMinute = {};
+        volSeries.forEach(function (s) {
+          var hit = null;
+          s.data.forEach(function (p) { if (p[0] === snap) hit = p; });
+          if (!hit) return;
+          atMinute[s.key] = hit[1];
+          hover.appendChild(el('circle', {cx: X(snap), cy: VY(hit[1]), r: 3.5,
+                                          fill: s.color, stroke: '#fff', 'stroke-width': 1.5}));
+          rows.push('<div class="r"><span class="k"><span class="sw" style="background:' +
+                    s.color + '"></span>' + s.name + '</span><span class="v">' +
+                    lotFmt(hit[1]) + '</span></div>');
+        });
+        // MS as a share of the market, but ONLY against option volume — the
+        // cash-market line is a different instrument and no share exists
+        if (atMinute.ms != null && atMinute.index > 0) {
+          rows.push('<div class="r"><span class="k">MS share</span><span class="v">' +
+                    (atMinute.ms / atMinute.index * 100).toFixed(2) + '%</span></div>');
+        }
         tip.innerHTML = rows.join('');
         tip.style.opacity = 1;
         var wpx = wrap.clientWidth, xpx = X(snap) / W * wpx, tw = tip.offsetWidth;

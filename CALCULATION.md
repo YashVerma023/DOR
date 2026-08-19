@@ -39,8 +39,7 @@ tell you which formula produced it and what it assumes.
 | Secondary User MTM | optional | a second index set running on its own servers |
 | Multileg Orders (MLOB) | optional | Portfolio analysis |
 | ATM premium, one per index | optional | the premium line on the chart |
-| `user_aliases.json` | optional | All User id ↔ MTM id, when they differ entirely |
-| `account_aliases.json` | optional | orderbook base id → MTM account id, per server |
+| `aliases.json` | optional | both id maps: All User id ↔ MTM id (string value), and orderbook base id → MTM account id per server (object value) |
 
 **Orderbook row filters**, applied in this order:
 
@@ -77,7 +76,7 @@ Without these, the same account keys differently in two files and silently loses
 Upper-cased and trimmed; `NAN` / `NONE` / `NA` all read as blank. A server label is only
 ever compared to another server label, never parsed.
 
-### 2.3 Base id vs account id — `account_aliases.json`
+### 2.3 Base id vs account id — `aliases.json` (object entries)
 
 The orderbook records `TB2433`; the MTM records `TB2433A41`. The same base id is a
 **different account on each server**, so the map is keyed on both:
@@ -94,7 +93,7 @@ unattributed `—` row. Anything listed in the file is never guessed.
 Stripping a trailing `A<digits>` would be unsafe: `R7RA1315` would reduce to `R7R` and
 collide with real ids. That is why the match is by prefix within a server, or explicit.
 
-### 2.4 Different id entirely — `user_aliases.json`
+### 2.4 Different id entirely — `aliases.json` (string entries)
 
 Some accounts share no prefix at all: the All User sheet says `CC04`, the MTM says
 `XLDH142`. Three of the seven known cases carry no trace of the other id anywhere in the
@@ -649,32 +648,52 @@ Default report covers every portfolio whose name contains `QS` (case-insensitive
 Day High / Low per index for the report date, used for the chain's ATM anchor and the
 chart's index line.
 
-| Index | Ticker |
-|---|---|
-| NIFTY | `^NSEI` |
-| BANKNIFTY | `^NSEBANK` |
-| SENSEX | `^BSESN` |
+| Index | Fyers (primary) | Yahoo (fallback) |
+|---|---|---|
+| NIFTY | `NSE:NIFTY50-INDEX` | `^NSEI` |
+| BANKNIFTY | `NSE:NIFTYBANK-INDEX` | `^NSEBANK` |
+| SENSEX | `BSE:SENSEX-INDEX` | `^BSESN` |
 
 **Only the indexes the orderbook actually traded are fetched.** `indexes_in_orderbook()`
 reads the segments present and the fetch is restricted to those — BANKNIFTY is absent on
 most days, and fetching it anyway costs a round trip and produces a spurious "no data"
 warning.
 
-**Source is yfinance, not TradingView.** TradingView has no official public API for
-historical OHLC — its only official offering is the Charting Library, where the caller
-supplies the data. The unofficial websocket scrapers need a TradingView login and break
-when TV changes its internals.
+**Fyers is the primary source, Yahoo the fallback.** Fyers is already the feed behind the
+volume panel, so the levels and the volume come from one provider and one login. The two
+sources were compared before the switch and agree **to the paisa** on all three indexes:
+
+| 12-08-2026 | Fyers H / L / mid | Yahoo H / L / mid |
+|---|---|---|
+| NIFTY | 24,473.30 / 24,265.95 / 24,369.62 | identical |
+| BANKNIFTY | 57,885.85 / 57,254.00 / 57,569.93 | identical |
+| SENSEX | 78,263.33 / 77,497.93 / 77,880.63 | identical |
+
+Fyers is also **fresher**: on 17-08-2026 Yahoo returned "no data — market holiday, weekend,
+or the date has not settled yet" for all three, while Fyers had the full session. Yahoo is
+kept only for days when no Fyers token has been issued.
+
+**TradingView was rejected** as a source: it has no official public API for historical
+OHLC — its only official offering is the Charting Library, where the caller supplies the
+data. The unofficial websocket scrapers need a TradingView login and break when TV changes
+its internals.
 
 ```
 day mid = (High + Low) / 2
 ```
 
+**The day's OHLC is derived from the 1-minute candles, not the daily bar.** The two were
+verified identical to the paisa on every index and date tested, and the daily endpoint
+returns `None` intermittently — so deriving costs nothing and removes a failure mode. It
+also means one API call per index serves both the day High/Low and the chart's series.
+
 Every fetch is best-effort: a market holiday, weekend, future date or dropped connection
 yields an explanatory message and manual entry boxes, never an exception.
 
 **Retention limit:** Yahoo serves 1-minute history for roughly 30 days and 5/15-minute for
-about 60. A report date older than that produces no intraday series, and the chart section
-is omitted rather than half-drawn. Daily OHLC goes back years.
+about 60; Fyers serves 1-minute in requests of up to ~100 days and refuses wider ranges
+with `Invalid input`. A report date outside the available window produces no intraday
+series, and the chart section is omitted rather than half-drawn.
 
 ---
 
@@ -756,4 +775,4 @@ VAR 7,897, and Trade Value 5,59,307 − 48 square-off lots = 5,59,259.
    requires the prefix and excludes them.
 4. **Intraday index data ends 15:29**, so chart activity between 15:29 and 15:40 has no
    index line behind it.
-5. **Yahoo 1-minute retention is ~30 days** — older report dates get no chart.
+5. **1-minute retention** — Yahoo ~30 days, Fyers ~100 days per request; older report dates get no chart.

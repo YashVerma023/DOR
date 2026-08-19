@@ -32,9 +32,8 @@ dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once 
 | `app.py` | Streamlit UI — upload the inputs, set the outlier deviation, one **Process** click computes everything. Run with `streamlit run app.py`. |
 | `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1`). |
 | `summary.py` | Summary engine: All User classification, DTE scope, MTM, pivot, `MTM Data`, slippage, `no_sl_Acc` (also an interactive CLI). |
-| `marketdata.py` | Index day High/Low + intraday series (yfinance), premium-file parsing. |
-| `user_aliases.json` | All User id ↔ MTM id, when the two files name an account differently. |
-| `account_aliases.json` | Orderbook base id → MTM account id, per server. |
+| `marketdata.py` | Index day High/Low + intraday series (Fyers, Yahoo fallback), index option volume, premium-file parsing. |
+| `aliases.json` | Both id maps in one file, told apart by the value. String value = All User id ↔ MTM id, when the two files name an account differently. Object value = orderbook base id → MTM account id, per server. |
 | `CALCULATION.md` | Every formula and constant, with the reasoning. |
 | `portfolio.py` | Portfolio analysis engine over the Multileg Orders (MLOB): per-portfolio / per-user PnL, QS summary, any-pattern reports. |
 | `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters, the drill-downs and the in-page portfolio analysis are plain inline JS). |

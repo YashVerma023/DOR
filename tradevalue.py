@@ -682,7 +682,7 @@ def fill_missing_servers(orders, allocations, label="orderbook"):
     that exists on two servers is two distinct accounts with their own algo and
     allocation, and guessing between them is precisely what `_pick_allocation`
     refuses to do — those orders keep their blank server and stay unmatched,
-    which is visible rather than wrong. `account_aliases.json` is keyed on
+    which is visible rather than wrong. `aliases.json` is keyed on
     (id, server) and therefore cannot resolve them either; the count is logged.
 
     Returns (orders, report). Orders already carrying a server are untouched.
@@ -794,12 +794,12 @@ def _resolve_type(type_map, type_index, user_key, server_key):
     return type_index.get(user_key, "")
 
 
-ACCOUNT_ALIAS_FILE = SCRIPT_DIR / "account_aliases.json"
+ACCOUNT_ALIAS_FILE = SCRIPT_DIR / "aliases.json"
 
 
 def load_account_aliases(path=None):
     """{(orderbook user key, server key): MTM account id} from
-    account_aliases.json.
+    aliases.json.
 
     Keyed on the SERVER as well as the id, because one base id is a different
     account per server — TB2433 is TB2433A41 on VS8 and TB2433A42 on VS29.
@@ -812,7 +812,7 @@ def load_account_aliases(path=None):
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        logger.error("account_aliases.json could not be read (%s) — falling back "
+        logger.error("aliases.json could not be read (%s) — falling back "
                      "to prefix inference", exc)
         return {}
     out = {}
@@ -1577,6 +1577,24 @@ def lots_timeline(orders, allocations=None, deduped=True):
         logger.warning("lots timeline: %d order(s) had no readable Order Time "
                        "and are absent from the chart", skipped)
     return out
+
+
+def volume_timeline(orders):
+    """{index: [[minute, quantity], ...]} — traded QUANTITY per minute, our own.
+
+    Quantity, not lots, so it is directly comparable with an exchange volume
+    figure (exchanges report contracts). Completed orders only: volume means
+    what transacted, so a cancelled order contributed nothing to the tape.
+    Square-off is included — it is a real trade — unlike the lots panel, which
+    excludes it because there the question is what was *placed*."""
+    per_index = {}
+    for row in orders:
+        if row.status != "COMPLETE" or not row.minute:
+            continue
+        bucket = per_index.setdefault(row.segment, {})
+        bucket[row.minute] = bucket.get(row.minute, Decimal("0")) + abs(row.qty)
+    return {index: [[m, float(q)] for m, q in sorted(b.items())]
+            for index, b in per_index.items()}
 
 
 def strike_report(orders, allocations=None, bands=None):

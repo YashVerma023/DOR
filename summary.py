@@ -266,7 +266,7 @@ def dte_scope(all_users, dte):
 # User aliases — accounts whose MTM id differs from their All User id
 # ---------------------------------------------------------------------------
 
-ALIAS_FILE = os.path.join(SCRIPT_DIR, "user_aliases.json")
+ALIAS_FILE = os.path.join(SCRIPT_DIR, "aliases.json")
 
 # column names accepted when the map is uploaded as a CSV / Excel table
 _ALIAS_SOURCE_COLS = ("all user id", "alluserid", "all_user_id", "userid",
@@ -299,7 +299,7 @@ def load_user_aliases(source=None, name=None):
     sheet?".
 
     `source` is an optional uploaded file (JSON, CSV or Excel) that REPLACES
-    the on-disk user_aliases.json for that run; with no source and no file on
+    the on-disk aliases.json for that run; with no source and no file on
     disk the map is empty and nothing changes. Entries that resolve to
     themselves are dropped (harmless no-ops, e.g. the zero-padded numeric
     ids the canonical key already unifies), and an MTM id claimed by two

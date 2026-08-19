@@ -15,8 +15,9 @@ and offers exactly two downloads:
 """
 
 import io
+import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -24,6 +25,7 @@ import streamlit as st
 from openpyxl import Workbook
 
 import marketdata
+import fyers_auth
 import summary as seg
 from dor import build_dor_html
 from portfolio import (
@@ -68,6 +70,7 @@ from tradevalue import (
     split_rows_by_segment,
     strike_chain,
     strike_report,
+    volume_timeline,
     user_lot_observations,
 )
 from tradevalue import _server_key as tv_server_key
@@ -77,7 +80,7 @@ from tradevalue import _user_key as tv_user_key
 # returned by _process_all gains, loses or renames a field: it both busts the
 # st.cache_data entry and invalidates any session_state result an older build
 # left behind, so a shape change asks for a re-Process instead of crashing.
-STATE_VERSION = "orderbook-v2-format-v21"
+STATE_VERSION = "volume-panel-v24"
 
 # One-time logging setup. Streamlit re-runs this module on every interaction,
 # so guard against stacking a handler per rerun.
@@ -97,6 +100,93 @@ st.caption(
     "Int / Pos+Int Segregation are computed in one go, with a single Excel workbook and a "
     "shareable DOR.html as output."
 )
+
+# ---------------------------------------------------------------------------
+# Fyers login — index levels and index option volume
+# ---------------------------------------------------------------------------
+#
+# The access token expires at 06:00 every morning, so it CANNOT be baked into
+# the deployment. On a hosted app the filesystem is ephemeral and the
+# gitignored fyers_credentials.json is not in the repo at all, so:
+#
+#   client_id / secret_key / redirect_uri  ->  st.secrets, set once
+#   access_token                           ->  minted here, held in memory
+#
+# @st.cache_resource is a process-wide singleton: one operator logs in and
+# every session of the app uses that token until it expires or the app
+# restarts. Nothing is written to disk, so nothing is lost when it is wiped.
+#
+# Everything here is optional. With no login the report still builds — index
+# levels fall back to Yahoo and the volume panel shows MS volume alone.
+@st.cache_resource
+def _fyers_token_store():
+    return {}
+
+
+def _fyers_app_credentials():
+    """client_id / secret_key / redirect_uri from st.secrets, else the file."""
+    try:
+        secrets = dict(st.secrets.get("fyers", {}))
+    except Exception:                       # no secrets.toml at all, locally
+        secrets = {}
+    if secrets.get("client_id"):
+        return secrets
+    try:
+        with open(marketdata.FYERS_CREDENTIALS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+_fy_app = _fyers_app_credentials()
+_fy_store = _fyers_token_store()
+# a token already on disk (local runs) seeds the store, so a developer who has
+# run fyers_auth.py never sees the login prompt
+if not _fy_store.get("access_token") and _fy_app.get("access_token"):
+    _fy_store["access_token"] = _fy_app["access_token"]
+
+_fy_expiry = marketdata.token_expiry(_fy_store.get("access_token") or "")
+_fy_live = bool(_fy_store.get("access_token")) and (
+    _fy_expiry is None or _fy_expiry > datetime.now())
+if _fy_live:
+    marketdata.set_fyers_credentials(_fy_app.get("client_id"),
+                                     _fy_store["access_token"])
+else:
+    marketdata.set_fyers_credentials()
+
+with st.sidebar.expander("Fyers " + ("✅ connected" if _fy_live else "— not connected"),
+                         expanded=not _fy_live):
+    if not _fy_app.get("client_id"):
+        st.warning("No Fyers app configured. Add a `[fyers]` section to the "
+                   "app's secrets with `client_id`, `secret_key` and "
+                   "`redirect_uri`.")
+    elif _fy_live:
+        st.caption(f"Token valid until **{_fy_expiry:%d-%m-%Y %H:%M}**"
+                   if _fy_expiry else "Token set (expiry unreadable).")
+        st.caption("Index levels and index option volume come from Fyers. "
+                   "The token expires at 06:00 — log in again each morning.")
+        if st.button("Log out", key="fy_logout"):
+            _fy_store.clear()
+            st.rerun()
+    else:
+        st.caption("Not connected — index levels fall back to Yahoo and the "
+                   "volume panel shows MS volume only. Tokens expire at 06:00.")
+        try:
+            _fy_url = fyers_auth.login_url(_fy_app)
+            st.markdown(f"**1.** [Open the Fyers login]({_fy_url}) and sign in.")
+            st.caption("**2.** You land on a page that may not load — that is "
+                       "expected. Copy the whole address bar URL.")
+            _landed = st.text_input("**3.** Paste that URL here",
+                                    key="fy_landed",
+                                    placeholder="https://…?auth_code=…")
+            if _landed:
+                try:
+                    _fy_store["access_token"] = fyers_auth.exchange(_fy_app, _landed)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"{exc}")
+        except ValueError as exc:
+            st.error(str(exc))
 
 # ---------------------------------------------------------------------------
 # DTE — decides which All User accounts are in scope for the report
@@ -152,7 +242,7 @@ with au2:
         "User alias map (optional override)",
         type=["json", "csv", "xlsx", "xlsm", "xls"],
         help="Accounts the two files name differently — the MTM's XLDH142 is "
-             "the All User sheet's CC04. Leave empty to use user_aliases.json "
+             "the All User sheet's CC04. Leave empty to use aliases.json "
              "from the app folder; upload a JSON "
              "{\"CC04\": \"XLDH142\"} or a two-column table "
              "(All User id, MTM id) to replace it for this run only.",
@@ -277,7 +367,7 @@ if all_user_file is not None:
         _running, _in_scope, _n_pos, _n_int = _scope_preview(
             all_user_file.getvalue(), all_user_file.name, dte)
         _alias_src = ("the uploaded map" if alias_file is not None
-                      else "`user_aliases.json`")
+                      else "`aliases.json`")
         try:
             _n_alias = len(seg.load_user_aliases(
                 io.BytesIO(alias_file.getvalue()), alias_file.name)
@@ -347,7 +437,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     all_users = seg.read_all_users(io.BytesIO(all_user_bytes), all_user_name)
     scope = seg.dte_scope(all_users, dte_value)
     # accounts the two files name differently (MTM XLDH142 = sheet CC04) —
-    # the uploaded map wins over the on-disk user_aliases.json for this run
+    # the uploaded map wins over the on-disk aliases.json for this run
     aliases = seg.load_user_aliases(
         io.BytesIO(alias_bytes) if alias_bytes else None, alias_name)
 
@@ -430,6 +520,10 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # raw list (not the deduped one) is deliberately avoided: duplicates would
     # inflate the lots exactly as they would inflate the trade value.
     lots_chart = lots_timeline(dedup_orders(all_orders), allocations)
+    # MS volume: our own traded QUANTITY per minute, comparable with an
+    # exchange volume figure. Market volume needs a Fyers feed and is fetched
+    # separately below.
+    ms_volume = volume_timeline(dedup_orders(all_orders))
 
     order_rows = order_summary(all_orders, allocations, type_map, bands)
     orders_by_segment = {}
@@ -455,6 +549,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         "strikes": strikes,
         "order_rows": order_rows,
         "lots_chart": lots_chart,
+        "ms_volume": ms_volume,
         "ob_indexes": ob_indexes,
         "orders_by_segment": orders_by_segment,
         "portfolio_groups": pf_groups,
@@ -1222,6 +1317,25 @@ _chart_choices = [s for s in marketdata.INDEX_SYMBOLS if s in segments]
 chart_payloads = []
 if not _chart_choices:
     st.info("No index traded in this orderbook, so there is nothing to chart.")
+# Index option volume — Fyers, the whole option chain of each traded index,
+# in CONTRACTS so it shares a scale with MS volume and reads as a market share.
+# Optional: without it the panel shows MS volume alone rather than blocking.
+# One paced call per strike (~200 strikes, ~90s), so this is cached hard.
+@st.cache_data(show_spinner="Fetching index option volume (about a minute)…")
+def _index_option_volume(day, index, expiry_text):
+    expiry = marketdata.parse_expiry(expiry_text, day)
+    return marketdata.fetch_index_option_volume(day, index, expiry)
+
+
+_index_vol, _index_vol_reasons = {}, {}
+for _idx in _chart_choices:
+    _index_vol[_idx], _reason = _index_option_volume(
+        market_date, _idx, expiry_map.get(_idx, ""))
+    if _reason:
+        _index_vol_reasons[_idx] = _reason
+for _idx, _reason in _index_vol_reasons.items():
+    st.caption(f"ℹ️ {_idx} index volume — {_reason}")
+
 for chart_index in _chart_choices:
     st.markdown(f"**{chart_index}**")
     chart_payload = None
@@ -1254,6 +1368,10 @@ for chart_index in _chart_choices:
             "axis_step": {"left": 50, "right": 1},
             # dots: lots fired per minute, split by algo and colour category
             "lots": (dor_state.get("lots_chart") or {}).get(chart_index),
+            "volume": {
+                "ms": (dor_state.get("ms_volume") or {}).get(chart_index) or [],
+                "index": _index_vol.get(chart_index) or [],
+            },
         }
         st.caption(
             f"📈 {chart_index} — {format_indian(len(_points))} one-minute bars "

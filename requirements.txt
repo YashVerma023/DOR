@@ -2,3 +2,4 @@ pandas
 streamlit
 openpyxl
 yfinance>=0.2
+fyers-apiv3

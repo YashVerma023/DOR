@@ -1,5 +1,3 @@
 /data/
-fyers*
-volume_fetcher.py
-fyers_credentials.json
+fyer_code/
 .streamlit/secrets.toml

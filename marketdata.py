@@ -100,14 +100,12 @@ def fetch_index_levels(day, indexes=None, interval=None):
     except ValueError as exc:
         return {}, {name: str(exc) for name in wanted}
 
-    # Fyers first: it is the same feed the volume panel already uses, it agrees
-    # with Yahoo to the paisa on every index tested, and it has today's and
-    # yesterday's session when Yahoo still returns nothing. Yahoo stays as the
-    # fallback for days when no Fyers token has been issued.
-    levels, problems = _fyers_levels(day, wanted, interval)
-    wanted = [name for name in wanted if name not in levels]
-    if not wanted:
-        return levels, {}
+    # yfinance is the source. Fyers was tried as primary and agrees to the
+    # paisa, but the report must not depend on a token that expires at 06:00
+    # daily — a missing token would silently change where the levels came from.
+    # _fyers_levels stays in this module for volume_fetcher.py, which is run
+    # separately and whose output is uploaded.
+    levels, problems = {}, {}
 
     try:
         import yfinance as yf
@@ -160,6 +158,25 @@ def fetch_index_levels(day, indexes=None, interval=None):
     return levels, problems
 
 
+def _candles(resp):
+    """Fyers history candles, one per timestamp, in time order.
+
+    Fyers returns the SAME-DAY session TWICE — 750 rows covering 375 distinct
+    minutes on the report date, but 375 on any settled earlier date. It looks
+    like the live intraday feed appended to the stored one. Left alone this
+    doubles every volume SUM and makes the chart draw a return stroke back to
+    09:15 (high/low/open/close survive it, which is why it hid for a while).
+    Verified 20-08-2026: 750 raw -> 375 unique on both NIFTY and SENSEX.
+
+    The LAST row for a timestamp wins: on a live minute the later copy is the
+    more complete one."""
+    by_time = {}
+    for row in resp.get("candles") or []:
+        if len(row) >= 6:
+            by_time[row[0]] = row
+    return [by_time[k] for k in sorted(by_time)]
+
+
 def _fyers_levels(day, wanted, interval):
     """({index: levels}, {index: reason}) from Fyers — one call per index.
 
@@ -191,7 +208,7 @@ def _fyers_levels(day, wanted, interval):
                           {"symbol": symbol, "resolution": resolution,
                            "date_format": "1", "range_from": day.isoformat(),
                            "range_to": day.isoformat(), "cont_flag": "1"})
-        candles = [c for c in (resp.get("candles") or []) if len(c) >= 6]
+        candles = _candles(resp)
         if not candles:
             problems[name] = (resp.get("message")
                               or f"Fyers has no {day:%d-%m-%Y} bar for {name}")
@@ -471,38 +488,64 @@ def set_fyers_credentials(client_id=None, access_token=None):
 
 
 def load_fyers_credentials(path=None):
-    """{'client_id', 'access_token'} from fyers_credentials.json, or {}.
+    """{'client_id', 'access_token'}, or {} with the reason logged.
 
-    The access token is issued per day by Fyers' OAuth flow — it is NOT a
-    static secret, so it has to be refreshed daily by whatever runs that flow.
-    Missing file -> market volume is simply absent from the chart."""
+    Order: credentials pushed in by the app first (hosted, ephemeral disk),
+    then fyers_credentials.json (local). A token is refused — not passed on to
+    fail confusingly at the API — when it is the auth_code rather than the
+    access token, or when it has expired."""
     if _RUNTIME_CREDENTIALS:
-        expiry = token_expiry(_RUNTIME_CREDENTIALS["access_token"])
-        if expiry and expiry <= datetime.now():
-            logger.error("Fyers access_token expired at %s",
-                         expiry.strftime("%d-%m-%Y %H:%M"))
+        creds, source = dict(_RUNTIME_CREDENTIALS), "the supplied token"
+    else:
+        path = path or FYERS_CREDENTIALS_FILE
+        if not os.path.exists(path):
             return {}
-        return dict(_RUNTIME_CREDENTIALS)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            logger.error("fyers_credentials.json unreadable (%s)", exc)
+            return {}
+        creds = {k: str(data.get(k, "")).strip()
+                 for k in ("client_id", "access_token")}
+        source = os.path.basename(path)
+        if not all(creds.values()):
+            return {}
 
-    path = path or FYERS_CREDENTIALS_FILE
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as exc:
-        logger.error("fyers_credentials.json unreadable (%s)", exc)
-        return {}
-    creds = {k: str(data.get(k, "")).strip() for k in ("client_id", "access_token")}
-    if not all(creds.values()):
+    if token_kind(creds["access_token"]) == "auth_code":
+        logger.error("%s holds the AUTH CODE, not the access token — the code "
+                     "is a single-use voucher that must be exchanged. Run "
+                     "`python fyers_auth.py`, which does the exchange for you.",
+                     source)
         return {}
     expiry = token_expiry(creds["access_token"])
     if expiry and expiry <= datetime.now():
-        logger.error("Fyers access_token expired at %s — run `python "
-                     "fyers_auth.py` to issue today's token",
-                     expiry.strftime("%d-%m-%Y %H:%M"))
+        logger.error("Fyers access_token expired at %s — run "
+                     "`python fyers_auth.py`", expiry.strftime("%d-%m-%Y %H:%M"))
         return {}
     return creds
+
+
+def token_claims(token):
+    """The JWT payload, unverified, or {}. A plain base64 read — NOT a
+    signature check, which only Fyers can do."""
+    try:
+        body = str(token).split(".")[1]
+        body += "=" * (-len(body) % 4)
+        return json.loads(base64.urlsafe_b64decode(body))
+    except (IndexError, ValueError, TypeError):
+        return {}
+
+
+def token_kind(token):
+    """"access_token", "auth_code", or None if it cannot be read.
+
+    These are two DIFFERENT JWTs and they look alike. The auth_code is the
+    single-use voucher the browser redirect carries; it has to be exchanged
+    for the access token using the secret. Pasting the code straight into
+    access_token yields a token every API call rejects with "Could not
+    authenticate the user", which is a confusing way to learn this."""
+    return token_claims(token).get("sub") or None
 
 
 def token_expiry(access_token):
@@ -512,13 +555,8 @@ def token_expiry(access_token):
     so a token minted at 21:00 is good for nine hours. Reading the claim is
     the only way to say that honestly — it is a plain unsigned base64 read,
     NOT a signature check, which only Fyers can do."""
-    try:
-        body = access_token.split(".")[1]
-        body += "=" * (-len(body) % 4)
-        exp = json.loads(base64.urlsafe_b64decode(body))["exp"]
-    except (IndexError, KeyError, ValueError, TypeError):
-        return None
-    return datetime.fromtimestamp(exp)
+    exp = token_claims(access_token).get("exp")
+    return None if exp is None else datetime.fromtimestamp(exp)
 
 
 def fetch_market_volume(day, symbols, interval="1"):
@@ -565,14 +603,14 @@ def fetch_market_volume(day, symbols, interval="1"):
         except Exception as exc:
             failures.append(f"{symbol}: {type(exc).__name__}")
             continue
-        candles = resp.get("candles")
+        candles = _candles(resp)
         if not candles:
             failures.append(f"{symbol}: {resp.get('message') or 'no candles'}")
             continue
         # candle = [epoch, open, high, low, close, volume]
         out[symbol] = [
             [datetime.fromtimestamp(c[0]).strftime("%H:%M"), float(c[5])]
-            for c in candles if len(c) >= 6
+            for c in candles
         ]
         logger.info("fyers %s: %d candles, volume %s", symbol, len(candles),
                     f"{sum(c[5] for c in candles):,.0f}")
@@ -732,7 +770,7 @@ def fetch_index_option_volume(day, index, expiry=None, interval="1"):
                           {"symbol": symbol, "resolution": interval,
                            "date_format": "1", "range_from": day.isoformat(),
                            "range_to": day.isoformat(), "cont_flag": "1"})
-        candles = resp.get("candles")
+        candles = _candles(resp)
         if not candles:
             # a strike that simply did not trade is normal; a REFUSED call is
             # not, and the two must not be conflated or a throttled run looks
@@ -743,9 +781,8 @@ def fetch_index_option_volume(day, index, expiry=None, interval="1"):
                 blank += 1
             continue
         for row in candles:
-            if len(row) >= 6:
-                minute = datetime.fromtimestamp(row[0]).strftime("%H:%M")
-                per_minute[minute] = per_minute.get(minute, 0.0) + float(row[5])
+            minute = datetime.fromtimestamp(row[0]).strftime("%H:%M")
+            per_minute[minute] = per_minute.get(minute, 0.0) + float(row[5])
 
     total = sum(per_minute.values())
     logger.info("fyers %s %s option chain: %d strikes, %d quiet, %d failed, "
@@ -759,3 +796,120 @@ def fetch_index_option_volume(day, index, expiry=None, interval="1"):
     if not per_minute:
         return [], f"no {index} option volume on {day:%d-%b-%Y}"
     return [[m, v] for m, v in sorted(per_minute.items())], None
+
+
+def chain_expiries(index):
+    """([expiry dates], reason) currently LISTED for one index, soonest first.
+
+    Fyers lists only expiries that have not passed. An expiry day is therefore
+    a trap: ask on 20-Aug and the 20-Aug weekly is there, ask on 21-Aug and the
+    nearest becomes 27-Aug — a different contract carrying a fraction of the
+    day's volume. Callers should name the expiry rather than take the nearest
+    on trust."""
+    creds = load_fyers_credentials()
+    if not creds:
+        return [], "no Fyers token"
+    underlying = FYERS_INDEX_SYMBOLS.get(index)
+    if not underlying:
+        return [], f"{index} has no Fyers underlying symbol"
+    try:
+        from fyers_apiv3 import fyersModel
+        client = fyersModel.FyersModel(client_id=creds["client_id"],
+                                       token=creds["access_token"],
+                                       is_async=False)
+        chain = _throttled(client.optionchain,
+                           {"symbol": underlying, "strikecount": 1,
+                            "timestamp": ""})
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    rows = (chain.get("data") or {}).get("expiryData") or []
+    dates = []
+    for row in rows:
+        try:
+            dates.append(_as_date(str(row["date"]).replace("-", "/")))
+        except (KeyError, ValueError):
+            continue
+    return sorted(dates), None if dates else "Fyers listed no expiries"
+
+
+# ---------------------------------------------------------------------------
+# Volume workbook — the file volume_fetcher.py writes, uploaded to the report
+# ---------------------------------------------------------------------------
+
+VOLUME_SHEETS = {"nifty": "NIFTY", "sensex": "SENSEX", "banknifty": "BANKNIFTY"}
+
+
+def read_volume_sheets(source):
+    """({index: [[minute, volume]]}, {index: reason}, {index: expiry note}).
+
+    Written by volume_fetcher.py: one sheet per index, named nifty / sensex /
+    banknifty, columns `time` and `volume`. Read defensively — this file is
+    produced on a different day by a different run, so a stale or hand-edited
+    one must be reported rather than silently plotted:
+
+      * sheet names are matched case-insensitively, and a sheet whose header
+        is not time/volume falls back to the first two columns;
+      * rows whose time or volume will not parse are counted and dropped, not
+        coerced to zero, which would draw a dip that never happened;
+      * duplicate minutes are SUMMED, since a chain fetched in parts can
+        legitimately report the same minute twice.
+
+    The expiry volume_fetcher.py wrote in D1 is returned so the caller can show
+    it. It matters: Fyers delists a passed expiry, so a workbook generated the
+    morning AFTER an expiry day silently holds the NEXT contract. Comparing
+    that against a book traded on the expired one is apples to oranges — it
+    read as a 56% market share in testing.
+    """
+    import pandas as pd
+
+    frames = pd.read_excel(source, sheet_name=None)
+    by_name = {str(k).strip().lower(): v for k, v in frames.items()}
+    # D1 holds "expiry 25-Aug-2026"; it lands in the header row, so pandas
+    # reads it as a column name rather than a cell
+    notes = {}
+    for sheet, index in VOLUME_SHEETS.items():
+        frame = by_name.get(sheet)
+        if frame is None:
+            continue
+        for col in frame.columns:
+            text = str(col).strip()
+            if text.lower().startswith("expiry"):
+                notes[index] = text
+    out, problems = {}, {}
+    for sheet, index in VOLUME_SHEETS.items():
+        frame = by_name.get(sheet)
+        if frame is None:
+            continue                       # index simply not in this workbook
+        if frame.empty:
+            problems[index] = f"sheet '{sheet}' is empty"
+            continue
+        cols = {str(c).strip().lower(): c for c in frame.columns}
+        time_col = cols.get("time", frame.columns[0])
+        vol_col = cols.get("volume",
+                           frame.columns[1] if len(frame.columns) > 1 else None)
+        if vol_col is None:
+            problems[index] = f"sheet '{sheet}' has no volume column"
+            continue
+        per_minute, dropped = {}, 0
+        for stamp, value in zip(frame[time_col], frame[vol_col]):
+            minute = _minute_label(stamp)
+            try:
+                volume = float(value)
+            except (TypeError, ValueError):
+                minute = None
+            if not minute or pd.isna(value):
+                dropped += 1
+                continue
+            per_minute[minute] = per_minute.get(minute, 0.0) + volume
+        if not per_minute:
+            problems[index] = (f"sheet '{sheet}' has {len(frame)} row(s) but "
+                               "none carried a readable time and volume")
+            continue
+        if dropped:
+            logger.warning("volume sheet %s: %d unreadable row(s) dropped",
+                           sheet, dropped)
+        out[index] = [[m, v] for m, v in sorted(per_minute.items())]
+        logger.info("volume sheet %s: %d minute(s), total %s (%s)", sheet,
+                    len(out[index]), f"{sum(per_minute.values()):,.0f}",
+                    notes.get(index, "expiry not stated"))
+    return out, problems, notes

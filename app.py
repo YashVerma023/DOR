@@ -15,9 +15,8 @@ and offers exactly two downloads:
 """
 
 import io
-import json
 import logging
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 
 import pandas as pd
@@ -25,7 +24,6 @@ import streamlit as st
 from openpyxl import Workbook
 
 import marketdata
-import fyers_auth
 import summary as seg
 from dor import build_dor_html
 from portfolio import (
@@ -47,6 +45,7 @@ from tradevalue import (
     add_report_sheets,
     add_strikes_sheet,
     add_user_aliases,
+    drop_unmatched,
     aggregate,
     algo_summary,
     dedup_orders,
@@ -80,7 +79,7 @@ from tradevalue import _user_key as tv_user_key
 # returned by _process_all gains, loses or renames a field: it both busts the
 # st.cache_data entry and invalidates any session_state result an older build
 # left behind, so a shape change asks for a re-Process instead of crashing.
-STATE_VERSION = "volume-panel-v24"
+STATE_VERSION = "yfinance-and-uploaded-volume-v27"
 
 # One-time logging setup. Streamlit re-runs this module on every interaction,
 # so guard against stacking a handler per rerun.
@@ -100,93 +99,6 @@ st.caption(
     "Int / Pos+Int Segregation are computed in one go, with a single Excel workbook and a "
     "shareable DOR.html as output."
 )
-
-# ---------------------------------------------------------------------------
-# Fyers login — index levels and index option volume
-# ---------------------------------------------------------------------------
-#
-# The access token expires at 06:00 every morning, so it CANNOT be baked into
-# the deployment. On a hosted app the filesystem is ephemeral and the
-# gitignored fyers_credentials.json is not in the repo at all, so:
-#
-#   client_id / secret_key / redirect_uri  ->  st.secrets, set once
-#   access_token                           ->  minted here, held in memory
-#
-# @st.cache_resource is a process-wide singleton: one operator logs in and
-# every session of the app uses that token until it expires or the app
-# restarts. Nothing is written to disk, so nothing is lost when it is wiped.
-#
-# Everything here is optional. With no login the report still builds — index
-# levels fall back to Yahoo and the volume panel shows MS volume alone.
-@st.cache_resource
-def _fyers_token_store():
-    return {}
-
-
-def _fyers_app_credentials():
-    """client_id / secret_key / redirect_uri from st.secrets, else the file."""
-    try:
-        secrets = dict(st.secrets.get("fyers", {}))
-    except Exception:                       # no secrets.toml at all, locally
-        secrets = {}
-    if secrets.get("client_id"):
-        return secrets
-    try:
-        with open(marketdata.FYERS_CREDENTIALS_FILE, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return {}
-
-
-_fy_app = _fyers_app_credentials()
-_fy_store = _fyers_token_store()
-# a token already on disk (local runs) seeds the store, so a developer who has
-# run fyers_auth.py never sees the login prompt
-if not _fy_store.get("access_token") and _fy_app.get("access_token"):
-    _fy_store["access_token"] = _fy_app["access_token"]
-
-_fy_expiry = marketdata.token_expiry(_fy_store.get("access_token") or "")
-_fy_live = bool(_fy_store.get("access_token")) and (
-    _fy_expiry is None or _fy_expiry > datetime.now())
-if _fy_live:
-    marketdata.set_fyers_credentials(_fy_app.get("client_id"),
-                                     _fy_store["access_token"])
-else:
-    marketdata.set_fyers_credentials()
-
-with st.sidebar.expander("Fyers " + ("✅ connected" if _fy_live else "— not connected"),
-                         expanded=not _fy_live):
-    if not _fy_app.get("client_id"):
-        st.warning("No Fyers app configured. Add a `[fyers]` section to the "
-                   "app's secrets with `client_id`, `secret_key` and "
-                   "`redirect_uri`.")
-    elif _fy_live:
-        st.caption(f"Token valid until **{_fy_expiry:%d-%m-%Y %H:%M}**"
-                   if _fy_expiry else "Token set (expiry unreadable).")
-        st.caption("Index levels and index option volume come from Fyers. "
-                   "The token expires at 06:00 — log in again each morning.")
-        if st.button("Log out", key="fy_logout"):
-            _fy_store.clear()
-            st.rerun()
-    else:
-        st.caption("Not connected — index levels fall back to Yahoo and the "
-                   "volume panel shows MS volume only. Tokens expire at 06:00.")
-        try:
-            _fy_url = fyers_auth.login_url(_fy_app)
-            st.markdown(f"**1.** [Open the Fyers login]({_fy_url}) and sign in.")
-            st.caption("**2.** You land on a page that may not load — that is "
-                       "expected. Copy the whole address bar URL.")
-            _landed = st.text_input("**3.** Paste that URL here",
-                                    key="fy_landed",
-                                    placeholder="https://…?auth_code=…")
-            if _landed:
-                try:
-                    _fy_store["access_token"] = fyers_auth.exchange(_fy_app, _landed)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"{exc}")
-        except ValueError as exc:
-            st.error(str(exc))
 
 # ---------------------------------------------------------------------------
 # DTE — decides which All User accounts are in scope for the report
@@ -268,6 +180,19 @@ for _col, _idx in zip(_prem_cols, marketdata.INDEX_SYMBOLS):
             help="Any CSV/Excel with a time column and a premium value — the "
                  "columns are auto-detected and correctable below.",
         )
+# Market volume for the chart's third panel. Produced OUTSIDE the report by
+# volume_fetcher.py, which walks each index's full option chain — ~200 paced
+# Fyers calls per index. Doing that here would add minutes to every run and tie
+# the report to a token that dies at 06:00, so it is uploaded instead.
+volume_file = st.file_uploader(
+    "Index option volume workbook (optional) — from `volume_fetcher.py`",
+    type=["xlsx", "xlsm"], key="volume_file",
+    help="Sheets `nifty` / `sensex` / `banknifty`, each with `time` and "
+         "`volume` columns. Adds the market-volume line to the chart's volume "
+         "panel, on the same scale as MS volume so the two read as a share. "
+         "Generate it with:  python volume_fetcher.py --date YYYY-MM-DD",
+)
+
 with in6:
     summary2_file = st.file_uploader(
         "Secondary index User MTM (optional)",
@@ -285,8 +210,13 @@ with in6:
 # upload when one is given), so the report can never be built against a date
 # nobody typed correctly.
 # ---------------------------------------------------------------------------
+# `_v=STATE_VERSION` is part of every cache key below. Without it these caches
+# key only on (day, index) and survive a code change: after the fix for Fyers
+# returning the current day's candles TWICE, a running app kept serving the
+# cached 750-point series and the chart still drew its return stroke. Bumping
+# STATE_VERSION now invalidates market data as well as dor_state.
 @st.cache_data(show_spinner="Fetching index levels…")
-def _index_levels(day, indexes=None):
+def _index_levels(day, indexes=None, _v=STATE_VERSION):
     """Day High / Low for the given indexes on `day` — only the ones the
     orderbook traded, so BANKNIFTY is not fetched on the days it is absent.
     Cached on the arguments, so changing any other input does not refetch."""
@@ -294,7 +224,7 @@ def _index_levels(day, indexes=None):
 
 
 @st.cache_data(show_spinner="Fetching intraday series…")
-def _index_intraday(day, index_name):
+def _index_intraday(day, index_name, _v=STATE_VERSION):
     """One-minute closes for the charted index. Fetched at 1m and bucketed to
     the chosen timeframe IN THE BROWSER, so every timeframe comes from a single
     embedded payload and switching one is instant."""
@@ -486,6 +416,14 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # anything reads an algo, or the user drops out of every algo table
     aliases = add_user_aliases(allocations, all_orders)
 
+    # Accounts in neither the User MTM nor aliases.json are dropped from every
+    # calculation. They carry no algo, allocation or type, so they could only
+    # ever sit in the "-" row while still inflating the headline totals — the
+    # report would then add up to more than it can attribute. What went is
+    # reported below the KPI, never dropped silently.
+    all_orders, unmatched_drop = drop_unmatched(all_orders, allocations)
+    orders = [o for o in all_orders if o.status == "COMPLETE"]
+
     # every uploaded orderbook is duplicate-checked on
     # user + date + order id + symbol before anything is aggregated
     # Strike validation band, derived from the day's own High / Low rather
@@ -521,8 +459,8 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
     # inflate the lots exactly as they would inflate the trade value.
     lots_chart = lots_timeline(dedup_orders(all_orders), allocations)
     # MS volume: our own traded QUANTITY per minute, comparable with an
-    # exchange volume figure. Market volume needs a Fyers feed and is fetched
-    # separately below.
+    # exchange volume figure. The market side comes from the uploaded
+    # volume_fetcher.py workbook, not from here.
     ms_volume = volume_timeline(dedup_orders(all_orders))
 
     order_rows = order_summary(all_orders, allocations, type_map, bands)
@@ -544,6 +482,7 @@ def _process_all(ob_bytes, ob_name, mtm_bytes, mtm_name, mtm2_bytes, mtm2_name,
         "tv_by_segment": tv_by_segment,
         "multi_index": (multi_count, multi_map),
         "aliases": aliases,
+        "unmatched_drop": unmatched_drop,
         "order_count": len(orders),
         "allocation_count": len(allocations),
         "strikes": strikes,
@@ -764,6 +703,27 @@ def _pnl_color(value):
             else "color:#DC2626;font-weight:600")
 
 
+def _arrow_safe(df):
+    """Make a display frame convertible to Arrow, in place-ish.
+
+    Summary tables put a label in a numeric column — algo 1 beside "Sub-Total"
+    or "Overall", a server COUNT beside "VS1", "" beside a number. Arrow cannot
+    type a column like that, so Streamlit logs a full traceback on every render
+    and then silently applies its own fix. Coercing the genuinely mixed columns
+    to text keeps the tables identical and the log readable. Display only —
+    the Excel and HTML builders keep the real numbers."""
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype != object:
+            continue
+        kinds = {type(v) for v in out[col] if v is not None and v == v}
+        if len(kinds) > 1:
+            out[col] = out[col].map(
+                lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v))
+                else str(v))
+    return out
+
+
 def _styled_pivot(pivot_rows_view):
     pivot_df = pd.DataFrame(
         [
@@ -785,6 +745,7 @@ def _styled_pivot(pivot_rows_view):
         ],
         columns=PIVOT_COLS,
     )
+    pivot_df = _arrow_safe(pivot_df)
     row_kinds = [r["kind"] for r in pivot_rows_view]
 
     def _pivot_row_style(row):
@@ -984,7 +945,7 @@ else:
             ],
             columns=seg.SLIP_SUMMARY_HEADERS,
         )
-        st.dataframe(df_slip_sum.style.set_properties(**{"text-align": "center"}),
+        st.dataframe(_arrow_safe(df_slip_sum).style.set_properties(**{"text-align": "center"}),
                      width="stretch", hide_index=True)
     with sl2:
         st.subheader("Major Slippages")
@@ -1000,7 +961,7 @@ else:
                 ],
                 columns=seg.SLIP_MAJOR_HEADERS,
             )
-            st.dataframe(df_majors.style.set_properties(**{"text-align": "center"}),
+            st.dataframe(_arrow_safe(df_majors).style.set_properties(**{"text-align": "center"}),
                          width="stretch", hide_index=True)
         else:
             st.info("No slippage account is above its algo's average.")
@@ -1059,7 +1020,7 @@ for gi, (group_label, group_rows) in enumerate(tv_view_groups):
                             "obs": user_obs})
     df_summary = pd.DataFrame([format_summary_row(s) for s in summary_rows],
                               columns=SUMMARY_HEADER)
-    st.dataframe(df_summary.style.set_properties(**{"text-align": "center"}),
+    st.dataframe(_arrow_safe(df_summary).style.set_properties(**{"text-align": "center"}),
                  width="stretch", hide_index=True)
 
     _summary_labels = [f"Algo {s['algo']}" + (f" · {s['user_type']}" if s["user_type"] else "")
@@ -1086,7 +1047,7 @@ for gi, (group_label, group_rows) in enumerate(tv_view_groups):
                 columns=["User ID", "Server", "Lots per Cr", "Lots", "Outlier",
                          "Partial exposure"],
             )
-            st.dataframe(df_flagged.style.set_properties(**{"text-align": "center"}),
+            st.dataframe(_arrow_safe(df_flagged).style.set_properties(**{"text-align": "center"}),
                          width="stretch", hide_index=True)
         else:
             st.info("No outlier users in this algo.")
@@ -1190,6 +1151,7 @@ else:
 
 # ---- Portfolio analysis (from the MLOB) ----
 def _centered(df):
+    df = _arrow_safe(df)
     return (df.style.set_properties(**{"text-align": "center"})
             .map(_pnl_color, subset=["PnL"])
             .format({"PnL": format_indian, "Total Orders": format_indian}))
@@ -1276,6 +1238,22 @@ if pf_groups is not None:
 
 # ---- Strikes ----
 st.header("Strikes Traded")
+# Orders removed because their account is in neither the User MTM nor
+# aliases.json. Shown, not hidden: this shrinks Total Orders, and a total that
+# quietly changed is worse than one that explains itself.
+_dropped = dor_state.get("unmatched_drop") or {}
+if _dropped:
+    _names = ", ".join(f"`{u}` ({s}, {n})" for (u, s), n in
+                       sorted(_dropped.items(), key=lambda kv: -kv[1])[:8])
+    st.caption(
+        f"ℹ️ **{sum(_dropped.values()):,} order(s)** from **{len(_dropped)} account(s)** "
+        "were dropped from every calculation — the ids appear in neither the "
+        "**User MTM** nor **aliases.json**, so they carry no algo, allocation "
+        f"or type: {_names}"
+        + (" …" if len(_dropped) > 8 else "")
+        + ". Add a mapping to `aliases.json` to bring one back."
+    )
+
 strikes = dor_state["strikes"]
 seg_counts = {}
 for r in strikes["per_strike"]:
@@ -1317,24 +1295,45 @@ _chart_choices = [s for s in marketdata.INDEX_SYMBOLS if s in segments]
 chart_payloads = []
 if not _chart_choices:
     st.info("No index traded in this orderbook, so there is nothing to chart.")
-# Index option volume — Fyers, the whole option chain of each traded index,
-# in CONTRACTS so it shares a scale with MS volume and reads as a market share.
-# Optional: without it the panel shows MS volume alone rather than blocking.
-# One paced call per strike (~200 strikes, ~90s), so this is cached hard.
-@st.cache_data(show_spinner="Fetching index option volume (about a minute)…")
-def _index_option_volume(day, index, expiry_text):
-    expiry = marketdata.parse_expiry(expiry_text, day)
-    return marketdata.fetch_index_option_volume(day, index, expiry)
-
-
-_index_vol, _index_vol_reasons = {}, {}
+# Index option volume — read from the workbook volume_fetcher.py writes, not
+# fetched here. Fetching a whole option chain is ~200 paced API calls per index
+# (about 90 seconds each) and it needs a Fyers token that expires at 06:00
+# daily; neither belongs in the report's critical path. volume_fetcher.py is
+# run separately, once, and its output uploaded.
+_index_vol, _index_vol_problems, _index_vol_notes = {}, {}, {}
+if volume_file is not None:
+    try:
+        (_index_vol, _index_vol_problems,
+         _index_vol_notes) = marketdata.read_volume_sheets(volume_file)
+    except Exception as exc:                       # unreadable / not a workbook
+        st.warning(f"Volume workbook could not be read ({type(exc).__name__}: "
+                   f"{exc}). The volume panel shows MS volume only.")
+for _idx, _why in _index_vol_problems.items():
+    st.caption(f"ℹ️ {_idx} index volume — {_why}")
+# The expiry the workbook covers, shown against the one entered for the report.
+# A mismatch means the market line is a DIFFERENT contract from the traded one
+# and the MS share is meaningless — cheap to show, expensive to miss.
 for _idx in _chart_choices:
-    _index_vol[_idx], _reason = _index_option_volume(
-        market_date, _idx, expiry_map.get(_idx, ""))
-    if _reason:
-        _index_vol_reasons[_idx] = _reason
-for _idx, _reason in _index_vol_reasons.items():
-    st.caption(f"ℹ️ {_idx} index volume — {_reason}")
+    _note = _index_vol_notes.get(_idx)
+    if not _note:
+        continue
+    _want = marketdata.parse_expiry(expiry_map.get(_idx, ""), market_date)
+    _got = marketdata.parse_expiry(_note.split(maxsplit=1)[-1], market_date)
+    if _want and _got and _want != _got:
+        st.warning(
+            f"⚠️ {_idx}: the volume workbook covers **{_got:%d-%b-%Y}** but the "
+            f"report's expiry is **{_want:%d-%b-%Y}**. These are different "
+            "contracts — the market-volume line and the MS share do not "
+            "compare. Regenerate with `volume_fetcher.py --expiry "
+            f"{_want:%d%b%y}` (only possible before that expiry is delisted)."
+        )
+    else:
+        st.caption(f"ℹ️ {_idx} index volume — {_note}")
+_missing_vol = [i for i in _chart_choices if i not in _index_vol]
+if volume_file is not None and _missing_vol:
+    st.caption("ℹ️ No index-volume sheet for " + ", ".join(_missing_vol)
+               + " — run `volume_fetcher.py` for that index. The panel shows "
+                 "MS volume only.")
 
 for chart_index in _chart_choices:
     st.markdown(f"**{chart_index}**")
@@ -1492,7 +1491,7 @@ with s1:
         [[algo, len(b["servers"]), len(b["contracts"])] for algo, b in by_algo.items()],
         columns=["Algo", "No. of Server", "Strikes Traded"],
     )
-    st.dataframe(df_algo_strikes.style.set_properties(**{"text-align": "center"}),
+    st.dataframe(_arrow_safe(df_algo_strikes).style.set_properties(**{"text-align": "center"}),
                  width="stretch", hide_index=True)
     st.caption(f"Total (distinct) strikes in this view: {format_indian(len(as_distinct))} — "
                "an algo's count is distinct across its servers, not the column sum.")

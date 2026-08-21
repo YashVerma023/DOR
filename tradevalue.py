@@ -824,12 +824,69 @@ def load_account_aliases(path=None):
     return out
 
 
+def load_id_aliases(path=None):
+    """{orderbook user key: MTM account id} from aliases.json's STRING entries.
+
+    The object entries are per-server (one base id is a different account on
+    each server). These are not: they say "this id IS that MTM account,
+    wherever it traded". Two things need that:
+
+      * typos in the orderbook — S03939TWO is S0393TWO with a stray 9, and it
+        fired on VS5 while the real account lives on VS2, so no per-server
+        entry could express it;
+      * exports that write the All User id (CC03) where the MTM uses its own
+        (XLDH161), which otherwise drops every one of that account's orders.
+
+    Deliberately server-blind, so it is only safe for ids stated by hand.
+    Nothing is inferred by similarity: a fuzzy rule would eventually fold two
+    real accounts together and move their orders under the wrong algo."""
+    import json
+
+    path = Path(path) if path else ACCOUNT_ALIAS_FILE
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.error("aliases.json could not be read (%s)", exc)
+        return {}
+    return {_user_key(k): str(v) for k, v in raw.items()
+            if not str(k).startswith("_") and isinstance(v, str)}
+
+
+def _apply_id_aliases(allocations, orders, id_aliases):
+    """Attach stated id -> MTM account mappings, whatever the server."""
+    if not id_aliases:
+        return {}
+    by_key = {}
+    for entries in allocations.values():
+        for entry in entries:
+            by_key.setdefault(_user_key(entry["user_id"]), entry)
+
+    seen = {_user_key(o.user_id) for o in orders}
+    resolved = {}
+    for key, account in id_aliases.items():
+        if key not in seen or key in allocations:
+            continue                       # absent today, or matched on its own id
+        entry = by_key.get(_user_key(account))
+        if entry is None:
+            logger.warning("aliases: %s -> %s, but %s is not in the User MTM "
+                           "— skipped", key, account, account)
+            continue
+        allocations[key] = [entry]
+        resolved[key] = entry["user_id"]
+        logger.info("aliases: %s -> %s (%s, algo %s)", key, entry["user_id"],
+                    entry["server"], entry["algo"] or "-")
+    return resolved
+
+
 def add_user_aliases(allocations, orders, account_aliases=None):
     """See below. `account_aliases` (from load_account_aliases) is applied
     FIRST; anything it does not cover falls back to prefix inference."""
     explicit = (load_account_aliases() if account_aliases is None
                 else account_aliases)
     resolved = _apply_explicit_aliases(allocations, orders, explicit)
+    resolved.update(_apply_id_aliases(allocations, orders, load_id_aliases()))
     resolved.update(_infer_user_aliases(allocations, orders))
     return resolved
 
@@ -1379,8 +1436,16 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
         if not opt:
             continue
         user_key = _user_key(row.user_id)
-        server_key = _server_key(row.server)
         entry = _pick_allocation(allocations, user_key, row.server)
+        # The SERVER shown is the matched account's, not the order's. They can
+        # disagree: a handful of orders arrive tagged with a server the account
+        # does not live on (cross-panel bleed — every MStech panel shares one
+        # server, so exports cross-fetch other panels' rows). Taking the algo
+        # from the MTM and the server from the order paired VS23's algo 1 with
+        # the name VS5, reading as "VS5 runs algo 1" when VS5 is wholly algo 8.
+        # One source for both keeps the pairing truthful; server_mismatches()
+        # reports the orders this hides.
+        server_key = _server_key(entry["server"] if entry else row.server)
         algo = entry["algo"] if entry else ""
         user_type = (_resolve_type(type_map, type_index,
                                    _user_key(entry["user_id"]), server_key)
@@ -1935,3 +2000,52 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+def server_mismatches(orders, allocations):
+    """{(user, order server, MTM server, algo): order count} where an order's
+    server is not the server its account lives on.
+
+    Small and worth seeing: these are the orders whose server is rewritten for
+    display by order_summary. On 20-08-2026 there were 98 of 475,592, all one
+    account family, and they are the reason a VS5 row can carry a non-A8 algo."""
+    out = {}
+    for row in orders:
+        key = _user_key(row.user_id)
+        entry = _pick_allocation(allocations, key, row.server)
+        if entry is None:
+            continue
+        order_server = _server_key(row.server)
+        if entry["server"] and order_server and entry["server"] != order_server:
+            k = (key, order_server, entry["server"], entry["algo"])
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+def drop_unmatched(orders, allocations):
+    """(kept orders, {(user key, server): count}) — orders whose account is in
+    neither the User MTM nor aliases.json are removed from every calculation.
+
+    Call AFTER add_user_aliases, so an id that only resolves through an alias
+    is kept. An unmatched id carries no algo, no allocation and no type, so it
+    can only ever land in the "-" row; counting its orders in the totals while
+    attributing them to nothing makes the report add up to more than it can
+    explain. Dropping is the desk's stated rule.
+
+    This CHANGES the headline totals, so the caller is expected to report what
+    went — silently shrinking an order count is worse than the "-" row it
+    replaces."""
+    kept, dropped = [], {}
+    for row in orders:
+        key = _user_key(row.user_id)
+        if _pick_allocation(allocations, key, row.server) is None:
+            k = (key, _server_key(row.server))
+            dropped[k] = dropped.get(k, 0) + 1
+            continue
+        kept.append(row)
+    if dropped:
+        logger.warning("dropped %d order(s) from %d account(s) absent from the "
+                       "User MTM and aliases.json: %s", sum(dropped.values()),
+                       len(dropped),
+                       ", ".join(f"{u} on {s}" for u, s in sorted(dropped)[:6]))
+    return kept, dropped

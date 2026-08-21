@@ -31,6 +31,13 @@
     "purely numeric string entries are already handled by that rule and are",
     "listed only to document the known cases — they are harmless no-ops.",
     "",
+    "Some string entries are TYPOS in the orderbook, not renames: S03939TWO is",
+    "S0393TWO with a stray 9 and S0393THREEE is S0393THREE with a stray E. Both",
+    "fired the same 8-12 orders as their correctly spelled siblings on the same",
+    "server and the same minutes. They are mapped explicitly rather than by any",
+    "fuzzy rule: a near-match rule would eventually fold two REAL accounts into",
+    "one and move their orders under the wrong algo, silently.",
+    "",
     "Add an account by adding one line. No code change, no redeploy.",
     "This file is optional: if it is missing, both maps are simply empty and",
     "account matching falls back to prefix inference."
@@ -51,5 +58,7 @@
   "JSR129": {
     "VS5": "JSR129A31",
     "VS26": "JSR129A25"
-  }
+  },
+  "S03939TWO": "S0393TWO",
+  "S0393THREEE": "S0393THREE"
 }

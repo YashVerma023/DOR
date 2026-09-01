@@ -1,3 +1,5 @@
 /data/
 fyer_code/
 .streamlit/secrets.toml
+.fyersApi.log
+.fyersRequests.log

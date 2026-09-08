@@ -24,6 +24,7 @@ tell you which formula produced it and what it assumes.
 12. [Intraday chart](#12-intraday-chart)
 13. [Portfolio analysis](#13-portfolio-analysis)
 14. [Index market data](#14-index-market-data)
+14.1 [Volume — MS volume and market volume](#141-volume--ms-volume-and-the-market-volume-it-is-compared-against)
 15. [Constants — the complete list](#15-constants--the-complete-list)
 16. [Reconciliation identities](#16-reconciliation-identities)
 
@@ -39,14 +40,37 @@ tell you which formula produced it and what it assumes.
 | Secondary User MTM | optional | a second index set running on its own servers |
 | Multileg Orders (MLOB) | optional | Portfolio analysis |
 | ATM premium, one per index | optional | the premium line on the chart |
+| Index option volume workbook | optional | the market-volume line on the chart — see §14.1. Produced by `fyer_code/volume_fetcher.py`, never fetched by the report |
 | `aliases.json` | optional | both id maps: All User id ↔ MTM id (string value), and orderbook base id → MTM account id per server (object value) |
 
 **Orderbook row filters**, applied in this order:
 
-1. `Exchange ∈ {BFO, NFO}` — drops cash rows (NSE/BSE) whose quantities are not lot multiples
-2. Symbol classifies to NIFTY / BANKNIFTY / SENSEX — anything else is ignored
-3. `Status == COMPLETE` — **only** for Trade Value and strikes. The Orders Summary and the
-   chart read every status.
+1. `Exchange ∈ {BFO, NFO}` — drops cash rows (NSE/BSE) whose quantities are not lot
+   multiples, and the wholly blank padding rows some exports carry (8,636 of them on
+   20-08-2026)
+2. **`Exchange Time` present and not year 0001** — an order the exchange never saw. The OMS
+   writes that as a blank or as .NET's `DateTime.MinValue`, which arrives as
+   `01-Jan-0001 00:00:00` or `0001-01-01 00:00:00`. Judged on the YEAR, not by matching
+   each spelling, so a new one cannot slip through. A timestamp that is merely unparseable
+   is KEPT — unreadable is not the same as absent.
+3. Symbol classifies to NIFTY / BANKNIFTY / SENSEX — anything else is ignored
+4. `Status == COMPLETE` — **only** for Trade Value, strikes and MS volume. The Orders
+   Summary and the chart dots read every status.
+5. **Account known** — the user id resolves to a User MTM row, directly or through
+   `aliases.json`. See §2.5.
+
+Rule 2 costs real orders and the count is logged on every run. On 20-08-2026 it dropped
+628 rows, all RMS rejections blocked before they left the desk (556 on one
+`Option price check` rule, 8 on margin). They leave the Failed/Cancelled/Rejected totals
+with it — the desk's rule is that the orderbook holds what the exchange saw.
+
+```
+484,228   rows in the file
+ -8,636   Exchange not in {NFO, BFO}
+   -628   no exchange timestamp
+──────
+474,964   parsed
+```
 
 ---
 
@@ -107,6 +131,20 @@ the mapping has to be stated:
 Applied before the row's own id, because the MTM id can itself exist in the All User sheet
 as a dropped `DLR ACC` row.
 
+### 2.4a String aliases also apply to the ORDERBOOK
+
+`load_id_aliases()` reads the same string entries and applies them to orderbook ids,
+**server-blind** — unlike the object entries of §2.3, which are keyed per server. Two
+things need that:
+
+- **typos**: `S03939TWO` is `S0393TWO` with a stray 9 and it fired on VS5 while the real
+  account lives on VS2, so no per-server entry could express it;
+- **exports that write the All User id** (`CC03`) where the MTM uses its own (`XLDH161`),
+  which otherwise drops every one of that account's orders.
+
+Nothing is inferred by similarity. A fuzzy near-match rule would eventually fold two real
+accounts together and move their orders under the wrong algo, silently.
+
 ### 2.5 Allocation lookup
 
 `_pick_allocation(allocations, user_key, server)`
@@ -117,6 +155,32 @@ as a dropped `DLR ACC` row.
 - no server matches → **unmatched**, blank allocation
 
 Never guesses between accounts.
+
+### 2.6 Unmatched accounts are DROPPED
+
+`drop_unmatched(orders, allocations)`, run after the aliases. An id in neither the User MTM
+nor `aliases.json` carries no algo, allocation or type, so it could only ever sit in the
+`—` row while still inflating the headline totals — the report would add up to more than it
+can attribute.
+
+On 20-08-2026 this removed 84 orders from 7 accounts (`XTSD2`, `XTSD2_0`…`XTSD2_5`), taking
+Total Orders from 475,592 to 475,508. What went is named in a caption under the KPI: a
+total that quietly changed is worse than the `—` row it replaces.
+
+Worth noting those accounts were `NOT RUNNING` in All User yet fired 84 orders — the report
+surfaces that rather than absorbing it.
+
+### 2.7 The SERVER shown is the account's, not the order's
+
+`order_summary` takes both the algo AND the server from the matched MTM row. They can
+disagree: on 20-08-2026, 98 orders arrived tagged with a server their account does not live
+on — cross-panel bleed, since every MStech panel shares one server and exports cross-fetch
+other panels' rows.
+
+Taking the algo from the MTM and the server from the order paired VS23's algo 1 with the
+name VS5, reading as "VS5 runs algo 1" when VS5 is wholly algo 8 (26 accounts, all algo 8,
+in both files). One source for both keeps the pairing truthful. `server_mismatches()`
+reports the orders this rewrites, so the bleed stays visible.
 
 ---
 
@@ -551,11 +615,22 @@ One chart per index traded. Lines plotted on the **close** of each bucket.
 
 ### Series
 
-| Series | Axis | Source |
+| Series | Panel / axis | Source |
 |---|---|---|
-| Index | left | fetched 1-minute closes |
-| Premium | right | uploaded ATM premium file |
-| Lots dots | lower panel | orderbook |
+| Index | top, left | yfinance 1-minute closes (§14) |
+| Premium | top, right | uploaded ATM premium file |
+| Lots dots | middle panel | orderbook, every status |
+| MS volume | bottom panel | orderbook, COMPLETE only (§14.1) |
+| Index volume | bottom panel, same scale | uploaded volume workbook (§14.1) |
+
+Three stacked panels share one x-axis and one hover crosshair. The lots stems anchor at the
+**lots baseline**, not the chart floor — running them to the floor drew them straight
+through the volume panel and buried it.
+
+MS volume and Index volume share one scale deliberately: both are contracts, so the hover
+tooltip can state **MS share** as a real percentage. The index's own CASH volume was tried
+here and removed — it is a different instrument, ~1000x larger in these units, and putting
+it on the panel invited exactly the comparison it cannot support.
 
 An index in the tens of thousands and a premium in the hundreds cannot share a scale, hence
 two axes. Axis ticks snap to a round step — **index 50, premium 1** — and the range spans
@@ -648,52 +723,110 @@ Default report covers every portfolio whose name contains `QS` (case-insensitive
 Day High / Low per index for the report date, used for the chain's ATM anchor and the
 chart's index line.
 
-| Index | Fyers (primary) | Yahoo (fallback) |
-|---|---|---|
-| NIFTY | `NSE:NIFTY50-INDEX` | `^NSEI` |
-| BANKNIFTY | `NSE:NIFTYBANK-INDEX` | `^NSEBANK` |
-| SENSEX | `BSE:SENSEX-INDEX` | `^BSESN` |
+| Index | Ticker |
+|---|---|
+| NIFTY | `^NSEI` |
+| BANKNIFTY | `^NSEBANK` |
+| SENSEX | `^BSESN` |
+
+**Source is yfinance.** Fyers was trialled as the primary source and agrees with Yahoo
+**to the paisa** on all three indexes (12-08 and 17-08 checked, High/Low/mid identical),
+and it is fresher — on 17-08 Yahoo returned "no data ... has not settled yet" while Fyers
+had the full session. It was still reverted: a Fyers token expires at 06:00 every morning,
+so making the report depend on it means the levels silently change source, or vanish,
+depending on whether someone logged in that day. The report must not have a moving floor.
+
+`marketdata._fyers_levels()` remains in the module and is exercised by `volume_fetcher.py`
+(§14.1), which runs outside the report.
+
+**TradingView was rejected** as a source: no official public API for historical OHLC — the
+only official offering is the Charting Library, where the caller supplies the data. The
+unofficial websocket scrapers need a login and break when TV changes its internals.
 
 **Only the indexes the orderbook actually traded are fetched.** `indexes_in_orderbook()`
 reads the segments present and the fetch is restricted to those — BANKNIFTY is absent on
 most days, and fetching it anyway costs a round trip and produces a spurious "no data"
 warning.
 
-**Fyers is the primary source, Yahoo the fallback.** Fyers is already the feed behind the
-volume panel, so the levels and the volume come from one provider and one login. The two
-sources were compared before the switch and agree **to the paisa** on all three indexes:
-
-| 12-08-2026 | Fyers H / L / mid | Yahoo H / L / mid |
-|---|---|---|
-| NIFTY | 24,473.30 / 24,265.95 / 24,369.62 | identical |
-| BANKNIFTY | 57,885.85 / 57,254.00 / 57,569.93 | identical |
-| SENSEX | 78,263.33 / 77,497.93 / 77,880.63 | identical |
-
-Fyers is also **fresher**: on 17-08-2026 Yahoo returned "no data — market holiday, weekend,
-or the date has not settled yet" for all three, while Fyers had the full session. Yahoo is
-kept only for days when no Fyers token has been issued.
-
-**TradingView was rejected** as a source: it has no official public API for historical
-OHLC — its only official offering is the Charting Library, where the caller supplies the
-data. The unofficial websocket scrapers need a TradingView login and break when TV changes
-its internals.
-
 ```
 day mid = (High + Low) / 2
 ```
-
-**The day's OHLC is derived from the 1-minute candles, not the daily bar.** The two were
-verified identical to the paisa on every index and date tested, and the daily endpoint
-returns `None` intermittently — so deriving costs nothing and removes a failure mode. It
-also means one API call per index serves both the day High/Low and the chart's series.
 
 Every fetch is best-effort: a market holiday, weekend, future date or dropped connection
 yields an explanatory message and manual entry boxes, never an exception.
 
 **Retention limit:** Yahoo serves 1-minute history for roughly 30 days and 5/15-minute for
-about 60; Fyers serves 1-minute in requests of up to ~100 days and refuses wider ranges
-with `Invalid input`. A report date outside the available window produces no intraday
-series, and the chart section is omitted rather than half-drawn.
+about 60. A report date older than that produces no intraday series, and the chart section
+is omitted rather than half-drawn. Daily OHLC goes back years.
+
+---
+
+## 14.1 Volume — MS volume, and the market volume it is compared against
+
+The chart's third panel carries two lines, both in **contracts**, on one shared scale. The
+shared scale is the point: it makes MS ÷ Market a market share.
+
+### MS volume — computed here, from the orderbook alone
+
+```
+MS volume(index, minute)
+    = Σ  Quantity
+      over rows of Compiled_Orderbook where
+          Exchange       ∈ {NFO, BFO}
+      AND Status         = COMPLETE
+      AND Exchange Time  present and not year 0001
+      AND minute(Exchange Time) = minute          (HH:MM, seconds discarded)
+      AND index(Symbol)  = index
+```
+
+Five columns, and only five: `Exchange`, `Status`, `Exchange Time`, `Symbol`, `Quantity`.
+`tradevalue.volume_timeline()`.
+
+| Choice | Why |
+|---|---|
+| **Quantity, not lots** | Exchanges report volume in contracts. Dividing by lot size would make the two lines incomparable. |
+| **COMPLETE only** | Volume means what transacted. A cancelled order never touched the tape. On 20-08 that is 391,559 of 474,964 rows. |
+| **Square-off included** | It is a real trade. (The lots panel excludes it — there the question is what was *placed*.) |
+| **Exchange Time, not Order Time** | Order time is when the OMS sent it; exchange time is when the exchange saw it. Only the latter shares a clock with the index and volume series drawn beside it. |
+
+**Both sides are counted.** The `Transaction` column is not read, so a BUY and a SELL each
+add their quantity (20-08: BUY 9,773,755 + SELL 9,616,550 = 19,390,305). That matches
+exchange convention while the counterparty is external. If one MS account fills against
+another, the exchange counts the trade once and this counts it twice — which is why a
+strike-minute share above 100% means internal crossing, not a bug. Self-trade prevention
+appears active (23 `Self Trade Order Deleted` rows on 20-08), so the distortion is small.
+
+### Market volume — NOT fetched by the report
+
+Produced by `volume_fetcher.py` and **uploaded** as a workbook. It is the exchange's
+per-minute volume summed over EVERY strike of that index's option chain for one expiry.
+
+It is deliberately outside the report: a chain is ~200 paced API calls per index (~90 s),
+and it needs a Fyers token that dies at 06:00. Neither belongs in the critical path.
+
+```
+python fyer_code/volume_fetcher.py --date YYYY-MM-DD
+```
+
+Sheets `nifty` / `sensex` / `banknifty`, columns `time | volume`, expiry stated in D1.
+`marketdata.read_volume_sheets()` reads it: sheet names matched case-insensitively,
+unreadable rows counted and dropped rather than coerced to zero, duplicate minutes summed.
+
+**Expiry trap.** Fyers delists an expiry the moment it passes, so a workbook generated the
+morning AFTER an expiry day silently contains the NEXT contract. The expiry is written to
+D1 and the report compares it against the expiry entered for the run, warning on a
+mismatch — in testing this read as a 56% market share, which is what a wrong denominator
+looks like.
+
+**Fyers duplicates the current day.** `history` returns the session TWICE for the report
+date (750 candles over 375 distinct minutes on 20-08; settled earlier dates return 375).
+High/Low/Open/Close survive that, but **sums do not** — index volume read 34,326,837
+instead of 17,163,419. `marketdata._candles()` deduplicates on timestamp at every read.
+
+**Rate limiting is silent.** Fyers caps the data API near 10/second and 200/minute and
+answers 429. An un-paced burst returns short *with no error*: a first run reported
+5,901,682,280 against a true 7,629,219,325 — 23% missing, and it looked entirely normal.
+Calls are paced at 0.35 s with exponential backoff.
 
 ---
 

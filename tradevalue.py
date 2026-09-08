@@ -163,12 +163,45 @@ def _decimal(value, default="0"):
         return Decimal(default)
 
 
-# Excel number format with Indian digit grouping (16,44,536 / 5,72,58,680);
-# the escaped-comma groups drop automatically for smaller magnitudes, and the
-# first two conditional sections keep crore-scale values grouped on both signs.
-INDIAN_XLSX_FMT = (r"[>=10000000]##\,##\,##\,##\,##0;"
-                   r"[<=-10000000]-##\,##\,##\,##\,##0;"
-                   r"##\,##\,##0")
+# Excel number format with Indian digit grouping (16,44,536 / 5,72,58,680).
+#
+# The commas are ESCAPED, which makes them literal characters — that is the only
+# way to get lakh/crore grouping out of Excel, whose own separator groups by
+# threes. Literal means they ALWAYS print, so each section must be sized to the
+# magnitude it handles: a 7-placeholder pattern applied to 352 rendered ",,352",
+# and 2,59,632 came out as ",2,59,632". That looked like text and 99.8% of the
+# workbook's numeric cells were affected.
+#
+# Excel allows two conditions plus a fallback, so the tiers are by magnitude:
+#
+#   >= 1 crore    #\,##\,##\,##0   8 placeholders; a 9-digit value widens the first
+#   >= 1 lakh     #\,##\,##0        6 placeholders; a 7-digit value widens the first
+#   otherwise     ##,##0           plain grouping — covers 0, under a lakh, and
+#                                  EVERY negative
+#
+# The fallback is where the trade-off sits. Both conditions are spent on
+# positive magnitudes, so a negative lakh prints -1,26,334 as -126,334:
+# international grouping, still a correct number, just not Indian. That is the
+# lesser evil — in the sample workbooks 2,811 cells were negative but only 29
+# reached a crore, and mis-grouping a crore figure on a desk that reads in
+# crores is worse than international grouping on a lakh.
+INDIAN_XLSX_FMT = (r"[>=10000000]#\,##\,##\,##0;"
+                   r"[>=100000]#\,##\,##0;"
+                   r"##,##0")
+
+# ...and the format for anything that can go NEGATIVE.
+#
+# The Indian format above must not be used on a signed column. Verified by
+# rendering the workbook through LibreOffice: a conditional format's fallback
+# section never emits the minus sign, so -19,370 printed as "19,370" — a loss
+# reading as a gain. Excel allows only two conditions, which are already spent
+# on the lakh and crore tiers, so there is no section left to catch small
+# negatives.
+#
+# Grouping by threes is the price of a sign that is always right. Applied to
+# P&L, MTM and slippage columns; counts, allocations and max-loss stay Indian
+# because they are never negative.
+SIGNED_XLSX_FMT = "#,##0"
 
 
 def format_indian(value, places=0):
@@ -577,6 +610,32 @@ def _order_category(tag):
 
 FO_EXCHANGES = {"BFO", "NFO"}
 
+# An order that never reached the exchange carries no exchange timestamp. The
+# OMS writes that as a blank or as year 0001 — .NET's DateTime.MinValue, not a
+# real date. Both mean "the exchange never saw this", and such a row is dropped
+# rather than bucketed: _parse_minute would read "01-Jan-0001 00:00:00" as the
+# perfectly plausible minute 00:00 and pile those orders onto one phantom
+# bucket at midnight.
+_TS_YEAR = re.compile(r"\b(\d{4})\b")
+
+
+def _has_exchange_time(text):
+    """False when the exchange never timestamped this order.
+
+    The OMS writes that as a blank or as year 0001 — .NET's DateTime.MinValue,
+    which arrives in several spellings ("01-Jan-0001 00:00:00",
+    "0001-01-01 00:00:00"). Judged on the YEAR rather than by matching each
+    spelling, so a new one cannot slip through.
+
+    A timestamp with no 4-digit year at all is KEPT: unreadable is not the same
+    as absent, and dropping what we merely failed to parse would quietly delete
+    real orders."""
+    text = str(text or "").strip()
+    if not text:
+        return False
+    years = _TS_YEAR.findall(text)
+    return not (years and int(years[0]) <= 1)
+
 
 def read_orderbook(source, name=None, all_statuses=False):
     """Parse an orderbook CSV/Excel into Order tuples. Rows that never traded
@@ -618,11 +677,13 @@ def read_orderbook(source, name=None, all_statuses=False):
                           "exchgorderid")
     i_rowid = col("row_id", "sno", "id")
     i_tag = col("tag", "order_unique_identifier")
-    # the clock time the order was placed — feeds the intraday chart only, so a
-    # file without it simply produces no dots rather than failing
+    # the clock time the order was placed — kept for the dedup key and for
+    # reference, but NOT what the intraday chart buckets on
     i_time = col("order time", "order_time", "order_generated_time", "time")
-    # the dedup key needs the exchange timestamp too; a file without it simply
-    # contributes a blank component rather than failing
+    # EXCHANGE time is the timeline the report uses: it is when the exchange
+    # actually saw the order, whereas order time is when the OMS sent it. The
+    # two differ by the round trip, and only the exchange's own clock lines up
+    # with exchange-sourced index and volume series.
     i_exch_time = col("exchange time", "exchange_time", "exchange_transact_time",
                       "exchg time")
     if i_symbol is None or i_avg is None or i_qty is None:
@@ -634,8 +695,14 @@ def read_orderbook(source, name=None, all_statuses=False):
                        "Order Time" if i_time is None else "Exchange Time")
 
     orders = []
+    no_exch_time = 0
     for line_no, raw in enumerate(rows, start=2):
         if i_exchange is not None and _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
+            continue
+        raw_exch_time = (_normalise_timestamp(_cell(raw, i_exch_time))
+                         if i_exch_time is not None else "")
+        if i_exch_time is not None and not _has_exchange_time(raw_exch_time):
+            no_exch_time += 1
             continue
         status = (_normalise_status(_cell(raw, i_status))
                   if i_status is not None else "COMPLETE")
@@ -664,11 +731,18 @@ def read_orderbook(source, name=None, all_statuses=False):
             symbol=sys.intern(symbol),
             category=_order_category(raw_tag),
             status=sys.intern(status),
-            minute=sys.intern(_parse_minute(raw_order_time)),
+            minute=sys.intern(_parse_minute(raw_exch_time)),
             order_time=sys.intern(raw_order_time),
-            exchange_time=sys.intern(_normalise_timestamp(_cell(raw, i_exch_time))),
+            exchange_time=sys.intern(raw_exch_time),
             tag=sys.intern(raw_tag),
         ))
+    if no_exch_time:
+        # these are real orders the RMS blocked before they left the desk, so
+        # the count is stated: it comes out of the failed/rejected totals
+        logger.warning("%s: dropped %d row(s) with no exchange timestamp — the "
+                       "exchange never saw them (blank or 01-Jan-0001). They "
+                       "are excluded from every count, including failures.",
+                       name or "orderbook", no_exch_time)
     return orders
 
 
@@ -1525,6 +1599,16 @@ def format_order_row(row):
             row["executed"], row["failed"], row["pending"], row["hedge"], row["var"]]
 
 
+def _algo_cell(row):
+    """The algo as a NUMBER where it is one, so the column sorts and pivots.
+
+    order_summary carries it as a string ("1", "") because the HTML needs text;
+    an unmatched row has no algo and stays blank."""
+    algo = row.get("algo", "")
+    text = str(algo).strip()
+    return int(text) if text.isdigit() else text
+
+
 def add_orders_sheet(workbook, order_rows, suffix=""):
     """Append the "Orders" sheet: one row per (algo, type) with its servers
     listed underneath, then the grand total. `suffix` (e.g. " 2") names the
@@ -1543,14 +1627,23 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
     r = 2
     for row in order_rows:
         for col_idx, value in enumerate(format_order_row(row), start=1):
-            sheet.cell(row=r, column=col_idx, value=value).font = bold
+            cell = sheet.cell(row=r, column=col_idx, value=value)
+            cell.font = bold
+            if col_idx > 2 and isinstance(value, (int, float)):
+                cell.number_format = INDIAN_XLSX_FMT
         r += 1
         for s in row["servers"]:
-            # server rows sit under their algo, indented in the Type column
-            values = ["", f"  {s['server']}", s["users"], s["orders"],
+            # The algo is REPEATED on every server row rather than left blank
+            # under its group header. A blank reads as "no algo" once the sheet
+            # is sorted or filtered — which is the first thing anyone does to a
+            # spreadsheet — and it cannot be pivoted at all. The visual grouping
+            # is carried by the bold group row above instead.
+            values = [_algo_cell(row), f"  {s['server']}", s["users"], s["orders"],
                       s["executed"], s["failed"], s["pending"], s["hedge"], s["var"]]
             for col_idx, value in enumerate(values, start=1):
-                sheet.cell(row=r, column=col_idx, value=value)
+                cell = sheet.cell(row=r, column=col_idx, value=value)
+                if col_idx > 2 and isinstance(value, (int, float)):
+                    cell.number_format = INDIAN_XLSX_FMT
             r += 1
 
     totals = order_summary_totals(order_rows)
@@ -1558,7 +1651,10 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
             ["Total", "", totals["users"], totals["orders"], totals["executed"],
              totals["failed"], totals["pending"], totals["hedge"],
              totals["var"]], start=1):
-        sheet.cell(row=r, column=col_idx, value=value).font = bold
+        cell = sheet.cell(row=r, column=col_idx, value=value)
+        cell.font = bold
+        if col_idx > 2 and isinstance(value, (int, float)):
+            cell.number_format = INDIAN_XLSX_FMT
     sheet.freeze_panes = "A2"
 
 

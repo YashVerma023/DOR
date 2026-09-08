@@ -32,11 +32,32 @@ dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once 
 | `app.py` | Streamlit UI — upload the inputs, set the outlier deviation, one **Process** click computes everything. Run with `streamlit run app.py`. |
 | `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1`). |
 | `summary.py` | Summary engine: All User classification, DTE scope, MTM, pivot, `MTM Data`, slippage, `no_sl_Acc` (also an interactive CLI). |
-| `marketdata.py` | Index day High/Low + intraday series (Fyers, Yahoo fallback), index option volume, premium-file parsing. |
+| `marketdata.py` | Index day High/Low + intraday series (yfinance), premium-file parsing, volume-workbook reader, Fyers client used by `volume_fetcher.py`. |
+| `fyer_code/fyers_auth.py` | Mints the daily Fyers access token. Run outside the report. |
+| `fyer_code/volume_fetcher.py` | Writes the per-minute index option volume workbook the report uploads. Run outside the report. |
 | `aliases.json` | Both id maps in one file, told apart by the value. String value = All User id ↔ MTM id, when the two files name an account differently. Object value = orderbook base id → MTM account id, per server. |
 | `CALCULATION.md` | Every formula and constant, with the reasoning. |
 | `portfolio.py` | Portfolio analysis engine over the Multileg Orders (MLOB): per-portfolio / per-user PnL, QS summary, any-pattern reports. |
 | `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters, the drill-downs and the in-page portfolio analysis are plain inline JS). |
+
+## Daily workflow
+
+The report itself needs **no** Fyers token and makes no API calls beyond yfinance. Two
+scripts run outside it, and only if you want the market-volume line:
+
+```
+python fyer_code/fyers_auth.py                     # token, expires 06:00 daily
+python fyer_code/volume_fetcher.py --date <day>    # ~90 s per index, writes .xlsx
+```
+
+Then open the report and upload the workbook alongside the usual files. Skip both and
+everything still builds — the volume panel simply shows MS volume alone.
+
+**The access token and the auth code are two different JWTs that look identical.** The
+redirect page shows the *auth code*; the token is what Fyers returns in exchange for it.
+`fyers_auth.py` does the exchange, and now detects an auth code pasted into
+`fyers_credentials.json` and exchanges that too. Tell them apart with
+`fyers_auth.py --check`, or by length: token ~653 chars, code ~590.
 
 ## Inputs
 
@@ -66,8 +87,19 @@ so `user_id`, `User ID` and `UserID` all match.
 A raw order row survives only if **all** of these hold:
 
 - **Exchange ∈ {BFO, NFO}** — F&O only; NSE/BSE/MCX cash rows (e.g. `NIFTYBEES-EQ`) are dropped
-  because their quantities aren't lot multiples.
-- **Status == `COMPLETE`** — never-traded orders are dropped.
+  because their quantities aren't lot multiples. This also removes the wholly blank padding
+  rows some exports carry (8,636 of them on 20-08-2026).
+- **Exchange Time present, and not year 0001** — an order the exchange never saw. Written as
+  a blank or as `01-Jan-0001 00:00:00` (.NET's `DateTime.MinValue`). Judged on the **year**,
+  so any spelling of it is caught; a timestamp that is merely unparseable is kept, because
+  unreadable is not the same as absent. On 20-08-2026 this dropped 628 rows — all genuine
+  RMS rejections, which therefore leave the Failed/Cancelled/Rejected totals too. The count
+  is logged on every run.
+- **Account known** — the user id resolves to a User MTM row, directly or via `aliases.json`.
+  Ids in neither are dropped from every calculation (`drop_unmatched`) rather than sitting in
+  the `—` row while still inflating the totals. What went is named in a caption.
+- **Status == `COMPLETE`** — never-traded orders are dropped. Applies to Trade Value, strikes
+  and MS volume; the Orders Summary and the chart dots read every status.
 - **Symbol classifies into a segment** (substring match on the upper-cased symbol, checked in this
   order so BANKNIFTY isn't misread as NIFTY):
   `BANKNIFTY`/`BANK NIFTY` → **BANKNIFTY**, else `SENSEX` → **SENSEX**, else `NIFTY` → **NIFTY**,
@@ -78,7 +110,10 @@ A raw order row survives only if **all** of these hold:
 - **User key** — trimmed, upper-cased; **all-digit ids have leading zeros stripped**
   (`04101961` ≡ `4101961`), because Excel/CSV drops them. The report displays the longest
   (zero-padded) form it saw.
-- **Server key** — trimmed, upper-cased; `NAN`/`NONE`/`NA` read as blank.
+- **Server key** — trimmed, upper-cased; `NAN`/`NONE`/`NA` read as blank. In the Orders
+  Summary the server shown is the **matched account's**, not the order's — the two disagree
+  on a handful of cross-panel rows, and mixing them printed "VS5 under algo 1" when VS5 is
+  wholly algo 8. `server_mismatches()` lists what this rewrites.
 
 ## 1.3 Deduplication
 

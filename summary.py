@@ -58,7 +58,7 @@ import os
 
 import pandas as pd
 
-from tradevalue import INDIAN_XLSX_FMT, _user_key
+from tradevalue import INDIAN_XLSX_FMT, SIGNED_XLSX_FMT, _user_key
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
@@ -593,6 +593,13 @@ NCOLS   = 1 + len(HEADERS)   # col A = type label, cols B-K = data
 KEY_COL   = {"Users": "D", "SLHit": "E", "MaxLoss": "F",
              "Allocation": "G", "Realized": "H", "Unrealized": "I", "MTM": "J"}
 MONEY_KEYS = {"MaxLoss", "Allocation", "Realized", "Unrealized", "MTM"}
+# Of those, the ones that can be negative — they need the signed format, since
+# the Indian one silently drops the minus (see tradevalue.SIGNED_XLSX_FMT).
+SIGNED_KEYS = {"Realized", "Unrealized", "MTM"}
+
+
+def money_format(key):
+    return SIGNED_XLSX_FMT if key in SIGNED_KEYS else INDIAN_XLSX_FMT
 
 # --- Border sides ---
 _thin = Side(style="thin",   color="C0C0C0")
@@ -688,7 +695,7 @@ def write_data_row(ws, row, rowdict, fill, is_bold=False, bdr=None):
             cell.value = _algo_val(rowdict[key])
         elif key in MONEY_KEYS:
             cell.value         = round(float(rowdict[key]))
-            cell.number_format = INDIAN_XLSX_FMT
+            cell.number_format = money_format(key)
         else:
             cell.value = rowdict[key]
 
@@ -708,7 +715,7 @@ def write_subtotal_row(ws, row, data_start, data_end, fill, n_servers, is_bold=T
             cl             = KEY_COL[key]
             cell.value     = f"=SUM({cl}{data_start}:{cl}{data_end})"
             if key in MONEY_KEYS:
-                cell.number_format = INDIAN_XLSX_FMT
+                cell.number_format = money_format(key)
         elif key == "Return":
             # MTM % = MTM (col J) / ALLOCATION (col G) — the live formula keeps
             # the percentage tied to the MTM column when the sheet is edited
@@ -732,7 +739,7 @@ def write_total_row(ws, row, label, n_servers, ref_rows, fill, is_bold=True, bdr
             formula    = "+".join(f"{cl}{rr}" for rr in ref_rows)
             cell.value = f"={formula}"
             if key in MONEY_KEYS:
-                cell.number_format = INDIAN_XLSX_FMT
+                cell.number_format = money_format(key)
         elif key == "Return":
             # MTM % = MTM (col J) / ALLOCATION (col G) — the live formula keeps
             # the percentage tied to the MTM column when the sheet is edited
@@ -1093,6 +1100,7 @@ def _write_no_sl_sheet(wb, comp, report_date, suffix=""):
         cell.border = inner_bdr
 
     money = {"ALLOCATION", "MAX LOSS", "Realized P&L", "Unrealized P&L", "MTM"}
+    signed = {"Realized P&L", "Unrealized P&L", "MTM"}   # can be negative
     r = 3
     for row in rows:
         values = [_algo_val(row["ALGO"]), row["SERVER"], row["UserID"], row["Alias"],
@@ -1104,7 +1112,9 @@ def _write_no_sl_sheet(wb, comp, report_date, suffix=""):
             cell.border = inner_bdr
             cell.alignment = center
             if NO_SL_HEADERS[j - 1] in money:
-                cell.number_format = INDIAN_XLSX_FMT
+                cell.number_format = (SIGNED_XLSX_FMT
+                                      if NO_SL_HEADERS[j - 1] in signed
+                                      else INDIAN_XLSX_FMT)
         r += 1
     if not rows:
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(NO_SL_HEADERS))
@@ -1202,8 +1212,10 @@ def _write_slippage_sheet(wb, comp, report_date, suffix=""):
                 cell.border = inner_bdr
                 if is_major:
                     cell.fill = major_fill
-                if j in (5, 6, 7):
+                if j in (5, 6):
                     cell.number_format = INDIAN_XLSX_FMT
+                elif j == 7:                      # Realized P&L — can be negative
+                    cell.number_format = SIGNED_XLSX_FMT
                 elif j in (8, 9, 10):
                     cell.number_format = "0.00"
             r += 1
@@ -1452,6 +1464,9 @@ MTM_DATA_COLS = [
     ("SL HIT/NOT",     "SL Hit"),
 ]
 MTM_DATA_MONEY = {"ALLOCATION", "MAX LOSS", "MTM", "Realized P&L", "Unrealized P&L"}
+# P&L and MTM go negative, so they must not carry the Indian format — it drops
+# the minus sign (see tradevalue.SIGNED_XLSX_FMT).
+MTM_DATA_SIGNED = {"MTM", "Realized P&L", "Unrealized P&L"}
 MTM_DATA_COUNT = {"Total Orders", "Total Lots"}
 MTM_DATA_CENTER = {"SERVER", "ALGO", "Running Type", "Running Days", "EXPIRY",
                    "Date", "Month", "Day", "INDEX", "SL HIT/NOT"}
@@ -1489,7 +1504,8 @@ def _write_raw_sheet(wb, comp, suffix=""):
             cell.border = inner_bdr
             if hdr in MTM_DATA_MONEY and isinstance(val, (int, float)):
                 cell.value         = float(val)
-                cell.number_format = INDIAN_XLSX_FMT
+                cell.number_format = (SIGNED_XLSX_FMT if hdr in MTM_DATA_SIGNED
+                                      else INDIAN_XLSX_FMT)
             elif hdr in MTM_DATA_COUNT and isinstance(val, (int, float)):
                 cell.number_format = INDIAN_XLSX_FMT
             if hdr in MTM_DATA_CENTER:

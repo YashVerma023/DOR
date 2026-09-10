@@ -1090,9 +1090,10 @@ else:
         ord_totals = order_summary_totals(group_order_rows)
         df_orders = pd.DataFrame(
             [format_order_row(r) for r in group_order_rows]
-            + [["Total", "", ord_totals["users"], ord_totals["orders"], ord_totals["executed"],
-                ord_totals["failed"], ord_totals["pending"], ord_totals["hedge"],
-            ord_totals["var"]]],
+            + [["Total", "", ord_totals["users"], ord_totals["orders"],
+                ord_totals["executed"], ord_totals["failed"], ord_totals["margin"],
+                ord_totals["other"], ord_totals["pending"], ord_totals["hedge"],
+                ord_totals["var"]]],
             columns=ORDER_SUMMARY_HEADER,
         )
         n_order_rows = len(group_order_rows)
@@ -1138,7 +1139,7 @@ else:
             picked_order = group_order_rows[_order_labels.index(order_pick)]
             df_order_servers = pd.DataFrame(
                 [[s["server"], s["users"], s["orders"], s["executed"], s["failed"],
-                  s["pending"], s["hedge"], s["var"]]
+                  s["margin"], s["other"], s["pending"], s["hedge"], s["var"]]
                  for s in picked_order["servers"]],
                 columns=ORDER_SERVER_HEADER,
             )

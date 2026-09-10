@@ -60,9 +60,59 @@ NORMALISE_BASE = Decimal(100000)
 STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
 ORDER_SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Total Orders", "Executed",
-                        "Failed/Cancelled/Rejected", "Pending", "Hedge", "VAR"]
+                        "Rejected", "Margin Rejection", "Others",
+                        "Pending", "Hedge", "VAR"]
 ORDER_SERVER_HEADER = ["Server", "Users", "Total Orders", "Executed",
-                       "Failed/Cancelled/Rejected", "Pending", "Hedge", "VAR"]
+                       "Rejected", "Margin Rejection", "Others",
+                       "Pending", "Hedge", "VAR"]
+
+# Status Message fragments that mean the order died for want of MARGIN, as
+# opposed to price bands, instrument state, throttling or an unfilled IOC.
+#
+# Matched as case-insensitive SUBSTRINGS because the messages carry live
+# amounts and account ids ("RED:Margin Shortfall:INR 65823.92 Available:INR
+# 19499434.41 for C-7RA110084 [MTM_SINGLE_LEVEL]") — there is no fixed code to
+# key on, only the wording.
+#
+# The desk supplied this list.
+MARGIN_REJECT_MARKERS = (
+    "red:sqroff shortfall",
+    "rms:square off order margin exceeds",
+    "margin exceeds",
+    "rrm: collateral",
+    "margin shortfall",
+    "insufficient funds",
+    "red:margin shortfall",
+    "oems:[buy exposure limit for options]",
+    "span limit",
+)
+
+# Markers that count as margin ONLY on a REJECTED row.
+#
+# "SAF:order is not open to cancel" is an order-state error on its face, and it
+# appears on ordinary CANCELLED rows too — a cancel that lost a race with a
+# fill, which has nothing to do with margin. It is a margin cause only where the
+# status is REJECTED, which is the square-off-against-a-margin-call case. Taking
+# the message alone would have swept in every benign late cancel.
+REJECTED_ONLY_MARGIN_MARKERS = (
+    "saf:order is not open to cancel",
+)
+
+
+def is_margin_reject(message, status=None):
+    """True when a failure names a margin cause.
+
+    Everything that fails and does NOT match is counted as "Others", so the two
+    always add back to the failed total — no order can fall between them.
+
+    `status` is required for the markers that only count when REJECTED; passing
+    it is what keeps a cancelled order from being read as a margin failure."""
+    text = str(message or "").lower()
+    if any(marker in text for marker in MARGIN_REJECT_MARKERS):
+        return True
+    if str(status or "").upper() == "REJECTED":
+        return any(marker in text for marker in REJECTED_ONLY_MARGIN_MARKERS)
+    return False
 
 # An order that is still live at end of day is NOT a failure — the real
 # orderbook carries OPEN / OPEN_PENDING alongside CANCELLED and REJECTED, and
@@ -575,7 +625,7 @@ def _cell(row, idx):
 Order = namedtuple(
     "Order",
     "rowid trade_date server user_id segment qty avg_price order_id exch_order_id symbol "
-    "category status minute order_time exchange_time tag",
+    "category status minute order_time exchange_time tag status_message",
 )
 
 # "09:16" from "05-Aug-2026 09:16:00" / "09:16:00" / a datetime cell. The
@@ -617,6 +667,14 @@ FO_EXCHANGES = {"BFO", "NFO"}
 # perfectly plausible minute 00:00 and pile those orders onto one phantom
 # bucket at midnight.
 _TS_YEAR = re.compile(r"\b(\d{4})\b")
+
+# Last minute of the Indian F&O session. The equity segment closes at 15:30 and
+# the closing auction runs to 15:35, but F&O keeps trading to 15:40 — which is
+# why the book is NOT cut at 15:30. Anything stamped after 15:40 is outside the
+# session: a late OMS write-back, a settlement artefact or a clock skew, never a
+# trade someone made. Compared as "HH:MM" text, which orders correctly because
+# the hour is zero-padded.
+SESSION_END = "15:40"
 
 
 def _has_exchange_time(text):
@@ -677,6 +735,10 @@ def read_orderbook(source, name=None, all_statuses=False):
                           "exchgorderid")
     i_rowid = col("row_id", "sno", "id")
     i_tag = col("tag", "order_unique_identifier")
+    # why an order failed, in free text — the only thing that separates a
+    # margin rejection from a price-band one or an unfilled IOC
+    i_reason = col("status message", "status_message", "reason", "rejection_reason",
+                   "error_message", "remarks")
     # the clock time the order was placed — kept for the dedup key and for
     # reference, but NOT what the intraday chart buckets on
     i_time = col("order time", "order_time", "order_generated_time", "time")
@@ -695,7 +757,7 @@ def read_orderbook(source, name=None, all_statuses=False):
                        "Order Time" if i_time is None else "Exchange Time")
 
     orders = []
-    no_exch_time = 0
+    no_exch_time = after_close = 0
     for line_no, raw in enumerate(rows, start=2):
         if i_exchange is not None and _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
             continue
@@ -703,6 +765,10 @@ def read_orderbook(source, name=None, all_statuses=False):
                          if i_exch_time is not None else "")
         if i_exch_time is not None and not _has_exchange_time(raw_exch_time):
             no_exch_time += 1
+            continue
+        exch_minute = _parse_minute(raw_exch_time)
+        if exch_minute and exch_minute > SESSION_END:
+            after_close += 1
             continue
         status = (_normalise_status(_cell(raw, i_status))
                   if i_status is not None else "COMPLETE")
@@ -731,10 +797,14 @@ def read_orderbook(source, name=None, all_statuses=False):
             symbol=sys.intern(symbol),
             category=_order_category(raw_tag),
             status=sys.intern(status),
-            minute=sys.intern(_parse_minute(raw_exch_time)),
+            minute=sys.intern(exch_minute),
             order_time=sys.intern(raw_order_time),
             exchange_time=sys.intern(raw_exch_time),
             tag=sys.intern(raw_tag),
+            # only failures carry a reason; keeping it for completes would hold
+            # a few hundred thousand redundant strings in memory
+            status_message=("" if status == "COMPLETE" or i_reason is None
+                            else _cell(raw, i_reason)),
         ))
     if no_exch_time:
         # these are real orders the RMS blocked before they left the desk, so
@@ -743,6 +813,11 @@ def read_orderbook(source, name=None, all_statuses=False):
                        "exchange never saw them (blank or 01-Jan-0001). They "
                        "are excluded from every count, including failures.",
                        name or "orderbook", no_exch_time)
+    if after_close:
+        logger.warning("%s: dropped %d row(s) stamped after %s — the F&O "
+                       "session had closed, so these are write-back or clock "
+                       "artefacts rather than trades.",
+                       name or "orderbook", after_close, SESSION_END)
     return orders
 
 
@@ -1528,7 +1603,8 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
         group["users"].add(user_key)
         bucket = group["servers"].setdefault(
             server_key, {"users": set(), "orders": 0, "executed": 0,
-                         "failed": 0, "pending": 0, "hedge": 0, "var": 0})
+                         "failed": 0, "margin": 0, "other": 0,
+                         "pending": 0, "hedge": 0, "var": 0})
         bucket["users"].add(user_key)
         bucket["orders"] += 1
         # STATUS first, then the tag sub-divides only what executed — so Hedge
@@ -1546,11 +1622,19 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
             bucket["pending"] += 1     # still live — not a failure
         else:
             bucket["failed"] += 1
+            # Margin and Others PARTITION the failures — everything that is not
+            # margin is Others, so Rejected = Margin Rejection + Others always
+            # holds and no order can fall between the two columns.
+            if is_margin_reject(row.status_message, row.status):
+                bucket["margin"] += 1
+            else:
+                bucket["other"] += 1
 
     out = []
     for (algo, user_type), group in groups.items():
         servers = [{"server": server, "users": len(b["users"]), "orders": b["orders"],
                     "executed": b["executed"], "failed": b["failed"],
+                    "margin": b["margin"], "other": b["other"],
                     "pending": b["pending"], "hedge": b["hedge"], "var": b["var"]}
                    for server, b in sorted(group["servers"].items())]
         out.append({
@@ -1564,6 +1648,8 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
             "orders": sum(s["orders"] for s in servers),
             "executed": sum(s["executed"] for s in servers),
             "failed": sum(s["failed"] for s in servers),
+            "margin": sum(s["margin"] for s in servers),
+            "other": sum(s["other"] for s in servers),
             "pending": sum(s["pending"] for s in servers),
             "hedge": sum(s["hedge"] for s in servers),
             "var": sum(s["var"] for s in servers),
@@ -1587,6 +1673,8 @@ def order_summary_totals(rows):
         "orders": sum(r["orders"] for r in rows),
         "executed": sum(r["executed"] for r in rows),
         "failed": sum(r["failed"] for r in rows),
+        "margin": sum(r["margin"] for r in rows),
+        "other": sum(r["other"] for r in rows),
         "pending": sum(r["pending"] for r in rows),
         "hedge": sum(r["hedge"] for r in rows),
         "var": sum(r["var"] for r in rows),
@@ -1596,7 +1684,8 @@ def order_summary_totals(rows):
 def format_order_row(row):
     # blank algo / type = a user with no MTM entry, shown as an explicit dash
     return [row["algo"] or "—", row["user_type"] or "—", row["users"], row["orders"],
-            row["executed"], row["failed"], row["pending"], row["hedge"], row["var"]]
+            row["executed"], row["failed"], row["margin"], row["other"],
+            row["pending"], row["hedge"], row["var"]]
 
 
 def _algo_cell(row):
@@ -1639,7 +1728,8 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
             # spreadsheet — and it cannot be pivoted at all. The visual grouping
             # is carried by the bold group row above instead.
             values = [_algo_cell(row), f"  {s['server']}", s["users"], s["orders"],
-                      s["executed"], s["failed"], s["pending"], s["hedge"], s["var"]]
+                      s["executed"], s["failed"], s["margin"], s["other"],
+                      s["pending"], s["hedge"], s["var"]]
             for col_idx, value in enumerate(values, start=1):
                 cell = sheet.cell(row=r, column=col_idx, value=value)
                 if col_idx > 2 and isinstance(value, (int, float)):
@@ -1649,8 +1739,8 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
     totals = order_summary_totals(order_rows)
     for col_idx, value in enumerate(
             ["Total", "", totals["users"], totals["orders"], totals["executed"],
-             totals["failed"], totals["pending"], totals["hedge"],
-             totals["var"]], start=1):
+             totals["failed"], totals["margin"], totals["other"],
+             totals["pending"], totals["hedge"], totals["var"]], start=1):
         cell = sheet.cell(row=r, column=col_idx, value=value)
         cell.font = bold
         if col_idx > 2 and isinstance(value, (int, float)):
@@ -1673,10 +1763,14 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
 # first, which put failed hedges into `hedge` — on 11-08 that inflated hedge to
 # 15.6 lakh lots against a 5.6 lakh executed book, and left `failed` showing
 # 1.1% of real failures because only normal-tagged failures reached it.
-LOT_CATEGORIES = ("complete", "stoxxo", "hedge", "var", "failed")
+LOT_CATEGORIES = ("complete", "stoxxo", "hedge", "var",
+                  "failed", "margin", "other")
 
 # The parts of `complete`; used to assert the split adds back up.
 LOT_EXECUTED_PARTS = ("stoxxo", "hedge", "var")
+
+# The parts of `failed` — a partition, so these two DO sum to it.
+LOT_FAILED_PARTS = ("margin", "other")
 
 
 def _lot_categories(order):
@@ -1692,7 +1786,11 @@ def _lot_categories(order):
         return ["complete", "stoxxo"]
     if order.status in PENDING_STATUSES:
         return []
-    return ["failed"]
+    # `failed` is the total and margin/other are its two halves, so a failed
+    # order always appears in exactly two of these series
+    return ["failed",
+            "margin" if is_margin_reject(order.status_message, order.status)
+            else "other"]
 
 
 def lots_timeline(orders, allocations=None, deduped=True):

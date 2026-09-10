@@ -590,10 +590,58 @@ traded.
 |---|---|
 | Total Orders | every order, any outcome |
 | Executed | `status == COMPLETE` |
-| Failed/Cancelled/Rejected | not complete and not pending |
+| Rejected | not complete and not pending (rejected + cancelled) |
+| Margin Rejection | of those, the ones whose Status Message names a margin cause |
+| Others | every other rejection — `Rejected − Margin Rejection` |
 | Pending | still live at close — `OPEN`, `OPEN_PENDING`, `TRIGGER_PENDING`, `TRIGGER PENDING`, `AMO_SUBMITTED`, `PENDING` |
 | Hedge | **executed** orders tagged `h_…` |
 | VAR | **executed** orders tagged `v_…` |
+
+### 11.1 Margin Rejection vs Others
+
+```
+Rejected = Margin Rejection + Others          (always, by construction)
+```
+
+The two are a **partition**, not two independent tests: anything that fails and does not
+match a margin marker is Others, so no order can fall between the columns or be counted
+twice. Unlike Hedge/VAR — which are slices of Executed — these two DO add up to their
+total.
+
+The cause is read from the orderbook's **`Status Message`** column, matched as
+case-insensitive **substrings**. There is no status code to key on; the messages carry live
+amounts and account ids, e.g.
+
+```
+RED:Margin Shortfall:INR 65823.92 Available:INR 19499434.41 for C-7RA110084 [MTM_SINGLE_LEVEL]
+OEMS:RMS : Margin Exceeds : - Set Limit:[40000000] Total Required Margin:[40200588.74] …
+```
+
+Markers (`tradevalue.MARGIN_REJECT_MARKERS`), matched on any failed row:
+
+`red:sqroff shortfall` · `rms:square off order margin exceeds` · `margin exceeds` ·
+`rrm: collateral` · `margin shortfall` · `insufficient funds` · `red:margin shortfall` ·
+`oems:[buy exposure limit for options]` · `span limit`
+
+**One marker is status-conditional** (`REJECTED_ONLY_MARGIN_MARKERS`):
+
+`saf:order is not open to cancel` — counted as margin **only when `Status == REJECTED`**.
+
+On its face that is an order-state error, and it appears on ordinary `CANCELLED` rows too
+— a cancel that lost a race with a fill, which has nothing to do with margin. It is a
+margin cause only where the status is REJECTED, which is the square-off-against-a-
+margin-call case. Matching on the message alone would have swept every benign late cancel
+into Margin Rejection.
+
+Everything else lands in Others — price-band rejections
+(`RED:RULE:{Option price check…}`), `Throttle limit exceeded`, exchange-adapter
+disconnects, `TRANSACTION NOT ALLOWED IN CURRENT INSTRUMENT STATE`, and — by far the
+largest group — **`IOC Order Cancelled`**, which on 20-08-2026 was 72,724 of 83,618
+failures. An IOC cancels when there is no resting quantity at its price, so Others is
+dominated by liquidity, not by anything the RMS did.
+
+The Status Message is kept only for non-COMPLETE rows; holding it for the ~390,000
+completed rows would retain a few hundred thousand redundant strings for nothing.
 
 **Status decides first, then the tag sub-divides only what executed.** Counting the tag
 across all statuses reported cancelled hedges as hedge activity: on 11-08 that read
@@ -619,7 +667,7 @@ One chart per index traded. Lines plotted on the **close** of each bucket.
 |---|---|---|
 | Index | top, left | yfinance 1-minute closes (§14) |
 | Premium | top, right | uploaded ATM premium file |
-| Lots dots | middle panel | orderbook, every status |
+| Lots dots | middle panel | orderbook, every status — 7 series: `complete` and its parts `stoxxo`/`hedge`/`var`, then `failed` and its parts `margin`/`other` (§11.1) |
 | MS volume | bottom panel | orderbook, COMPLETE only (§14.1) |
 | Index volume | bottom panel, same scale | uploaded volume workbook (§14.1) |
 

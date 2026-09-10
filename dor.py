@@ -141,6 +141,8 @@ def _orders_table(order_rows, table_id="orders-summary"):
             f"<td>{_money(r['orders'])}</td>"
             f"<td>{_money(r['executed'])}</td>"
             f'<td class="above">{_money(r["failed"])}</td>'
+            f'<td class="above">{_money(r.get("margin", 0))}</td>'
+            f"<td>{_money(r.get('other', 0))}</td>"
             f"<td>{_money(r.get('pending', 0))}</td>"
             f"<td>{_money(r['hedge'])}</td>"
             f"<td>{_money(r['var'])}</td>"
@@ -155,6 +157,8 @@ def _orders_table(order_rows, table_id="orders-summary"):
                 f"<td>{_money(s['orders'])}</td>"
                 f"<td>{_money(s['executed'])}</td>"
                 f'<td class="above">{_money(s["failed"])}</td>'
+                f'<td class="above">{_money(s.get("margin", 0))}</td>'
+                f"<td>{_money(s.get('other', 0))}</td>"
                 f"<td>{_money(s.get('pending', 0))}</td>"
                 f"<td>{_money(s['hedge'])}</td>"
                 f"<td>{_money(s['var'])}</td>"
@@ -167,6 +171,8 @@ def _orders_table(order_rows, table_id="orders-summary"):
         f"<td>{_money(totals['orders'])}</td>"
         f"<td>{_money(totals['executed'])}</td>"
         f"<td>{_money(totals['failed'])}</td>"
+        f"<td>{_money(totals.get('margin', 0))}</td>"
+        f"<td>{_money(totals.get('other', 0))}</td>"
         f"<td>{_money(totals.get('pending', 0))}</td>"
         f"<td>{_money(totals['hedge'])}</td>"
         f"<td>{_money(totals['var'])}</td></tr>"
@@ -175,7 +181,8 @@ def _orders_table(order_rows, table_id="orders-summary"):
     <table class="tbl drill-tbl" id="{table_id}">
       <thead><tr>
         <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Total Orders</th>
-        <th>Executed</th><th>Failed/Cancelled/Rejected</th><th>Pending</th>
+        <th>Executed</th><th>Rejected</th>
+        <th>Margin Rejection</th><th>Others</th><th>Pending</th>
         <th>Hedge</th><th>VAR</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
@@ -767,7 +774,53 @@ def _chart_section(chart):
         <option value="60">1 Hour</option>
       </select></label>
       <label class="chip"><input type="checkbox" class="c-log" checked>Log lots</label>
+      <button type="button" class="chip c-zin" aria-label="Zoom in">+</button>
+      <button type="button" class="chip c-zout" aria-label="Zoom out">&minus;</button>
+      <button type="button" class="chip c-reset" hidden>Reset zoom</button>
+      <span class="c-hint note"><span class="c-hint-m">scroll to zoom · drag to pan ·
+        double-click to reset</span><span class="c-hint-t">pinch to zoom · drag to
+        pan</span></span>
       <span class="c-legend chip-group"></span>
+    </div>
+    <div class="c-sums">
+      <div class="c-sum">
+        <div class="c-sum-cap">Order summary</div>
+        <div class="c-sum-cols">
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="complete"></span>Completed</div>
+            <div class="c-val" data-k="complete">0</div>
+          </div>
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="stoxxo"></span>Stoxxo</div>
+            <div class="c-val" data-k="stoxxo">0</div>
+          </div>
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="hedge"></span>Hedge</div>
+            <div class="c-val" data-k="hedge">0</div>
+          </div>
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="var"></span>VAR</div>
+            <div class="c-val" data-k="var">0</div>
+          </div>
+        </div>
+      </div>
+      <div class="c-sum">
+        <div class="c-sum-cap">Rejection summary</div>
+        <div class="c-sum-cols">
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="failed"></span>Total</div>
+            <div class="c-val" data-k="failed">0</div>
+          </div>
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="margin"></span>Margin</div>
+            <div class="c-val" data-k="margin">0</div>
+          </div>
+          <div class="c-cell">
+            <div class="c-lab"><span class="sw2 rnd" data-c="other"></span>Others</div>
+            <div class="c-val" data-k="other">0</div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="chart-wrap">
       <svg class="c-svg" viewBox="0 0 1080 700" preserveAspectRatio="xMidYMid meet"></svg>
@@ -784,11 +837,17 @@ _CHART_SCRIPT = """
   var LINE = ['#1E40AF', '#B45309', '#0F766E', '#9333EA'];
   // `complete` is the TOTAL executed; stoxxo/hedge/var are its three parts, so
   // the legend must not be added up. `failed` is every non-executed lot.
+  // `complete` is the TOTAL executed; stoxxo/hedge/var are its three parts.
+  // `failed` is the TOTAL non-executed; margin/other are its two halves and
+  // DO sum to it. Neither total may be added to its own parts.
   var CAT_COLOR = {complete: '#15803D', stoxxo: '#0891B2',
-                   hedge: '#EA580C', var: '#9333EA', failed: '#DC2626'};
+                   hedge: '#EA580C', var: '#9333EA', failed: '#DC2626',
+                   margin: '#BE123C', other: '#F59E0B'};
   var CAT_LABEL = {complete: 'Completed (total)', stoxxo: 'Stoxxo',
-                   hedge: 'Hedge', var: 'VAR', failed: 'Failed / cancelled'};
-  var CAT_ORDER = ['complete', 'stoxxo', 'hedge', 'var', 'failed'];
+                   hedge: 'Hedge', var: 'VAR', failed: 'Rejected (total)',
+                   margin: 'Margin rejection', other: 'Others'};
+  var CAT_ORDER = ['complete', 'stoxxo', 'hedge', 'var',
+                   'failed', 'margin', 'other'];
   // two stacked panels sharing one time axis: prices above, lots below
   var W = 1080, H = 700, L = 76, R = 70, T = 20, B = 44;
   var LOTS_H = 150, VOL_H = 120, GAP = 34;
@@ -838,6 +897,7 @@ _CHART_SCRIPT = """
     var tfSel = card.querySelector('.c-tf');
     var algoSel = card.querySelector('.c-algo');
     var logBox = card.querySelector('.c-log');
+    var resetBtn = card.querySelector('.c-reset');
     var legend = card.querySelector('.c-legend');
     var LOTS = C.lots || null;
 
@@ -872,19 +932,34 @@ _CHART_SCRIPT = """
     }
 
     var state = [], lots = {}, X, Y, LY, x0, x1, lotMax, useLog;
+    var snapMinutes = [];
+    // zoom window over the x-axis, in minutes-since-midnight; null = full day
+    var view0 = null, view1 = null;
+
+    // Zoom is applied by FILTERING each series to the view window rather than
+    // by rescaling the axes. Everything downstream — x range, y range, ticks,
+    // paths, hover — then works on the visible data with no further change,
+    // and the y-axis rescales to what is on screen, which is the point of
+    // zooming into a quiet stretch.
+    function inView(pts) {
+      if (view0 === null) return pts;
+      return pts.filter(function (p) { return p[0] >= view0 && p[0] <= view1; });
+    }
 
     function draw() {
       var step = +tfSel.value;
       svg.innerHTML = '';
       state = C.series.map(function (s, i) {
         return {name: s.name, axis: s.axis || 'left', color: LINE[i % LINE.length],
-                data: resample(s.points, step)};
+                data: inView(resample(s.points, step))};
       });
       var all = [].concat.apply([], state.map(function (s) { return s.data; }));
       if (!all.length) return;
       var xs = all.map(function (d) { return d[0]; });
       x0 = Math.min.apply(null, xs); x1 = Math.max.apply(null, xs);
-      if (C.shade) {
+      if (view0 !== null) {
+        x0 = view0; x1 = view1;
+      } else if (C.shade) {
         x0 = Math.min(x0, mins(C.shade[0])); x1 = Math.max(x1, mins(C.shade[1]));
       }
       if (x1 === x0) x1 = x0 + 1;
@@ -916,6 +991,7 @@ _CHART_SCRIPT = """
       };
 
       lots = lotsByCat(step, algoSel.value);
+      Object.keys(lots).forEach(function (c) { lots[c] = inView(lots[c]); });
       useLog = logBox && logBox.checked;
       lotMax = 0;
       Object.keys(lots).forEach(function (c) {
@@ -939,7 +1015,7 @@ _CHART_SCRIPT = """
         .filter(function (s) { return (VOL[s[0]] || []).length; })
         .map(function (s) {
           return {key: s[0], name: s[1], color: s[2],
-                  data: resample(VOL[s[0]], step)};
+                  data: inView(resample(VOL[s[0]], step))};
         });
       var volMax = 0;
       volSeries.forEach(function (s) {
@@ -950,6 +1026,22 @@ _CHART_SCRIPT = """
         if (volMax <= 0) return H - B;
         return (H - B) - (v / volMax) * (H - B - P3T);
       };
+
+      // every minute any series carries — the hover snaps to this, so the
+      // tooltip keeps working past the index feed's last tick
+      var seen = {};
+      state.forEach(function (s) {
+        s.data.forEach(function (p) { seen[p[0]] = 1; });
+      });
+      volSeries.forEach(function (s) {
+        s.data.forEach(function (p) { seen[p[0]] = 1; });
+      });
+      Object.keys(lots).forEach(function (cat) {
+        (lots[cat] || []).forEach(function (p) { seen[p[0]] = 1; });
+      });
+      snapMinutes = Object.keys(seen).map(Number).sort(function (a, b) {
+        return a - b;
+      });
 
       // ---- panel backgrounds: one card, two clearly bounded regions ----
       svg.appendChild(el('rect', {x: L, y: T, width: W - L - R, height: P1B - T,
@@ -1076,17 +1168,26 @@ _CHART_SCRIPT = """
         });
       });
 
+      // The two summary tables read the SAME `lots` object the dots are drawn
+      // from — already filtered by the algo selector and by the zoom window —
+      // so they cannot disagree with the chart, and they follow a zoom without
+      // any extra wiring. Completed = stoxxo + hedge + var and Total rejection
+      // = margin + others, both by construction, so each row adds up.
+      card.querySelectorAll('.c-sums [data-k]').forEach(function (cell) {
+        var series = lots[cell.getAttribute('data-k')] || [];
+        var total = series.reduce(function (a, p) { return a + p[1]; }, 0);
+        cell.textContent = lotFmt(total);
+      });
+
+      // Only the four LINE series get a legend chip. The seven lot categories
+      // used to sit here too, which meant every number appeared twice once the
+      // summary tables arrived — the tables carry their own colour swatch in
+      // the column header instead, so the key travels with the figure.
       legend.innerHTML = state.map(function (s) {
         return '<label class="chip"><span class="sw2" style="background:' + s.color +
                '"></span>' + s.name + ' <span class="note">(' +
                (s.axis === 'left' ? 'left' : 'right') + ')</span></label>';
-      }).concat(cats.map(function (cat) {
-        var tot = lots[cat].reduce(function (a, p) { return a + p[1]; }, 0);
-        return '<label class="chip"><span class="sw2 rnd" style="background:' +
-               (CAT_COLOR[cat] || '#64748B') + '"></span>' +
-               (CAT_LABEL[cat] || cat) + ' <span class="note">' + lotFmt(tot) +
-               ' lots</span></label>';
-      })).concat(volSeries.map(function (s) {
+      }).concat(volSeries.map(function (s) {
         var tot = s.data.reduce(function (a, p) { return a + p[1]; }, 0);
         return '<label class="chip"><span class="sw2" style="background:' + s.color +
                '"></span>' + s.name + ' <span class="note">' + lotFmt(tot) + '</span></label>';
@@ -1099,10 +1200,14 @@ _CHART_SCRIPT = """
         var box = svg.getBoundingClientRect();
         var px = (e.clientX - box.left) / box.width * W;
         var m = x0 + (px - L) / (W - L - R) * (x1 - x0);
-        var ref = state[0].data, snap = null, bd = 1e9;
-        ref.forEach(function (p) {
-          var dd = Math.abs(p[0] - m);
-          if (dd < bd) { bd = dd; snap = p[0]; }
+        // Snap to ANY series' minute, not just the first one. The index feed
+        // stops at 15:29 (index ticks end with the equity session) while the
+        // premium, lots and volume run to 15:40 — snapping to state[0] alone
+        // made the tooltip die at 15:29 over data that was plainly on screen.
+        var snap = null, bd = 1e9;
+        snapMinutes.forEach(function (t) {
+          var dd = Math.abs(t - m);
+          if (dd < bd) { bd = dd; snap = t; }
         });
         if (snap === null) return;
         hover.innerHTML = '';
@@ -1161,6 +1266,159 @@ _CHART_SCRIPT = """
         hover.innerHTML = '';
       };
     }
+
+    // ---- zoom: wheel over the plot, drag to pan, double-click to reset ----
+    // The full day is 375 minutes across ~930px, so a busy minute is barely a
+    // pixel wide. Zooming is what makes the lots dots and the volume spikes
+    // readable at all.
+    var FULL = null;               // the whole day, cached on first draw
+    function fullRange() {
+      if (!FULL) {
+        var xs = [];
+        C.series.forEach(function (s) {
+          s.points.forEach(function (p) { xs.push(mins(p[0])); });
+        });
+        if (!xs.length) return null;
+        FULL = [Math.min.apply(null, xs), Math.max.apply(null, xs)];
+      }
+      return FULL;
+    }
+    function setView(a, b) {
+      var f = fullRange();
+      if (!f) return;
+      var span = Math.max(5, Math.min(b - a, f[1] - f[0]));   // never below 5 min
+      a = Math.max(f[0], Math.min(a, f[1] - span));
+      view0 = a; view1 = a + span;
+      if (view1 - view0 >= f[1] - f[0]) { view0 = view1 = null; }
+      if (resetBtn) resetBtn.hidden = (view0 === null);
+      draw();
+    }
+    function minuteAt(e) {
+      return minuteIn(e.clientX, x0, x1);
+    }
+    // clientX -> minute against an EXPLICIT window. Gestures must anchor on the
+    // window they started in: draw() rewrites x0/x1 on every frame, so reading
+    // the live values mid-pinch makes the zoom run away from the fingers.
+    function minuteIn(clientX, a, b) {
+      var box = svg.getBoundingClientRect();
+      var px = (clientX - box.left) / box.width * W;
+      return a + (px - L) / (W - L - R) * (b - a);
+    }
+    svg.addEventListener('wheel', function (e) {
+      var f = fullRange();
+      if (!f) return;
+      e.preventDefault();                       // the page must not scroll away
+      var a = view0 === null ? f[0] : view0,
+          b = view1 === null ? f[1] : view1;
+      var at = Math.max(a, Math.min(minuteAt(e), b));
+      var k = e.deltaY < 0 ? 0.8 : 1.25;        // up = in, down = out
+      setView(at - (at - a) * k, at + (b - at) * k);
+    }, {passive: false});
+    var panFrom = null;
+    svg.addEventListener('mousedown', function (e) {
+      if (view0 === null) return;               // nothing to pan when unzoomed
+      // anchored in PIXELS, not minutes: draw() rewrites x0/x1 on every frame,
+      // so a minute captured in the old view would drift as the pan proceeds
+      panFrom = {px: e.clientX, a: view0, b: view1};
+      svg.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mouseup', function () {
+      panFrom = null; svg.style.cursor = '';
+    });
+    svg.addEventListener('mousemove', function (e) {
+      if (!panFrom) return;
+      var box = svg.getBoundingClientRect();
+      var span = panFrom.b - panFrom.a;
+      var perPx = span / ((W - L - R) / W * box.width);
+      var shift = (panFrom.px - e.clientX) * perPx;
+      setView(panFrom.a + shift, panFrom.b + shift);
+    });
+    // ---- touch: pinch to zoom, one finger to pan ----
+    // The svg carries `touch-action: pan-y`, so a vertical drag still scrolls
+    // the page — a chart this tall would be a trap otherwise. Horizontal drags
+    // and two-finger gestures come to us, and only those call preventDefault.
+    var gesture = null;
+    // TRUE distance between the fingers, not the horizontal gap. A pinch is
+    // rarely axis-aligned, and a near-vertical one collapses the x-gap to
+    // almost nothing — the ratio then explodes and the chart snaps to its
+    // 5-minute floor on the first move.
+    function spread(t) {
+      var dx = t[0].clientX - t[1].clientX, dy = t[0].clientY - t[1].clientY;
+      return Math.max(1, Math.sqrt(dx * dx + dy * dy));
+    }
+    svg.addEventListener('touchstart', function (e) {
+      var f = fullRange();
+      if (!f) return;
+      var a = view0 === null ? f[0] : view0,
+          b = view1 === null ? f[1] : view1;
+      if (e.touches.length === 2) {
+        var mid = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        gesture = {kind: 'pinch', d: spread(e.touches), a: a, b: b,
+                   at: minuteIn(mid, a, b)};
+      } else if (e.touches.length === 1 && view0 !== null) {
+        gesture = {kind: 'pan', px: e.touches[0].clientX, a: a, b: b};
+      } else {
+        gesture = null;
+      }
+    }, {passive: true});
+    svg.addEventListener('touchmove', function (e) {
+      if (!gesture) return;
+      if (gesture.kind === 'pinch' && e.touches.length === 2) {
+        e.preventDefault();                 // stop the browser zooming the page
+        var k = gesture.d / spread(e.touches);
+        setView(gesture.at - (gesture.at - gesture.a) * k,
+                gesture.at + (gesture.b - gesture.at) * k);
+      } else if (gesture.kind === 'pan' && e.touches.length === 1) {
+        var box = svg.getBoundingClientRect();
+        var perPx = (gesture.b - gesture.a) / ((W - L - R) / W * box.width);
+        var shift = (gesture.px - e.touches[0].clientX) * perPx;
+        if (Math.abs(shift) < 0.5) return;  // let a near-vertical drag scroll
+        e.preventDefault();
+        setView(gesture.a + shift, gesture.b + shift);
+      }
+    }, {passive: false});
+    function endGesture(e) {
+      // a pinch ends the moment either finger lifts — carrying it on with one
+      // finger down leaves a stale anchor that jumps on the next move
+      if (!e.touches.length || (gesture && gesture.kind === 'pinch'
+                                && e.touches.length < 2)) {
+        gesture = null;
+      }
+    }
+    svg.addEventListener('touchend', endGesture);
+    // the browser takes the gesture over when it decides the drag is a scroll
+    svg.addEventListener('touchcancel', function () { gesture = null; });
+
+    function resetZoom() {
+      view0 = view1 = null;
+      if (resetBtn) resetBtn.hidden = true;
+      draw();
+    }
+    svg.addEventListener('dblclick', resetZoom);
+    if (resetBtn) resetBtn.addEventListener('click', resetZoom);
+
+    // Buttons as well as gestures. Pinch handling cannot be verified on every
+    // Android browser from here, and a chart you cannot zoom is worse than an
+    // extra pair of controls — these work on any device, and on a desktop
+    // without a wheel.
+    function stepZoom(k) {
+      var f = fullRange();
+      if (!f) return;
+      var a = view0 === null ? f[0] : view0,
+          b = view1 === null ? f[1] : view1;
+      var mid = (a + b) / 2;                // hold the centre, scale the span
+      setView(mid - (mid - a) * k, mid + (b - mid) * k);
+    }
+    var zinBtn = card.querySelector('.c-zin');
+    var zoutBtn = card.querySelector('.c-zout');
+    if (zinBtn) zinBtn.addEventListener('click', function () { stepZoom(0.6); });
+    if (zoutBtn) zoutBtn.addEventListener('click', function () { stepZoom(1 / 0.6); });
+
+    // Column swatches, painted once — the dot colours never change, so this
+    // does not belong in draw().
+    card.querySelectorAll('.c-sums [data-c]').forEach(function (sw) {
+      sw.style.background = CAT_COLOR[sw.getAttribute('data-c')] || '#64748B';
+    });
 
     tfSel.addEventListener('change', draw);
     algoSel.addEventListener('change', draw);
@@ -1730,6 +1988,59 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
   }}
   .chain-controls #chain-n {{ width: 58px; }}
   .chip-group {{ display: inline-flex; gap: 8px; flex-wrap: wrap; }}
+  /* the Reset zoom button is toggled with the `hidden` attribute, which a
+     display rule would otherwise override — so state it explicitly */
+  [hidden] {{ display: none !important; }}
+  button.chip {{ font: inherit; background: #fff; cursor: pointer; }}
+  /* The two summaries above each chart. Deliberately NOT `.tbl` — the report's
+     table style paints a dark navy header, and two heavy blocks sitting above
+     a pale chart fought with it. These read as quiet stat cards instead: the
+     figure is the loud element, the label and its colour key stay muted. */
+  .c-sums {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 2px;
+             align-items: stretch; }}
+  .c-sum {{ background: var(--panel, #F8FAFC); border: 1px solid var(--line);
+            border-radius: 8px; padding: 8px 4px 10px; }}
+  .c-sum-cap {{ font-size: 11px; font-weight: 700; letter-spacing: .04em;
+                text-transform: uppercase; color: var(--muted);
+                padding: 0 12px 7px; }}
+  .c-sum-cols {{ display: flex; align-items: flex-end; }}
+  .c-cell {{ padding: 0 14px; min-width: 96px; }}
+  .c-cell + .c-cell {{ border-left: 1px solid var(--line); }}
+  .c-lab {{ font-size: 11.5px; color: var(--muted); white-space: nowrap;
+            display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }}
+  .c-lab .sw2 {{ margin: 0; flex: none; }}
+  .c-val {{ font-size: 15px; font-weight: 600; color: var(--header);
+            font-variant-numeric: tabular-nums; white-space: nowrap;
+            text-align: right; }}
+  @media print {{ .c-sum {{ break-inside: avoid; }} }}
+  /* pan-y, not none: a vertical drag must still scroll the page, or a chart
+     this tall becomes a trap on a phone. Horizontal and two-finger gestures
+     are ours. */
+  .chart-wrap, .c-svg {{ touch-action: pan-y; }}
+  .c-hint-t {{ display: none; }}
+  @media (hover: none) {{
+    .c-hint-m {{ display: none; }}
+    .c-hint-t {{ display: inline; }}
+  }}
+  /* Phones: the four Order-summary cells are ~400px wide on a desktop row and
+     would run off a 360px screen, so they become a 2x2 grid and each card
+     takes the full width. */
+  @media (max-width: 640px) {{
+    .c-sums {{ gap: 8px; }}
+    .c-sum {{ flex: 1 1 100%; padding: 8px 2px 6px; }}
+    .c-sum-cols {{ display: grid; grid-template-columns: 1fr 1fr; }}
+    .c-cell {{ min-width: 0; padding: 6px 12px; }}
+    .c-cell + .c-cell {{ border-left: none; }}
+    .c-sum-cols .c-cell:nth-child(n + 3) {{ border-top: 1px solid var(--line); }}
+    .c-sum-cols .c-cell:nth-child(even) {{ border-left: 1px solid var(--line); }}
+    .c-val {{ font-size: 14px; }}
+    .chain-controls {{ gap: 6px; }}
+    .chain-controls label, .chain-controls .chip {{ font-size: 12px; }}
+  }}
+  .c-hint {{ font-size: 11px; color: var(--muted); margin-left: 4px; }}
+  @media print {{ .c-hint, .c-reset, .c-zin, .c-zout {{ display: none; }} }}
+  .c-zin, .c-zout {{ min-width: 30px; padding: 4px 8px; line-height: 1;
+                     font-size: 14px; }}
   /* intraday charts — one card per index, svg scales with the card */
   .chart-wrap {{ width: 100%; position: relative; }}
   .c-svg {{ width: 100%; height: auto; display: block; }}

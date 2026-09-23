@@ -144,6 +144,7 @@ def _orders_table(order_rows, table_id="orders-summary"):
             f'<td class="above">{_money(r.get("margin", 0))}</td>'
             f"<td>{_money(r.get('other', 0))}</td>"
             f"<td>{_money(r.get('pending', 0))}</td>"
+            f'<td class="above">{_money(r.get("outside", 0))}</td>'
             f"<td>{_money(r['hedge'])}</td>"
             f"<td>{_money(r['var'])}</td>"
             "</tr>"
@@ -160,6 +161,7 @@ def _orders_table(order_rows, table_id="orders-summary"):
                 f'<td class="above">{_money(s.get("margin", 0))}</td>'
                 f"<td>{_money(s.get('other', 0))}</td>"
                 f"<td>{_money(s.get('pending', 0))}</td>"
+                f'<td class="above">{_money(s.get("outside", 0))}</td>'
                 f"<td>{_money(s['hedge'])}</td>"
                 f"<td>{_money(s['var'])}</td>"
                 "</tr>"
@@ -174,6 +176,7 @@ def _orders_table(order_rows, table_id="orders-summary"):
         f"<td>{_money(totals.get('margin', 0))}</td>"
         f"<td>{_money(totals.get('other', 0))}</td>"
         f"<td>{_money(totals.get('pending', 0))}</td>"
+        f"<td>{_money(totals.get('outside', 0))}</td>"
         f"<td>{_money(totals['hedge'])}</td>"
         f"<td>{_money(totals['var'])}</td></tr>"
     )
@@ -183,7 +186,7 @@ def _orders_table(order_rows, table_id="orders-summary"):
         <th class="txt">Algo</th><th>Type</th><th>Total Users</th><th>Total Orders</th>
         <th>Executed</th><th>Rejected</th>
         <th>Margin Rejection</th><th>Others</th><th>Pending</th>
-        <th>Hedge</th><th>VAR</th>
+        <th>Out of market</th><th>Hedge</th><th>VAR</th>
       </tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table>"""
@@ -802,6 +805,10 @@ def _chart_section(chart):
             <div class="c-lab"><span class="sw2 rnd" data-c="var"></span>VAR</div>
             <div class="c-val" data-k="var">0</div>
           </div>
+          <div class="c-cell c-cell-sep">
+            <div class="c-lab"><span class="sw2 rnd" data-c="outside"></span>Out of market</div>
+            <div class="c-val" data-k="outside">0</div>
+          </div>
         </div>
       </div>
       <div class="c-sum">
@@ -842,12 +849,13 @@ _CHART_SCRIPT = """
   // DO sum to it. Neither total may be added to its own parts.
   var CAT_COLOR = {complete: '#15803D', stoxxo: '#0891B2',
                    hedge: '#EA580C', var: '#9333EA', failed: '#DC2626',
-                   margin: '#BE123C', other: '#F59E0B'};
+                   margin: '#BE123C', other: '#F59E0B', outside: '#475569'};
   var CAT_LABEL = {complete: 'Completed (total)', stoxxo: 'Stoxxo',
                    hedge: 'Hedge', var: 'VAR', failed: 'Rejected (total)',
-                   margin: 'Margin rejection', other: 'Others'};
+                   margin: 'Margin rejection', other: 'Others',
+                   outside: 'Out of market order'};
   var CAT_ORDER = ['complete', 'stoxxo', 'hedge', 'var',
-                   'failed', 'margin', 'other'];
+                   'failed', 'margin', 'other', 'outside'];
   // two stacked panels sharing one time axis: prices above, lots below
   var W = 1080, H = 700, L = 76, R = 70, T = 20, B = 44;
   var LOTS_H = 150, VOL_H = 120, GAP = 34;
@@ -956,6 +964,15 @@ _CHART_SCRIPT = """
       var all = [].concat.apply([], state.map(function (s) { return s.data; }));
       if (!all.length) return;
       var xs = all.map(function (d) { return d[0]; });
+      // The lots have to widen the axis too. The index and premium feeds start
+      // at 09:15, but an out-of-market order can sit at 08:58 — with the domain
+      // taken from the lines alone it mapped left of the plot and drew as a
+      // stray dot outside the panel.
+      lots = lotsByCat(step, algoSel.value);
+      Object.keys(lots).forEach(function (c) {
+        lots[c] = inView(lots[c]);
+        lots[c].forEach(function (p) { xs.push(p[0]); });
+      });
       x0 = Math.min.apply(null, xs); x1 = Math.max.apply(null, xs);
       if (view0 !== null) {
         x0 = view0; x1 = view1;
@@ -990,8 +1007,6 @@ _CHART_SCRIPT = """
         return T + (1 - (v - r[0]) / (r[1] - r[0])) * (P1B - T);
       };
 
-      lots = lotsByCat(step, algoSel.value);
-      Object.keys(lots).forEach(function (c) { lots[c] = inView(lots[c]); });
       useLog = logBox && logBox.checked;
       lotMax = 0;
       Object.keys(lots).forEach(function (c) {
@@ -2006,6 +2021,9 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
   .c-sum-cols {{ display: flex; align-items: flex-end; }}
   .c-cell {{ padding: 0 14px; min-width: 96px; }}
   .c-cell + .c-cell {{ border-left: 1px solid var(--line); }}
+  /* Out of market is NOT part of Completed — Completed = Stoxxo + Hedge + VAR.
+     A heavier rule says so, so nobody adds the row across. */
+  .c-cell.c-cell-sep {{ border-left: 2px solid var(--line); margin-left: 2px; }}
   .c-lab {{ font-size: 11.5px; color: var(--muted); white-space: nowrap;
             display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }}
   .c-lab .sw2 {{ margin: 0; flex: none; }}

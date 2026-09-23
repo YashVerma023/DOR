@@ -11,6 +11,7 @@ tell you which formula produced it and what it assumes.
 ## Contents
 
 1. [Inputs](#1-inputs)
+1.1 [Out of market orders](#11-out-of-market-orders)
 2. [Identity matching — how a user is recognised across files](#2-identity-matching)
 3. [Deduplication](#3-deduplication)
 4. [Lot sizes](#4-lot-sizes)
@@ -25,6 +26,7 @@ tell you which formula produced it and what it assumes.
 13. [Portfolio analysis](#13-portfolio-analysis)
 14. [Index market data](#14-index-market-data)
 14.1 [Volume — MS volume and market volume](#141-volume--ms-volume-and-the-market-volume-it-is-compared-against)
+14.2 [Excel number formats](#142-excel-number-formats)
 15. [Constants — the complete list](#15-constants--the-complete-list)
 16. [Reconciliation identities](#16-reconciliation-identities)
 
@@ -59,18 +61,68 @@ tell you which formula produced it and what it assumes.
 5. **Account known** — the user id resolves to a User MTM row, directly or through
    `aliases.json`. See §2.5.
 
+Rule 1 is **strict**: a file with no `Exchange` column raises rather than parsing. The
+filter used to be skipped silently in that case, which is the one situation where it
+matters most — cash rows would be counted as F&O.
+
 Rule 2 costs real orders and the count is logged on every run. On 20-08-2026 it dropped
 628 rows, all RMS rejections blocked before they left the desk (556 on one
-`Option price check` rule, 8 on margin). They leave the Failed/Cancelled/Rejected totals
-with it — the desk's rule is that the orderbook holds what the exchange saw.
+`Option price check` rule, 8 on margin). They leave the Rejected totals with it — the
+desk's rule is that the orderbook holds what the exchange saw.
+
+**Orders outside 09:15–15:40 are NOT a filter.** They are kept and reported — see §1.1.
 
 ```
 484,228   rows in the file
  -8,636   Exchange not in {NFO, BFO}
    -628   no exchange timestamp
 ──────
-474,964   parsed
+474,964   parsed   (of which 6 out of market)
 ```
+
+### 1.1 Out of market orders
+
+```
+SESSION_START = "09:15"      SESSION_END = "15:40"
+```
+
+The Indian F&O session. Equities close at 15:30 and the closing auction runs to 15:35, but
+F&O trades to 15:40 — which is why the book is not cut at 15:30. Judged on the **exchange**
+clock, like every other time in the report.
+
+An order stamped outside that window is tagged **`Out of market order`** and counted under
+its own heading, **whatever its status** — completed, rejected or pending. It is carved out
+of the status columns rather than added alongside them, which is what keeps the row
+addable:
+
+```
+Total Orders = Executed + Rejected + Pending + Out of market
+```
+
+| | 18-08-2026 | 20-08-2026 |
+|---|---:|---:|
+| Total Orders | 611,063 | 474,880 |
+| Executed | 455,314 | 391,475 |
+| Rejected | 124,358 | 82,987 |
+| Pending | 849 | 412 |
+| **Out of market** | **30,542** | **6** |
+
+These were previously **dropped**. That hid 30,542 rows on 18-08-2026 — 5% of the book,
+every one of them outside the session, running as late as 16:19. A number that large is a
+finding, not noise.
+
+Two rules interact with it, both settled the same way — out of market wins:
+
+- **It overrides status.** In `_lot_categories` the check sits ABOVE the COMPLETE branch.
+  Below it, 13 fills stamped 08:39 and 08:57 on 18-08-2026 were counted as ordinary Stoxxo
+  lots.
+- **It overrides the square-off exclusion.** `lots_timeline` normally drops `sqoff` orders
+  (they close a position rather than place one). 23,046 of the 30,542 were square-offs, so
+  keeping that exclusion would have hidden three quarters of the finding from the chart.
+
+**Executed fills before the open are a real anomaly, not a parsing artefact.** 13 of them
+on 18-08-2026 at 08:39 and 08:57, when NSE pre-open matching runs 09:08–09:12. The report
+surfaces them rather than discarding them; the cause is for the desk to establish.
 
 ---
 
@@ -590,9 +642,10 @@ traded.
 |---|---|
 | Total Orders | every order, any outcome |
 | Executed | `status == COMPLETE` |
-| Rejected | not complete and not pending (rejected + cancelled) |
+| Rejected | not complete and not pending (rejected + cancelled), inside the session |
 | Margin Rejection | of those, the ones whose Status Message names a margin cause |
 | Others | every other rejection — `Rejected − Margin Rejection` |
+| Out of market | stamped outside 09:15–15:40, **whatever the status** — §1.1 |
 | Pending | still live at close — `OPEN`, `OPEN_PENDING`, `TRIGGER_PENDING`, `TRIGGER PENDING`, `AMO_SUBMITTED`, `PENDING` |
 | Hedge | **executed** orders tagged `h_…` |
 | VAR | **executed** orders tagged `v_…` |
@@ -600,8 +653,12 @@ traded.
 ### 11.1 Margin Rejection vs Others
 
 ```
-Rejected = Margin Rejection + Others          (always, by construction)
+Total Orders = Executed + Rejected + Pending + Out of market
+Rejected     = Margin Rejection + Others
 ```
+
+Both hold by construction on every row, so the table is self-checking. Out of market is
+carved out of the status columns, not added beside them.
 
 The two are a **partition**, not two independent tests: anything that fails and does not
 match a margin marker is Others, so no order can fall between the columns or be counted
@@ -667,7 +724,7 @@ One chart per index traded. Lines plotted on the **close** of each bucket.
 |---|---|---|
 | Index | top, left | yfinance 1-minute closes (§14) |
 | Premium | top, right | uploaded ATM premium file |
-| Lots dots | middle panel | orderbook, every status — 7 series: `complete` and its parts `stoxxo`/`hedge`/`var`, then `failed` and its parts `margin`/`other` (§11.1) |
+| Lots dots | middle panel | orderbook, every status — 8 series: `complete` and its parts `stoxxo`/`hedge`/`var`; `failed` and its parts `margin`/`other` (§11.1); and `outside` (§1.1) |
 | MS volume | bottom panel | orderbook, COMPLETE only (§14.1) |
 | Index volume | bottom panel, same scale | uploaded volume workbook (§14.1) |
 
@@ -717,6 +774,59 @@ hedges into `hedge`, inflating it to 15,58,878 lots against a 5,59,259 executed 
 The index is the cash index and has no continuous ticks during the closing auction, so its
 line ends at **15:29** while order-driven series run to **15:40**. The 15:15–15:40 band is
 shaded and labelled rather than the gap being hidden or filled with invented data.
+
+---
+
+### 12.1 Summary cards
+
+Two cards sit above each chart, fed by the **same** filtered data the dots are drawn from —
+so they follow the algo selector and the zoom window, and cannot disagree with what is
+plotted.
+
+| Order summary | | | | | Rejection summary | | |
+|---|---|---|---|---|---|---|---|
+| Completed | Stoxxo | Hedge | VAR | Out of market | Total | Margin | Others |
+
+`Completed = Stoxxo + Hedge + VAR`, and `Total = Margin + Others`. **Out of market is not
+part of Completed** — it carries a heavier divider for that reason.
+
+Only the four LINE series keep a legend chip (index, premium, index volume, MS volume).
+The lot categories carry their colour swatch in the card header instead, so the key travels
+with the figure rather than sitting in a separate row.
+
+### 12.2 Zoom
+
+Zoom filters each series to a view window rather than rescaling the axes, so the y-axis,
+ticks, lots panel and volume panel all rescale to what is on screen — which is the point of
+zooming into a quiet stretch.
+
+| Input | Action |
+|---|---|
+| Mouse wheel | zoom, centred on the cursor |
+| Drag | pan (when zoomed) |
+| Pinch | zoom, centred between the fingers |
+| One finger | pan (when zoomed) |
+| `+` / `−` | zoom, centred on the view |
+| Double-click / Reset zoom | back to the full day |
+
+Floor is 5 minutes. Three details that are easy to get wrong:
+
+- **Gestures anchor on the window they started in.** `draw()` rewrites `x0/x1` every frame,
+  so reading the live values mid-gesture makes the zoom run away from the pointer.
+- **Pinch distance is Euclidean, not horizontal.** A near-vertical pinch collapses the
+  x-gap, the ratio explodes and the chart snaps to its floor on the first move.
+- **`touch-action: pan-y`, not `none`.** A vertical drag must still scroll the page, or a
+  700px chart becomes a trap on a phone.
+
+The `+` / `−` buttons exist because pinch handling cannot be verified on every Android
+browser — a chart you cannot zoom is worse than two extra controls.
+
+### 12.3 The x-axis spans the LOTS too
+
+Not just the index and premium lines. Those feeds start at 09:15, but an out-of-market
+order can sit at 08:39 — with the domain taken from the lines alone it mapped left of the
+plot and drew as a stray dot outside the panel. On 18-08-2026 the NIFTY axis runs
+**08:39 – 16:19** for that reason.
 
 ---
 
@@ -875,6 +985,42 @@ instead of 17,163,419. `marketdata._candles()` deduplicates on timestamp at ever
 answers 429. An un-paced burst returns short *with no error*: a first run reported
 5,901,682,280 against a true 7,629,219,325 — 23% missing, and it looked entirely normal.
 Calls are paced at 0.35 s with exponential backoff.
+
+---
+
+## 14.2 Excel number formats
+
+Two, because one cannot do both jobs.
+
+```
+INDIAN_XLSX_FMT  [>=10000000]#\,##\,##\,##0;[>=100000]#\,##\,##0;##,##0
+SIGNED_XLSX_FMT  #,##0
+```
+
+Indian grouping needs **escaped** commas — that is the only way to get lakh/crore positions
+out of Excel, whose own separator groups by threes. Escaped means **literal**, so they
+always print, and each section must be sized to the magnitude it handles. A single
+unconditional section rendered `352` as `,,352` and `2,59,632` as `,2,59,632`: 99.8% of the
+workbook's numeric cells looked like text.
+
+**A conditional format's fallback section never emits the minus sign**, and Excel allows
+only two conditions — both already spent on the lakh and crore tiers. Verified by rendering
+the workbook through LibreOffice: `-19,370` printed as `19,370`. A loss reading as a gain.
+
+So the format is chosen per column:
+
+| Columns | Format | Why |
+|---|---|---|
+| Allocation, max loss, orders, lots, strikes | Indian | never negative |
+| Realized, Unrealized, MTM, slippage P&L | `#,##0` | can be negative — a correct sign outranks grouping style |
+
+The two styles therefore sit side by side in one sheet. That is deliberate.
+
+**Values are always written as numbers**, never as pre-formatted strings — only the display
+format differs. The Streamlit tables need the same care from the other direction:
+`_arrow_safe()` coerces a column that mixes numbers with labels (`1` beside `Sub-Total`,
+`VS1` beside a server count) to text, because Arrow cannot type such a column and Streamlit
+logged a full traceback on every render.
 
 ---
 

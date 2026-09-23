@@ -61,10 +61,10 @@ STRIKE_ALGO_HEADER = ["Algo", "Server", "Strikes Traded"]
 STRIKE_CHAIN_HEADER = ["CE", "Strike", "PE"]
 ORDER_SUMMARY_HEADER = ["Algo", "Type", "Total Users", "Total Orders", "Executed",
                         "Rejected", "Margin Rejection", "Others",
-                        "Pending", "Hedge", "VAR"]
+                        "Pending", "Out of market", "Hedge", "VAR"]
 ORDER_SERVER_HEADER = ["Server", "Users", "Total Orders", "Executed",
                        "Rejected", "Margin Rejection", "Others",
-                       "Pending", "Hedge", "VAR"]
+                       "Pending", "Out of market", "Hedge", "VAR"]
 
 # Status Message fragments that mean the order died for want of MARGIN, as
 # opposed to price bands, instrument state, throttling or an unfilled IOC.
@@ -668,13 +668,27 @@ FO_EXCHANGES = {"BFO", "NFO"}
 # bucket at midnight.
 _TS_YEAR = re.compile(r"\b(\d{4})\b")
 
-# Last minute of the Indian F&O session. The equity segment closes at 15:30 and
-# the closing auction runs to 15:35, but F&O keeps trading to 15:40 — which is
-# why the book is NOT cut at 15:30. Anything stamped after 15:40 is outside the
-# session: a late OMS write-back, a settlement artefact or a clock skew, never a
-# trade someone made. Compared as "HH:MM" text, which orders correctly because
+# The Indian F&O session. The equity segment closes at 15:30 and the closing
+# auction runs to 15:35, but F&O keeps trading to 15:40 — which is why the book
+# is NOT cut at 15:30. Compared as "HH:MM" text, which orders correctly because
 # the hour is zero-padded.
+SESSION_START = "09:15"
 SESSION_END = "15:40"
+
+# Orders stamped outside that window are KEPT and reported under their own
+# heading rather than dropped. They were being discarded, which hid 30,495 rows
+# on 18-08-2026 — 5% of that book, every one of them rejected. A number that
+# large is a finding, not noise, and silently removing it made the report look
+# tidier than the day actually was.
+OUT_OF_MARKET = "Out of market order"
+
+
+def is_out_of_market(minute):
+    """True when an exchange timestamp falls outside 09:15–15:40.
+
+    Judged on the EXCHANGE clock, like every other time in the report — order
+    time is when the OMS sent it, which can differ by the round trip."""
+    return bool(minute) and not (SESSION_START <= minute <= SESSION_END)
 
 
 def _has_exchange_time(text):
@@ -756,10 +770,18 @@ def read_orderbook(source, name=None, all_statuses=False):
                        "component and may merge distinct orders",
                        "Order Time" if i_time is None else "Exchange Time")
 
+    # STRICT: only NFO and BFO. Previously the filter was skipped entirely when
+    # the file carried no Exchange column, which let a cash or currency row
+    # through unchallenged — the one case where the filter mattered most.
+    if i_exchange is None:
+        raise ValueError(
+            "orderbook has no Exchange column — NFO/BFO cannot be enforced, and "
+            "cash rows would be counted as F&O. Re-export with the column.")
+
     orders = []
     no_exch_time = after_close = 0
     for line_no, raw in enumerate(rows, start=2):
-        if i_exchange is not None and _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
+        if _cell(raw, i_exchange).upper() not in FO_EXCHANGES:
             continue
         raw_exch_time = (_normalise_timestamp(_cell(raw, i_exch_time))
                          if i_exch_time is not None else "")
@@ -767,9 +789,8 @@ def read_orderbook(source, name=None, all_statuses=False):
             no_exch_time += 1
             continue
         exch_minute = _parse_minute(raw_exch_time)
-        if exch_minute and exch_minute > SESSION_END:
-            after_close += 1
-            continue
+        if is_out_of_market(exch_minute):
+            after_close += 1        # kept — counted under OUT_OF_MARKET below
         status = (_normalise_status(_cell(raw, i_status))
                   if i_status is not None else "COMPLETE")
         if not all_statuses and status != "COMPLETE":
@@ -814,10 +835,10 @@ def read_orderbook(source, name=None, all_statuses=False):
                        "are excluded from every count, including failures.",
                        name or "orderbook", no_exch_time)
     if after_close:
-        logger.warning("%s: dropped %d row(s) stamped after %s — the F&O "
-                       "session had closed, so these are write-back or clock "
-                       "artefacts rather than trades.",
-                       name or "orderbook", after_close, SESSION_END)
+        logger.warning("%s: %d row(s) stamped outside %s–%s — kept and reported "
+                       "as \"%s\", whatever their status.",
+                       name or "orderbook", after_close, SESSION_START,
+                       SESSION_END, OUT_OF_MARKET)
     return orders
 
 
@@ -1604,7 +1625,7 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
         bucket = group["servers"].setdefault(
             server_key, {"users": set(), "orders": 0, "executed": 0,
                          "failed": 0, "margin": 0, "other": 0,
-                         "pending": 0, "hedge": 0, "var": 0})
+                         "pending": 0, "hedge": 0, "var": 0, "outside": 0})
         bucket["users"].add(user_key)
         bucket["orders"] += 1
         # STATUS first, then the tag sub-divides only what executed — so Hedge
@@ -1612,7 +1633,13 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
         # tag across all statuses (the previous behaviour) reported hedge
         # orders that were cancelled as hedge activity: on 11-08 that read
         # 1,82,855 hedge against 3,09,760 executed.
-        if row.status == "COMPLETE":
+        # Outside the session wins over STATUS — the desk's rule is that such an
+        # order is out-of-market whatever became of it. Carving it out here (as
+        # opposed to counting it twice) is what keeps
+        #     Total Orders = Executed + Rejected + Pending + Out of market
+        if is_out_of_market(row.minute):
+            bucket["outside"] += 1
+        elif row.status == "COMPLETE":
             bucket["executed"] += 1
             if row.category == "hedge":
                 bucket["hedge"] += 1
@@ -1635,7 +1662,8 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
         servers = [{"server": server, "users": len(b["users"]), "orders": b["orders"],
                     "executed": b["executed"], "failed": b["failed"],
                     "margin": b["margin"], "other": b["other"],
-                    "pending": b["pending"], "hedge": b["hedge"], "var": b["var"]}
+                    "pending": b["pending"], "outside": b["outside"],
+                    "hedge": b["hedge"], "var": b["var"]}
                    for server, b in sorted(group["servers"].items())]
         out.append({
             "algo": algo,
@@ -1651,6 +1679,7 @@ def order_summary(orders, allocations=None, type_map=None, bands=None):
             "margin": sum(s["margin"] for s in servers),
             "other": sum(s["other"] for s in servers),
             "pending": sum(s["pending"] for s in servers),
+            "outside": sum(s["outside"] for s in servers),
             "hedge": sum(s["hedge"] for s in servers),
             "var": sum(s["var"] for s in servers),
             "servers": servers,
@@ -1676,6 +1705,7 @@ def order_summary_totals(rows):
         "margin": sum(r["margin"] for r in rows),
         "other": sum(r["other"] for r in rows),
         "pending": sum(r["pending"] for r in rows),
+        "outside": sum(r["outside"] for r in rows),
         "hedge": sum(r["hedge"] for r in rows),
         "var": sum(r["var"] for r in rows),
     }
@@ -1685,7 +1715,7 @@ def format_order_row(row):
     # blank algo / type = a user with no MTM entry, shown as an explicit dash
     return [row["algo"] or "—", row["user_type"] or "—", row["users"], row["orders"],
             row["executed"], row["failed"], row["margin"], row["other"],
-            row["pending"], row["hedge"], row["var"]]
+            row["pending"], row["outside"], row["hedge"], row["var"]]
 
 
 def _algo_cell(row):
@@ -1729,7 +1759,7 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
             # is carried by the bold group row above instead.
             values = [_algo_cell(row), f"  {s['server']}", s["users"], s["orders"],
                       s["executed"], s["failed"], s["margin"], s["other"],
-                      s["pending"], s["hedge"], s["var"]]
+                      s["pending"], s["outside"], s["hedge"], s["var"]]
             for col_idx, value in enumerate(values, start=1):
                 cell = sheet.cell(row=r, column=col_idx, value=value)
                 if col_idx > 2 and isinstance(value, (int, float)):
@@ -1740,7 +1770,8 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
     for col_idx, value in enumerate(
             ["Total", "", totals["users"], totals["orders"], totals["executed"],
              totals["failed"], totals["margin"], totals["other"],
-             totals["pending"], totals["hedge"], totals["var"]], start=1):
+             totals["pending"], totals["outside"], totals["hedge"],
+             totals["var"]], start=1):
         cell = sheet.cell(row=r, column=col_idx, value=value)
         cell.font = bold
         if col_idx > 2 and isinstance(value, (int, float)):
@@ -1757,6 +1788,7 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
 #       hedge    executed, h_ tag
 #       var      executed, v_ tag
 #     failed   = every cancelled / rejected lot, WHATEVER the tag
+#     outside  = stamped outside 09:15-15:40, WHATEVER the status
 #
 # These OVERLAP by design: `complete` is the total and the next three are its
 # parts, so the legend must not be summed. An earlier version checked the tag
@@ -1764,7 +1796,7 @@ def add_orders_sheet(workbook, order_rows, suffix=""):
 # 15.6 lakh lots against a 5.6 lakh executed book, and left `failed` showing
 # 1.1% of real failures because only normal-tagged failures reached it.
 LOT_CATEGORIES = ("complete", "stoxxo", "hedge", "var",
-                  "failed", "margin", "other")
+                  "failed", "margin", "other", "outside")
 
 # The parts of `complete`; used to assert the split adds back up.
 LOT_EXECUTED_PARTS = ("stoxxo", "hedge", "var")
@@ -1778,6 +1810,12 @@ def _lot_categories(order):
     its own parts. Pending orders are still live and belong to none of them,
     the same way the Orders Summary treats them as neither executed nor
     failed."""
+    # FIRST, before status is looked at: outside the session overrides whatever
+    # became of the order, matching the Orders Summary. Sitting below the
+    # COMPLETE branch it missed executed ones — 13 fills stamped 08:39 and 08:57
+    # on 18-08-2026 were counted as ordinary Stoxxo lots.
+    if is_out_of_market(order.minute):
+        return ["outside"]
     if order.status == "COMPLETE":
         if order.category == "hedge":
             return ["complete", "hedge"]
@@ -1808,7 +1846,13 @@ def lots_timeline(orders, allocations=None, deduped=True):
     per_index, skipped = {}, 0
 
     for row in orders:
-        if not row.minute or row.category == "sqoff":
+        # Square-off is excluded because it closes a position rather than
+        # placing one — but NOT when the order is out of market. There the
+        # desk's rule is that everything shows regardless, and on 18-08-2026
+        # 23,046 of the 30,542 out-of-market orders were square-offs, so the
+        # exclusion would have hidden three quarters of the finding.
+        if not row.minute or (row.category == "sqoff"
+                              and not is_out_of_market(row.minute)):
             skipped += not row.minute
             continue
         cats = _lot_categories(row)

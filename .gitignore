@@ -1,5 +1,18 @@
 /data/
 fyer_code/
 .streamlit/secrets.toml
-.fyersApi.log
-.fyersRequests.log
+grafana_credentials.json
+
+# runtime logs — actual filenames have no leading dot, unlike the old rule
+fyersApi.log
+fyersRequests.log
+
+# never track: regenerates on every run, and the SDK image alone is ~400MB
+__pycache__/
+*.pyc
+.venv/
+
+# generated docs — no generator script lives in this repo right now (see
+# README), so these are hand-refreshed snapshots, not something git can diff
+# meaningfully. Track the .md sources in docs/, not these.
+docs/*.html

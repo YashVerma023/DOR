@@ -29,16 +29,109 @@ dashboard + DOR.html show the segregation cards/pivot and the Algo Summary once 
 
 | File | Role |
 |---|---|
+**Core engines**
+
+| File | Role |
+|---|---|
 | `app.py` | Streamlit UI — upload the inputs, set the outlier deviation, one **Process** click computes everything. Run with `streamlit run app.py`. |
 | `tradevalue.py` | Trade value engine: report rows, algo summary, strikes/option chain (also a CLI: `python tradevalue.py orderbook.csv -s user_mtm.xlsx -d 1`). |
 | `summary.py` | Summary engine: All User classification, DTE scope, MTM, pivot, `MTM Data`, slippage, `no_sl_Acc` (also an interactive CLI). |
-| `marketdata.py` | Index day High/Low + intraday series (yfinance), premium-file parsing, volume-workbook reader, Fyers client used by `volume_fetcher.py`. |
-| `fyer_code/fyers_auth.py` | Mints the daily Fyers access token. Run outside the report. |
-| `fyer_code/volume_fetcher.py` | Writes the per-minute index option volume workbook the report uploads. Run outside the report. |
-| `aliases.json` | Both id maps in one file, told apart by the value. String value = All User id ↔ MTM id, when the two files name an account differently. Object value = orderbook base id → MTM account id, per server. |
-| `CALCULATION.md` | Every formula and constant, with the reasoning. |
 | `portfolio.py` | Portfolio analysis engine over the Multileg Orders (MLOB): per-portfolio / per-user PnL, QS summary, any-pattern reports. |
 | `dor.py` | Renders the DOR.html summary (inline CSS/SVG/JS, no external assets — dropdown filters, the drill-downs and the in-page portfolio analysis are plain inline JS). |
+| `aliases.json` | Both id maps in one file, told apart by the value. String value = All User id ↔ MTM id, when the two files name an account differently. Object value = orderbook base id → MTM account id, per server. |
+
+**Market data — index, premium, volume**
+
+| File | Role |
+|---|---|
+| `marketdata.py` | Index day High/Low + intraday series (yfinance), premium-file parsing, volume-workbook reader, Fyers client used by `volume_fetcher.py`. |
+| `grafana_probe.py` | Grafana connection + instance discovery: reads a panel's own query, and asks each instance **which index it is running today** (the hosts rotate, so this is not a fixed lookup). Also a CLI for inspecting dashboards. |
+| `premium_fetcher.py` | Fetches the ATM premium from Grafana as the exact CSV the uploader accepts. Used by the report in **Automated** mode, and standalone: `python premium_fetcher.py`. |
+| `test_premium_csv.py` | Hermetic checks on `premium_fetcher.py` — CSV format, index-detection bands, window parsing. No Grafana needed: `python test_premium_csv.py`. |
+| `fyer_code/fyers_auth.py` | Mints the daily Fyers access token. Run outside the report. Gitignored — see **Not tracked in git**, below. |
+| `fyer_code/volume_fetcher.py` | Writes the per-minute index option volume workbook the report uploads. Run outside the report. Gitignored, same as above. |
+
+**Docs** — `docs/CALCULATION.md` (source, tracked) and `docs/_dor_calc_summary.md` (a short, un-numbered
+version of the same, for sharing) are the formulas and reasoning behind every figure. The `.html` copies
+beside them (`docs/CALCULATION.html`, `docs/README.html`, `docs/DOR_Calculation.html`) are hand-refreshed,
+styled snapshots for sharing outside the repo — gitignored, since there is currently no script in this
+repo that regenerates them from the `.md` sources.
+
+### Not tracked in git
+
+`fyer_code/` (Fyers credentials + the scripts beside them) and `grafana_credentials.json` are gitignored —
+this project is not pushed with real trading/Grafana credentials in it. That also means the two scripts
+inside `fyer_code/` carry no version history; back them up separately if they change.
+
+## Generating the report — step by step
+
+### 1. Collect the inputs (from MStech / Stoxxo)
+
+| File | Required | Naming |
+|---|---|---|
+| Compiled Orderbook | yes | `Compiled_Orderbook_<DD-MM-YYYY>.csv` |
+| Compiled User MTM | yes | `Compiled_User_MTM_<DD-MM-YYYY>.xlsx` |
+| All User Details | yes | `All User Details Daily Updated <DDMMMYY> <HHMM>.xlsx`, tab `Main` |
+| Compiled Multileg Orders (MLOB) | optional | `Compiled_Multileg_Orders_<DD-MM-YYYY>.xlsx` — only for Portfolio analysis |
+| ATM premium, per index | optional | Automated mode: fetched from Grafana. Manual mode: any CSV/Excel with a time column and a premium column |
+
+**Export the orderbook as text, not as an Excel-typed sheet.** Excel mangles long Order IDs
+into scientific notation — 118,333 rows on 20-08-2026. The six-part dedup key still
+separates them, but it is fragile and the warning appears on every run.
+
+### 2. Market volume (optional, ~5 min)
+
+Only if you want the market-volume line. Runs outside the report:
+
+```powershell
+.\.venv\Scripts\python.exe fyer_code\fyers_auth.py                   # token, dies 06:00
+.\.venv\Scripts\python.exe fyer_code\volume_fetcher.py --date 2026-09-17
+```
+
+Run it **on the trading day**. Fyers delists an expiry the moment it passes, so a workbook
+built the next morning silently contains the NEXT contract — see §14.1.
+
+### 3. Start the app
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+### 4. Fill the sidebar and upload
+
+1. **DTE** — `0DTE` / `1DTE` / `4DTE`. Decides which All User accounts are in scope
+   (cumulative: a DAILY account trades on a 1DTE day too).
+1b. **Data source** — `Automated` / `Manual`. Automated fetches the ATM premium from
+   Grafana for the report's own date; Manual shows the upload fields instead. Manual is
+   the fallback when Grafana is down or the fetched data looks wrong. Both produce the
+   identical CSV, so switching cannot change a number. Covers the premium only — the
+   volume workbook is generated outside the report either way.
+2. **Upload** orderbook, User MTM, All User; then optionally MLOB, premium files (Manual
+   mode only) and the volume workbook.
+3. **Report date** — inferred from the User MTM; override if it looks wrong.
+4. **Expiry per index** (e.g. `20AUG26`) — labels the option chain, and is what the volume
+   workbook is checked against.
+5. **Outlier deviation `k`** — default 1.0, the width of the Lots-per-Cr band.
+6. **Process**.
+
+### 5. Read the warnings before the numbers
+
+The app prints what it dropped and why. These are findings, not noise:
+
+| Message | What it means |
+|---|---|
+| `dropped N row(s) with no exchange timestamp` | RMS blocked them before the exchange saw them — they leave the Rejected totals too |
+| `N row(s) stamped outside 09:15–15:40` | kept, counted as **Out of market** (§1.1) |
+| `dropped N order(s) from M account(s) absent from the User MTM` | unknown ids, excluded from every calculation — add a mapping to `aliases.json` to recover one |
+| `N row(s) carry an Order ID mangled into scientific notation` | re-export the orderbook as text |
+| `duplicate row(s) across K key(s)` | removed before any aggregation |
+
+### 6. Download
+
+- `DOR_<DTE>_<date>.xlsx` — the workbook
+- `DOR_<date>.html` — self-contained, shareable, no external assets
+
+---
 
 ## Daily workflow
 
@@ -59,6 +152,33 @@ redirect page shows the *auth code*; the token is what Fyers returns in exchange
 `fyers_credentials.json` and exchanges that too. Tell them apart with
 `fyers_auth.py --check`, or by length: token ~653 chars, code ~590.
 
+## Troubleshooting
+
+**`WinError 10060` / `ConnectTimeout` from `fyers_auth.py`.** The request never reached
+Fyers — this is the network, not the credentials or the script. Confirmed on 22-09-2026:
+the office **LAN blocked it while WiFi worked**, same machine and same credentials.
+
+The symptom misleads, because the browser login still succeeds on the blocked network —
+that traffic goes somewhere the LAN permits — and only the script's API call to
+`api-t1.fyers.in` times out.
+
+```powershell
+.\.venv\Scripts\python.exe fyer_code\fyers_auth.py --net
+```
+
+Tests both Fyers hosts and reports the elapsed time, without touching credentials. Run it
+**before** logging in: every failed attempt burns an auth code and costs another sign-in.
+
+| Result | Do |
+|---|---|
+| reachable, a few seconds | retry the login |
+| reachable, 10–25s | the link is degraded, not blocked — it will work but slowly |
+| unreachable on LAN, fine on WiFi | switch networks, or ask IT to allow outbound 443 to `api-t1.fyers.in` and `api.fyers.in` — they are behind Cloudflare, so allow the NAMES, not IPs |
+| unreachable everywhere | check `$env:HTTPS_PROXY`; the browser may use a proxy Python does not |
+
+Nothing else in the report needs Fyers. Skip the token and everything still builds — the
+volume panel simply shows MS volume alone.
+
 ## Inputs
 
 | Input | Used for |
@@ -70,7 +190,7 @@ redirect page shows the *auth code*; the token is what Fyers returns in exchange
 | ATM premium file per index (optional) | The premium line on the intraday chart |
 | Multileg Orders — MLOB (optional, Excel/CSV) | The Portfolio Analysis (§4) — omitting it just hides that section |
 | Outlier deviation `k` (default 1.0) | Width of the Lots-per-Cr range (median ± k × MAD, per algo + type group) — drives the flags and the Algo Summary Range |
-| NIFTY / SENSEX / BANKNIFTY day open + day close | Day-mid = (open + close) / 2 — the option chain's ATM strike (§1.9); 0 = not set |
+| NIFTY / SENSEX / BANKNIFTY day High / Low | Fetched from yfinance for the report date; day-mid = (High + Low) / 2 is the option chain's ATM anchor (§1.9). Manual entry boxes appear only when the fetch fails |
 | NIFTY / SENSEX / BANKNIFTY expiry (text, e.g. `28JUL26`) | The expiry label of each index's strikes (§1.9). One orderbook holds a **single expiry per index**, and the symbol formats are too ambiguous to parse a date from — so the expiry is entered here, and only the strike is read from the symbol. Left empty → the chain shows `NA` |
 | Segregation algos (multiselect, empty = all) | Which algos the Int / Pos+Int pivot and its KPI summary cover (§2.3) — dashboard and DOR.html; populated after the first Process |
 | Slippage algos (multiselect, empty = all) | Which algos the slippage analysis covers (§2.7) — applies to the dashboard and DOR.html; populated after the first Process |
@@ -86,15 +206,20 @@ so `user_id`, `User ID` and `UserID` all match.
 
 A raw order row survives only if **all** of these hold:
 
-- **Exchange ∈ {BFO, NFO}** — F&O only; NSE/BSE/MCX cash rows (e.g. `NIFTYBEES-EQ`) are dropped
+- **Exchange ∈ {BFO, NFO}** — strict: a file with no `Exchange` column raises rather
+  than parsing. F&O only; NSE/BSE/MCX cash rows (e.g. `NIFTYBEES-EQ`) are dropped
   because their quantities aren't lot multiples. This also removes the wholly blank padding
   rows some exports carry (8,636 of them on 20-08-2026).
 - **Exchange Time present, and not year 0001** — an order the exchange never saw. Written as
   a blank or as `01-Jan-0001 00:00:00` (.NET's `DateTime.MinValue`). Judged on the **year**,
   so any spelling of it is caught; a timestamp that is merely unparseable is kept, because
   unreadable is not the same as absent. On 20-08-2026 this dropped 628 rows — all genuine
-  RMS rejections, which therefore leave the Failed/Cancelled/Rejected totals too. The count
-  is logged on every run.
+  RMS rejections, which therefore leave the Rejected totals too. The count is logged on
+  every run.
+
+**Not a filter:** orders stamped outside **09:15–15:40** are KEPT and reported as
+`Out of market order`, whatever their status — see `docs/CALCULATION.md` §1.1. They used to be
+dropped, which hid 30,542 rows (5% of the book) on 18-08-2026.
 - **Account known** — the user id resolves to a User MTM row, directly or via `aliases.json`.
   Ids in neither are dropped from every calculation (`drop_unmatched`) rather than sitting in
   the `—` row while still inflating the totals. What went is named in a caption.

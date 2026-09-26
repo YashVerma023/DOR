@@ -243,15 +243,15 @@ def portfolio_json(groups):
             "portfolios": portfolios, "rows": rows}
 
 
-def add_portfolio_sheet(workbook, report):
-    """Append the "Portfolio QS" sheet in the three-level layout: one row per
-    algo (server COUNT in the Server column), its server rows underneath
+def add_portfolio_sheet(workbook, report, sheet_name="Portfolio QS"):
+    """Append a portfolio-analysis sheet in the three-level layout: one row
+    per algo (server COUNT in the Server column), its server rows underneath
     (server name), and each server's user rows under that (user id in the
     users column), closed by a grand total row."""
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
-    sheet = workbook.create_sheet("Portfolio QS")
+    sheet = workbook.create_sheet(sheet_name)
     bold = Font(bold=True)
     center = Alignment(horizontal="center")
     algo_fill = PatternFill("solid", fgColor="B7C7E3")

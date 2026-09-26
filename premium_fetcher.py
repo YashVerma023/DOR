@@ -23,9 +23,11 @@ Grafana instance. Panel 11 ('Synthetic Premium') runs `ts.range` on the Redis
 key `premium`, which is already call + put combined — panel 5 on the same
 dashboard shows `cpremium` and `ppremium` as the separate legs.
 
-SAME DAY ONLY, by design. These dashboards are live monitors (`refresh=5s`,
-`from=now-6h`) and RedisTimeSeries keys carry a retention window; a past date
-may return nothing. Run it after the close, before generating the report.
+Also works for a past date — confirmed against the live instances going back
+at least a few weeks (RedisTimeSeries here is not evicting on a short
+window). Still, if a given day comes back with 0 rows, it may genuinely be a
+non-trading day, or it may be a retention edge somewhere further back — check
+before assuming the report has to fall back to a manual upload.
 """
 
 import argparse
@@ -35,7 +37,7 @@ import pathlib
 import sys
 from datetime import date, datetime, timedelta
 
-from grafana_probe import resolve
+from grafana_probe import post_query, resolve
 
 # the abbreviations the existing filenames use
 ABBR = {"NIFTY": "NF", "SENSEX": "SX", "BANKNIFTY": "BNF"}
@@ -64,7 +66,7 @@ def fetch_series(session, url, targets, datasource, start, end, bucket_ms=5000):
         q.setdefault("maxDataPoints", 20000)
         body["queries"].append(q)
 
-    r = session.post(f"{url}/api/ds/query", json=body, timeout=180)
+    r = post_query(session, url, body, timeout=180)
     if r.status_code != 200:
         raise SystemExit(f"  /api/ds/query -> HTTP {r.status_code}: {r.text[:300]}")
 
@@ -223,7 +225,8 @@ def main(argv=None):
 
         if not rows:
             print(f"  {index:<10} no premium data for {day:%d-%b-%Y} "
-                  f"— Redis retention may not reach that far back")
+                  f"— check it was a trading day, or that this is the "
+                  f"instance that ran {index} back then (they rotate)")
             failures += 1
             continue
         path = write_csv(rows, index, day, args.out)

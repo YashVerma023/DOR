@@ -14,8 +14,11 @@ and offers exactly two downloads:
   * DOR_<date>.html — the styled, client-shareable summary report
 """
 
+import importlib.util
 import io
+import json
 import logging
+import os
 from datetime import date
 from decimal import Decimal
 
@@ -101,6 +104,43 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
+# Fyers token — auth itself stays a separate, manual step (`python
+# fyers_auth.py`, outside this app, since it's a browser login flow). This
+# only points marketdata at whatever token that produced, wherever the file
+# lives, so the automated expiry lookup and volume fetch below need no login
+# of their own. fyer_code/ is gitignored (holds the token), so both paths are
+# checked and a missing file just means those two features fall back to
+# manual, same as everything else in AUTOMATED mode.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+for _cred_path in (os.path.join(_APP_DIR, "fyer_code", "fyers_credentials.json"),
+                   os.path.join(_APP_DIR, "fyers_credentials.json")):
+    if os.path.exists(_cred_path):
+        try:
+            with open(_cred_path, encoding="utf-8") as _fh:
+                _fyers_creds = json.load(_fh)
+            marketdata.set_fyers_credentials(
+                _fyers_creds.get("client_id"), _fyers_creds.get("access_token"))
+        except (OSError, ValueError):
+            pass
+        break
+
+
+@st.cache_resource(show_spinner=False)
+def _load_volume_fetcher():
+    """The fetch()/write_workbook() functions from fyer_code/volume_fetcher.py,
+    or None if that (gitignored, optional) file is not present. Loaded by
+    path rather than a package import — fyer_code/ has no __init__.py, it's
+    just where the Fyers-auth scripts happen to live."""
+    path = os.path.join(_APP_DIR, "fyer_code", "volume_fetcher.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("volume_fetcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------------------
 # DTE — decides which All User accounts are in scope for the report
 # ---------------------------------------------------------------------------
 dte = st.sidebar.radio(
@@ -142,12 +182,11 @@ st.sidebar.caption(
 # ---------------------------------------------------------------------------
 data_source = st.sidebar.radio(
     "Data source", ("Automated", "Manual"),
-    help="**Automated** — the ATM premium is fetched from Grafana for the "
-         "report's own date, once that date is known. No upload needed.\n\n"
-         "**Manual** — the premium upload fields are shown instead. Use this "
-         "when Grafana is down, or when the fetched data looks wrong.\n\n"
-         "The option-volume workbook is unaffected: it is generated outside "
-         "the report by `volume_fetcher.py` either way.",
+    help="**Automated** — ATM premium (Grafana), index option volume and the "
+         "nearest expiry are all fetched instead of uploaded/typed, for the "
+         "**Fetch date** below.\n\n"
+         "**Manual** — every upload field is shown instead. Use this when "
+         "Grafana/Fyers are down, or when fetched data looks wrong.",
 )
 AUTOMATED = data_source == "Automated"
 st.sidebar.caption(
@@ -158,22 +197,40 @@ st.sidebar.caption(
 # Per-index gate on the automated fetch. Whatever index an instance is running
 # gets found automatically (grafana_probe.resolve reads it off the instance,
 # not a config file — the instances rotate). This is a SEPARATE control: does
-# the report even try, for THIS index. Off by default for an index with no
-# instance configured yet (BANKNIFTY today), so every run does not end in the
-# same guaranteed "no instance is running it" error; on by default otherwise.
+# the report even try, for THIS index. On by default for every index now that
+# all three (NIFTY, SENSEX, BANKNIFTY) have a Grafana instance configured —
+# flip one off here if its instance is down, rather than eating the guaranteed
+# "no instance is running it" error every run.
 fetch_enabled = {}
 if AUTOMATED:
     st.sidebar.caption("Fetch premium for:")
-    _fetch_cols = st.sidebar.columns(len(marketdata.INDEX_SYMBOLS))
-    for _col, _idx in zip(_fetch_cols, marketdata.INDEX_SYMBOLS):
-        with _col:
-            fetch_enabled[_idx] = st.checkbox(
-                marketdata.INDEX_ABBR.get(_idx, _idx), value=(_idx != "BANKNIFTY"),
-                key=f"fetch_on_{_idx}",
-                help=f"When on, {_idx} premium is fetched from Grafana if the "
-                     f"report charts it. When off, {_idx} gets no premium "
-                     "line and Grafana is not queried for it at all.",
-            )
+    for _idx in marketdata.INDEX_SYMBOLS:
+        fetch_enabled[_idx] = st.sidebar.checkbox(
+            marketdata.INDEX_ABBR.get(_idx, _idx), value=True,
+            key=f"fetch_on_{_idx}",
+            help=f"When on, {_idx} premium is fetched from Grafana if the "
+                 f"report charts it. When off, {_idx} gets no premium "
+                 "line and Grafana is not queried for it at all.",
+        )
+
+# The single date every automated fetch below (volume, nearest expiry,
+# Grafana premium) runs against — default today, editable for testing or for
+# generating a past day's report without switching to Manual. The premium
+# fetch's own "Market date" input, further down, still starts from this same
+# date but stays independently editable once the upload reveals the report's
+# actual date.
+fetch_date = date.today()
+if AUTOMATED:
+    fetch_date = st.sidebar.date_input(
+        "Fetch date", value=date.today(), format="DD-MM-YYYY",
+        help="The trading day every automated fetch above runs against. "
+             "Today by default — change it to test, or to generate a past "
+             "day's report. Nearest-expiry lookup is always today's live "
+             "listing though (Fyers does not expose a past day's listing), "
+             "so for a past date type the expiry by hand below instead.",
+    )
+    if fetch_date != date.today():
+        st.sidebar.caption(f"⏰ Fetching as of **{fetch_date:%d-%b-%Y}**, not today.")
 
 # ---------------------------------------------------------------------------
 # Inputs — everything at the top
@@ -195,15 +252,40 @@ with au1:
              "sheet's max_loss is carried through as a reference column only.",
     )
 with au2:
-    alias_file = st.file_uploader(
-        "User alias map (optional override)",
-        type=["json", "csv", "xlsx", "xlsm", "xls"],
-        help="Accounts the two files name differently — the MTM's XLDH142 is "
-             "the All User sheet's CC04. Leave empty to use aliases.json "
-             "from the app folder; upload a JSON "
-             "{\"CC04\": \"XLDH142\"} or a two-column table "
-             "(All User id, MTM id) to replace it for this run only.",
-    )
+    st.caption("User alias map (optional override)")
+    if "user_aliases" not in st.session_state:
+        st.session_state.user_aliases = {}  # {All User sheet id: MTM id}
+    with st.expander(f"Add alias ({len(st.session_state.user_aliases)} added)"):
+        st.caption(
+            "Accounts the two files name differently — the MTM's XLDH142 is "
+            "the All User sheet's CC04. Rare, so add them one at a time here "
+            "instead of uploading a file. Leave empty to use aliases.json "
+            "from the app folder."
+        )
+        _na1, _na2, _na3 = st.columns([2, 2, 1])
+        with _na1:
+            _new_au_id = st.text_input("All User sheet id", key="alias_au_id")
+        with _na2:
+            _new_mtm_id = st.text_input("MTM id", key="alias_mtm_id")
+        with _na3:
+            st.write("")
+            st.write("")
+            if st.button("Add", key="alias_add_btn"):
+                if _new_au_id.strip() and _new_mtm_id.strip():
+                    st.session_state.user_aliases[_new_au_id.strip()] = _new_mtm_id.strip()
+                    st.session_state.alias_au_id = ""
+                    st.session_state.alias_mtm_id = ""
+                    st.rerun()
+        for _au, _mtm in list(st.session_state.user_aliases.items()):
+            _r1, _r2 = st.columns([5, 1])
+            _r1.caption(f"`{_au}` → `{_mtm}`")
+            if _r2.button("✕", key=f"alias_del_{_au}"):
+                del st.session_state.user_aliases[_au]
+                st.rerun()
+
+alias_bytes = (json.dumps(st.session_state.get("user_aliases", {})).encode("utf-8")
+               if st.session_state.get("user_aliases") else None)
+alias_name = "manual-alias-map.json" if alias_bytes else None
 
 in5, in6 = st.columns(2)
 with in5:
@@ -232,17 +314,80 @@ else:
                 help="Any CSV/Excel with a time column and a premium value — "
                      "the columns are auto-detected and correctable below.",
             )
-# Market volume for the chart's third panel. Produced OUTSIDE the report by
-# volume_fetcher.py, which walks each index's full option chain — ~200 paced
-# Fyers calls per index. Doing that here would add minutes to every run and tie
-# the report to a token that dies at 06:00, so it is uploaded instead.
+# Market volume for the chart's third panel. In Automated mode this runs
+# volume_fetcher.py's own fetch() in-process — still one paced Fyers call per
+# strike (~90s/index), so a button rather than something that runs on every
+# page load. Manual keeps the plain upload; Automated keeps it too, as an
+# explicit override (an uploaded file always wins over a freshly fetched one).
+_volume_fetcher_mod = _load_volume_fetcher() if AUTOMATED else None
+volume_bytes, volume_bytes_name = None, None
+if AUTOMATED and _volume_fetcher_mod is not None:
+    st.caption("**Index option volume** (optional) — adds the market-volume "
+               "line to the chart's volume panel, on the same scale as MS "
+               "volume. Also resolves each index's nearest expiry below.")
+    _vol_indexes = [i for i in marketdata.INDEX_SYMBOLS if fetch_enabled.get(i, True)]
+    _vb1, _vb2 = st.columns([1, 3])
+    with _vb1:
+        _run_volume = st.button("Fetch index volume now", key="run_volume_fetch",
+                                disabled=not _vol_indexes)
+    with _vb2:
+        st.caption(
+            (f"Walks the full option chain for {', '.join(_vol_indexes)} — "
+             "roughly 90s per index, paced to Fyers' rate limit.")
+            if _vol_indexes else
+            "No index selected above (the same per-index toggles as the "
+            "premium fetch) — nothing to run."
+        )
+    if fetch_date != date.today():
+        st.caption(
+            f"⏰ Fetching {', '.join(_vol_indexes) or 'the volume workbook'} for "
+            f"**{fetch_date:%d-%b-%Y}** — note the expiry used is still "
+            "resolved from TODAY's live Fyers listing (chain_expiries has no "
+            "past-day view), so a genuinely past expiry may come back empty. "
+            "Type the expiry by hand below if you know it."
+        )
+    if _run_volume and _vol_indexes:
+        with st.spinner(f"Fetching option volume for {', '.join(_vol_indexes)} "
+                        "— this can take a few minutes…"):
+            try:
+                _vol_results = _volume_fetcher_mod.fetch(fetch_date, _vol_indexes)
+                _vol_buf = io.BytesIO()
+                _volume_fetcher_mod.write_workbook(_vol_results, _vol_buf)
+                st.session_state["volume_workbook_bytes"] = _vol_buf.getvalue()
+                st.session_state["volume_fetch_date"] = fetch_date.isoformat()
+                st.session_state["volume_fetch_expiries"] = {
+                    idx: r[2] for idx, r in _vol_results.items() if len(r) > 2 and r[2]
+                }
+                _vol_failed = {idx: r[1] for idx, r in _vol_results.items() if r[1]}
+                if _vol_failed:
+                    st.warning("Fetched with issues: " + "; ".join(
+                        f"{idx} — {why}" for idx, why in _vol_failed.items()))
+                else:
+                    st.success(f"Fetched option volume for {', '.join(_vol_indexes)}.")
+            except Exception as exc:
+                st.error(f"Volume fetch failed: {type(exc).__name__}: {exc}")
+    if st.session_state.get("volume_workbook_bytes"):
+        volume_bytes = st.session_state["volume_workbook_bytes"]
+        volume_bytes_name = (
+            f"option_volume_{st.session_state.get('volume_fetch_date', date.today().isoformat())}.xlsx")
+        st.download_button(
+            "Download the fetched volume workbook", data=volume_bytes,
+            file_name=volume_bytes_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_volume_workbook",
+        )
+elif AUTOMATED and _volume_fetcher_mod is None:
+    st.caption("⏸️ `fyer_code/volume_fetcher.py` not found on this machine — "
+               "upload a workbook from an earlier run below instead.")
+
 volume_file = st.file_uploader(
-    "Index option volume workbook (optional) — from `volume_fetcher.py`",
+    ("…or upload a volume workbook instead (wins over a freshly fetched one)"
+     if AUTOMATED else
+     "Index option volume workbook (optional) — from `volume_fetcher.py`"),
     type=["xlsx", "xlsm"], key="volume_file",
     help="Sheets `nifty` / `sensex` / `banknifty`, each with `time` and "
          "`volume` columns. Adds the market-volume line to the chart's volume "
-         "panel, on the same scale as MS volume so the two read as a share. "
-         "Generate it with:  python volume_fetcher.py --date YYYY-MM-DD",
+         "panel, on the same scale as MS volume so the two read as a share.",
 )
 
 with in6:
@@ -317,8 +462,10 @@ def _premium_bytes(index_name, day):
     if not rows:
         raise RuntimeError(
             f"Grafana returned no premium for {index_name} on {day:%d-%b-%Y}. "
-            "These are live dashboards — the Redis retention window may not "
-            "reach back that far.")
+            "Confirmed the underlying Redis data goes back weeks, so this is "
+            "more likely a non-trading day, or the instances having rotated "
+            f"which index they run since then — {index_name} may have been "
+            "on a different host on that date than it is today.")
     return (premium_fetcher.csv_text(rows).encode("utf-8-sig"),
             premium_fetcher.filename(index_name, day))
 
@@ -326,18 +473,57 @@ def _premium_bytes(index_name, day):
 
 # the expiry is NOT parsed from the strike symbols (their formats are too
 # ambiguous to trust) — every symbol of an index shares the session's single
-# expiry, entered here and applied as a label in the strikes section
+# expiry, entered here and applied as a label in the strikes section.
+# Automated mode pre-fills it with Fyers' nearest LISTED expiry (chain_expiries
+# already handles the "today's weekly just delisted" trap) — still a plain
+# text input underneath, so a wrong auto-fetch is just typed over.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _nearest_expiry(index):
+    dates, reason = marketdata.chain_expiries(index)
+    return (dates[0].strftime("%d%b%y").upper() if dates else None), reason
+
+_expiry_defaults, _expiry_problems = {}, {}
+if AUTOMATED and fetch_date == date.today():
+    for _idx in ("NIFTY", "SENSEX", "BANKNIFTY"):
+        _val, _why = _nearest_expiry(_idx)
+        if _val:
+            _expiry_defaults[_idx] = _val
+        else:
+            _expiry_problems[_idx] = _why
+elif AUTOMATED:
+    st.caption(
+        f"ℹ️ No auto-filled expiry for **{fetch_date:%d-%b-%Y}** — nearest-"
+        "expiry lookup only reflects Fyers' live listing (today), not a past "
+        "day. Type each index's expiry manually below, or rely on the "
+        "**Fetch index volume now** run above if it resolved one."
+    )
+if AUTOMATED:
+    # The volume fetch above resolves + uses an actual expiry per index — more
+    # authoritative than the quick chain_expiries lookup, since it's the
+    # expiry the fetched numbers are actually for. Overrides where present,
+    # whatever fetch_date is — it reflects what was actually fetched.
+    for _idx, _exp in st.session_state.get("volume_fetch_expiries", {}).items():
+        _expiry_defaults[_idx] = _exp.strftime("%d%b%y").upper()
+        _expiry_problems.pop(_idx, None)
+
 ex1, ex2, ex3 = st.columns(3)
 with ex1:
-    nifty_expiry = st.text_input("NIFTY expiry", placeholder="e.g. 28JUL26",
+    nifty_expiry = st.text_input("NIFTY expiry", value=_expiry_defaults.get("NIFTY", ""),
+                                 placeholder="e.g. 28JUL26",
                                  help="The expiry of every NIFTY strike in the orderbook "
                                       "(one expiry per index per day). Shown as the "
                                       "chain's expiry label — strikes themselves are "
                                       "read from the symbols.")
 with ex2:
-    sensex_expiry = st.text_input("SENSEX expiry", placeholder="e.g. 23JUL26")
+    sensex_expiry = st.text_input("SENSEX expiry", value=_expiry_defaults.get("SENSEX", ""),
+                                  placeholder="e.g. 23JUL26")
 with ex3:
-    banknifty_expiry = st.text_input("BANKNIFTY expiry", placeholder="e.g. 30JUL26")
+    banknifty_expiry = st.text_input("BANKNIFTY expiry", value=_expiry_defaults.get("BANKNIFTY", ""),
+                                     placeholder="e.g. 30JUL26")
+if _expiry_problems:
+    st.caption("⏸️ Could not auto-fetch nearest expiry for "
+               + ", ".join(f"{i} ({w})" for i, w in _expiry_problems.items())
+               + " — enter it manually above.")
 
 @st.cache_data(show_spinner=False)
 def _algo_options_from_mtm(mtm_bytes, mtm_name):
@@ -384,12 +570,12 @@ if all_user_file is not None:
     try:
         _running, _in_scope, _n_pos, _n_int = _scope_preview(
             all_user_file.getvalue(), all_user_file.name, dte)
-        _alias_src = ("the uploaded map" if alias_file is not None
+        _alias_src = ("the added aliases" if alias_bytes is not None
                       else "`aliases.json`")
         try:
             _n_alias = len(seg.load_user_aliases(
-                io.BytesIO(alias_file.getvalue()), alias_file.name)
-                if alias_file is not None else None)
+                io.BytesIO(alias_bytes) if alias_bytes is not None else None,
+                alias_name))
             _alias_note = f" · **{_n_alias}** user alias(es) from {_alias_src}"
         except Exception as exc:
             _alias_note = f" · ⚠️ alias map unreadable ({exc})"
@@ -405,7 +591,7 @@ dev_col, seg_col, slip_col, btn_col = st.columns([1, 1.5, 1.5, 1])
 with dev_col:
     deviation = st.number_input(
         "Outlier deviation (× MAD)",
-        min_value=0.1, max_value=10.0, value=1.0, step=0.5,
+        min_value=0.1, max_value=10.0, value=2.0, step=0.5,
         help="A user is an outlier when their Lots per Cr is more than this "
              "many robust deviations (MAD) away from their algo's median.",
     )
@@ -613,7 +799,7 @@ def _signature():
         summary_file.name if summary_file else None,
         summary2_file.name if summary2_file else None,
         all_user_file.name if all_user_file else None,
-        alias_file.name if alias_file else None,
+        tuple(sorted(st.session_state.get("user_aliases", {}).items())),
         mlob_file.name if mlob_file else None,
         # one premium upload per index, so the signature carries them all;
         # `premium_file` (the charted index's one) does not exist yet here
@@ -633,8 +819,8 @@ if process_clicked:
                 summary2_file.name if summary2_file else None,
                 all_user_file.getvalue(), all_user_file.name,
                 dte,
-                alias_file.getvalue() if alias_file else None,
-                alias_file.name if alias_file else None,
+                alias_bytes,
+                alias_name,
                 mlob_file.getvalue() if mlob_file else None,
                 mlob_file.name if mlob_file else None,
                 deviation,
@@ -707,9 +893,9 @@ st.subheader("Market data")
 _dc1, _dc2 = st.columns([1, 3])
 with _dc1:
     try:
-        _default_date = marketdata._as_date(report_date) if report_date else date.today()
+        _default_date = marketdata._as_date(report_date) if report_date else fetch_date
     except ValueError:
-        _default_date = date.today()
+        _default_date = fetch_date
     market_date = st.date_input(
         "Market date", value=_default_date, format="DD-MM-YYYY",
         help="Which trading day's index data to fetch. Pre-filled from the "
@@ -1385,16 +1571,16 @@ _chart_choices = [s for s in marketdata.INDEX_SYMBOLS if s in segments]
 chart_payloads = []
 if not _chart_choices:
     st.info("No index traded in this orderbook, so there is nothing to chart.")
-# Index option volume — read from the workbook volume_fetcher.py writes, not
-# fetched here. Fetching a whole option chain is ~200 paced API calls per index
-# (about 90 seconds each) and it needs a Fyers token that expires at 06:00
-# daily; neither belongs in the report's critical path. volume_fetcher.py is
-# run separately, once, and its output uploaded.
+# Index option volume — read from the workbook volume_fetcher.py writes, in
+# the same format whether that workbook was fetched in-process above or
+# uploaded by hand. An explicit upload wins over a freshly fetched one.
+_volume_source = volume_file if volume_file is not None else (
+    io.BytesIO(volume_bytes) if volume_bytes else None)
 _index_vol, _index_vol_problems, _index_vol_notes = {}, {}, {}
-if volume_file is not None:
+if _volume_source is not None:
     try:
         (_index_vol, _index_vol_problems,
-         _index_vol_notes) = marketdata.read_volume_sheets(volume_file)
+         _index_vol_notes) = marketdata.read_volume_sheets(_volume_source)
     except Exception as exc:                       # unreadable / not a workbook
         st.warning(f"Volume workbook could not be read ({type(exc).__name__}: "
                    f"{exc}). The volume panel shows MS volume only.")
@@ -1420,7 +1606,7 @@ for _idx in _chart_choices:
     else:
         st.caption(f"ℹ️ {_idx} index volume — {_note}")
 _missing_vol = [i for i in _chart_choices if i not in _index_vol]
-if volume_file is not None and _missing_vol:
+if _volume_source is not None and _missing_vol:
     st.caption("ℹ️ No index-volume sheet for " + ", ".join(_missing_vol)
                + " — run `volume_fetcher.py` for that index. The panel shows "
                  "MS volume only.")

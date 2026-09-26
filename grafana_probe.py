@@ -37,8 +37,13 @@ hash — the same "Yesterday" figure the dashboard shows. NIFTY near 23,000 and
 SENSEX near 75,000 are not confusable. An instance can still be pinned with
 `"index": "NIFTY"` when that detection needs overriding.
 
-This means detection reflects RIGHT NOW. That suits the fetcher, which is
-same-day only anyway because Redis retention will not reach a past date.
+This means detection reflects RIGHT NOW, not whichever instance was running
+that index on some past day being re-fetched. RedisTimeSeries here is NOT
+short-retention — confirmed against the live instances back through several
+weeks — so a past-date fetch usually does return real data; the risk instead
+is that if the instances have rotated since that day, this asks the WRONG
+host for it. A day whose rotation you no longer remember is worth a spot
+check against the file it actually wrote.
 
 `panel` is what this probe is for: run it, read the panel ids it prints, put
 the right one in `defaults` (or per instance).
@@ -52,10 +57,33 @@ import json
 import pathlib
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
+
+
+def post_query(session, url, body, tries=3, timeout=60):
+    """POST /api/ds/query with a couple of retries on a transient failure.
+
+    Found by hand on 26-09: one instance's redis-datasource intermittently
+    drops its own connection to Redis mid-query ("write tcp …: write: broken
+    pipe", then "EOF" on the very next attempt) and self-heals within a
+    couple of seconds — no config or credential involved, confirmed by firing
+    the identical query 5 times in a row: 2 failures, then 3 clean. A single
+    flaky read must not cost an index its whole premium line for the day, so
+    this retries a few times before giving up. Any status is retried, not
+    just ones that look transient — a genuinely broken query fails the same
+    way after retrying, just a couple seconds slower."""
+    last = None
+    for attempt in range(tries):
+        last = session.post(f"{url}/api/ds/query", json=body, timeout=timeout)
+        if last.status_code == 200:
+            return last
+        if attempt < tries - 1:
+            time.sleep(1.5 * (attempt + 1))
+    return last
 
 _HERE = pathlib.Path(__file__).resolve().parent
 CREDENTIALS = _HERE / "grafana_credentials.json"
@@ -144,9 +172,9 @@ def instance_index(session, url, datasource):
     body = {"queries": [{"refId": "A", "datasource": datasource,
                          "command": "hgetall", "keyName": "ILAST",
                          "type": "command"}]}
-    r = session.post(f"{url}/api/ds/query", json=body, timeout=60)
+    r = post_query(session, url, body)
     if r.status_code != 200:
-        raise SystemExit(f"  {url}: ILAST -> HTTP {r.status_code}")
+        raise SystemExit(f"  {url}: ILAST -> HTTP {r.status_code}: {r.text[:200]}")
 
     level = None
     for res in (r.json().get("results") or {}).values():
@@ -414,10 +442,17 @@ def main(argv=None):
         panel = args.panel or cfg["panel"]
 
         # name the instance from its own data before running anything — with
-        # the hosts rotating, "which index is this?" is the first question
+        # the hosts rotating, "which index is this?" is the first question.
+        # One instance's own trouble (e.g. its Redis connection) must not
+        # abort the whole diagnostic run — resolve() already isolates this
+        # per-instance for the real fetch; this CLI now does too.
         if panel:
-            _, datasource = _panel_targets(s, cfg["url"], cfg["uid"], panel)
-            index, level = instance_index(s, cfg["url"], datasource)
+            try:
+                _, datasource = _panel_targets(s, cfg["url"], cfg["uid"], panel)
+                index, level = instance_index(s, cfg["url"], datasource)
+            except SystemExit as exc:
+                print(f"\n  {exc}")
+                continue
             print(f"\n  running: {index or 'UNKNOWN'}  (ILAST index {level:,.0f})")
             if args.index and index != args.index.upper():
                 print(f"  skipped — not {args.index.upper()}")

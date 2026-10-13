@@ -1671,12 +1671,20 @@ def build_dor_html(report_date, deviation, tv_totals, tv_summary=None, pivot_sta
     if tv_sections is None:
         tv_sections = [{"label": None, "summary": tv_summary, "obs": user_obs}]
 
-    tv_kpis = _kpi_tiles([
-        ("Users", _money(tv_totals["users"])),
-        ("Orders", _money(tv_totals["orders"])),
-        ("Total Lots", _money(tv_totals["lots"])),
-        ("Trade Value", format_crore(tv_totals["trade_value"])),
-    ])
+    # One KPI row PER INDEX, `tv_totals` is [(label, totals_dict), ...] —
+    # same report_totals() shape as before, just split per index rather than
+    # pooled (lot sizes differ per index, so a pooled Total Lots belongs to
+    # none of them, same reasoning as the per-index Algo Summary below).
+    tv_kpis = "".join(
+        f'<h3 class="pf-title">{_esc(label)}</h3>'
+        + _kpi_tiles([
+            ("Users", _money(t["users"])),
+            ("Orders", _money(t["orders"])),
+            ("Total Lots", _money(t["lots"])),
+            ("Trade Value", format_crore(t["trade_value"])),
+        ])
+        for label, t in tv_totals
+    )
 
     seg_blocks = []
     for i, sec in enumerate(seg_sections):

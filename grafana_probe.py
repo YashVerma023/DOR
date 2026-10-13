@@ -228,6 +228,22 @@ def resolve(config=None, want=None):
             continue
         if want and index not in want:
             continue
+        if index in resolved:
+            # two instances reading the same index RIGHT NOW — found live on
+            # 05-10: the instance meant for BANKNIFTY was actually mirroring
+            # NIFTY's level, and silently overwriting the genuine NIFTY
+            # instance's dict entry (or losing to it, depending on config
+            # order) picked an arbitrary winner every run — one run's NIFTY
+            # premium would be fine, the next's would come back empty,
+            # because which instance "won" wasn't even visible, let alone
+            # stable. Keep the FIRST instance for that index (so existing
+            # single-instance-per-index setups are unaffected) and surface
+            # the collision instead of silently dropping the second one.
+            problems[label] = (
+                f"  {cfg['url']}: also reads as {index} (level {level:,.0f}), "
+                f"same as {resolved[index]['url']} — ignored, both can't be "
+                "right. Check which one is actually meant to run it.")
+            continue
         resolved[index] = dict(cfg, session=session, targets=targets,
                                datasource=datasource, level=level, index=index)
     return resolved, problems

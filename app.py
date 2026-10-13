@@ -44,6 +44,7 @@ from tradevalue import (
     STRIKE_ALGO_HEADER,
     STRIKE_CHAIN_HEADER,
     SUMMARY_HEADER,
+    INDIAN_XLSX_FMT,
     add_orders_sheet,
     add_report_sheets,
     add_strikes_sheet,
@@ -1245,11 +1246,20 @@ st.header("Trade Value")
 totals = report_totals(tv_rows)
 matched = len({r["user_id"] for r in tv_rows if r["allocation"] is not None})
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Users", format_indian(totals["users"]))
-m2.metric("Orders", format_indian(totals["orders"]))
-m3.metric("Total Lots", format_indian(totals["lots"]))
-m4.metric("Total Trade Value", format_crore(totals["trade_value"]))
+# One KPI row PER INDEX rather than one pooled row — lot sizes differ per
+# index (same reason the Algo Summary below is split per index), so a single
+# combined "Total Lots" mixes NIFTY/SENSEX/BANKNIFTY lots into one number
+# nobody can act on. Same report_totals() call as before, just once per
+# index instead of once over everything.
+_tv_index_order = [i for i in ("NIFTY", "SENSEX", "BANKNIFTY") if i in tv_by_segment]
+tv_index_totals = [(idx, report_totals(tv_by_segment[idx])) for idx in _tv_index_order]
+for idx, idx_totals in tv_index_totals:
+    st.caption(f"**{idx}**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Users", format_indian(idx_totals["users"]))
+    c2.metric("Orders", format_indian(idx_totals["orders"]))
+    c3.metric("Total Lots", format_indian(idx_totals["lots"]))
+    c4.metric("Total Trade Value", format_crore(idx_totals["trade_value"]))
 
 st.caption(f"Outliers: beyond {used_deviation:g} robust deviation(s) (MAD) from each algo + type group's median Lots per Cr.")
 if matched < totals["users"]:
@@ -1888,6 +1898,21 @@ add_report_sheets(workbook, tv_rows, used_multiplier,
                   summary_groups=([(f"summary {idx}"[:31], rows)
                                    for idx, rows in tv_by_segment.items()]
                                   or None))
+# Verification table for the per-index KPI cards above — same report_totals()
+# figures, Index as its own column so they can be checked against the
+# "tradevalue" sheet's own Segment column without re-pivoting by hand.
+from openpyxl.styles import Font as _Font
+_idx_sheet = workbook.create_sheet("Index Totals")
+_idx_sheet.append(["Index", "Users", "Orders", "Total Lots", "Trade Value"])
+for _c in range(1, 6):
+    _idx_sheet.cell(row=1, column=_c).font = _Font(bold=True)
+for idx, idx_totals in tv_index_totals:
+    _idx_sheet.append([idx, idx_totals["users"], idx_totals["orders"],
+                       float(idx_totals["lots"]), float(idx_totals["trade_value"])])
+for _r in range(2, 2 + len(tv_index_totals)):
+    _idx_sheet.cell(row=_r, column=4).number_format = INDIAN_XLSX_FMT
+    _idx_sheet.cell(row=_r, column=5).number_format = INDIAN_XLSX_FMT
+_idx_sheet.freeze_panes = "A2"
 add_strikes_sheet(workbook, strikes, expiry_map)
 if orders_by_segment:
     for idx, rows in orders_by_segment.items():
@@ -1915,7 +1940,7 @@ _file_stem = f"DOR_{_used_dte}_{report_date or 'report'}"
 dor_html = build_dor_html(
     report_date=report_date or "—",
     deviation=float(used_deviation),
-    tv_totals=totals,
+    tv_totals=tv_index_totals,
     seg_sections=seg_dor_sections,
     tv_sections=tv_dor_sections,
     strikes=strikes,
@@ -1945,7 +1970,7 @@ with downloads_slot:
             type="primary",
             width="stretch",
         )
-        st.caption("tradevalue · summary · Strikes"
+        st.caption("tradevalue · summary · Index Totals · Strikes"
                    + (" · Portfolio QS" if pf_groups is not None else "")
                    + " · unclassified · Summary · MTM Data · Slippage · no_sl_Acc")
     with d2:

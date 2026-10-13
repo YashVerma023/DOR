@@ -2015,34 +2015,38 @@ def add_strikes_sheet(workbook, strikes, expiry_map=None):
     sheet.cell(row=total_row, column=1, value="Total (distinct)").font = bold
     sheet.cell(row=total_row, column=3, value=len(strikes["per_strike"])).font = bold
 
-    offset = len(STRIKE_ALGO_HEADER) + 2  # leave column D blank between the tables
-    for j in range(3):
-        sheet.column_dimensions[get_column_letter(offset + j)].width = 12
-    r = 1
-    for segment, rows in strike_chain(strikes["per_strike"]).items():
+    # One chain block per index, SIDE BY SIDE (not stacked) — each block gets
+    # its own 3 columns (CE | Strike | PE) plus a blank spacer column, all
+    # starting at row 1 so BANKNIFTY / NIFTY / SENSEX read left to right like
+    # the dashboard's own side-by-side cards.
+    offset = len(STRIKE_ALGO_HEADER) + 2  # leave column D blank before the first block
+    block_width = len(STRIKE_CHAIN_HEADER) + 1
+    for i, (segment, rows) in enumerate(strike_chain(strikes["per_strike"]).items()):
+        col = offset + i * block_width
+        for j in range(len(STRIKE_CHAIN_HEADER)):
+            sheet.column_dimensions[get_column_letter(col + j)].width = 12
         label = (expiry_map or {}).get(segment, "")
-        sheet.merge_cells(start_row=r, start_column=offset, end_row=r, end_column=offset + 2)
-        title = sheet.cell(row=r, column=offset,
-                           value=f"{segment} {label}".rstrip())
+        r = 1
+        sheet.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + 2)
+        title = sheet.cell(row=r, column=col, value=f"{segment} {label}".rstrip())
         title.font = bold
         r += 1
         for j, header in enumerate(STRIKE_CHAIN_HEADER):
-            sheet.cell(row=r, column=offset + j, value=header).font = bold
+            sheet.cell(row=r, column=col + j, value=header).font = bold
         r += 1
         ce_total = pe_total = Decimal("0")
         for ce, strike, pe in rows:
-            sheet.cell(row=r, column=offset, value=int(round(ce))).number_format = INDIAN_XLSX_FMT
-            sheet.cell(row=r, column=offset + 1, value=strike)
-            sheet.cell(row=r, column=offset + 2, value=int(round(pe))).number_format = INDIAN_XLSX_FMT
+            sheet.cell(row=r, column=col, value=int(round(ce))).number_format = INDIAN_XLSX_FMT
+            sheet.cell(row=r, column=col + 1, value=strike)
+            sheet.cell(row=r, column=col + 2, value=int(round(pe))).number_format = INDIAN_XLSX_FMT
             ce_total += ce
             pe_total += pe
             r += 1
         for j, value in enumerate((int(round(ce_total)), "Total", int(round(pe_total)))):
-            cell = sheet.cell(row=r, column=offset + j, value=value)
+            cell = sheet.cell(row=r, column=col + j, value=value)
             cell.font = bold
             if j != 1:
                 cell.number_format = INDIAN_XLSX_FMT
-        r += 2  # blank spacer row between chains
     sheet.freeze_panes = "A2"
 
 

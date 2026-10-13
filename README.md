@@ -18,7 +18,7 @@ A Streamlit app (plus standalone CLIs) that turns four raw inputs into the daily
    default, plus instant any-portfolio analysis inside the HTML report itself.
 
 Outputs: one Excel workbook `DOR_<DTE>_<date>.xlsx` (sheets: `unclassified`, `tradevalue`,
-`summary`, `Strikes`, `Orders`, `Portfolio QS` when the MLOB is given, `Summary`,
+`summary`, `Index Totals`, `Strikes`, `Orders`, `Portfolio QS` when the MLOB is given, `Summary`,
 `MTM Data`, `Slippage`, `no_sl_Acc`) and one self-contained, client-shareable `DOR_<date>.html` (all tables
 center-aligned, data and headers; numbers in Indian digit grouping, e.g. `16,44,536`).
 When a **secondary index User MTM** is uploaded (§below) the workbook carries a second set —
@@ -379,8 +379,16 @@ they sit below or above the range (below users first, worst first).
 The sum of `Total Users` across algos can differ from the `Users` KPI: unmatched users (no MTM
 entry) have no algo to sit under.
 
-Report KPIs: `Users` = distinct user ids, `Orders` = Σ order counts, `Total Lots` = Σ lots,
-`Trade Value` = Σ trade values.
+Report KPIs are shown **once per index** (NIFTY, SENSEX, then BANKNIFTY when present) rather
+than pooled — lot sizes differ per index, so a combined `Total Lots` would sit on a scale that
+belongs to none of them (same reasoning as the per-index Algo Summary above). Each index's row:
+`Users` = distinct user ids *for that index*, `Orders` = Σ order counts, `Total Lots` = Σ lots,
+`Trade Value` = Σ trade values — all from the same `report_totals()`, just called once per
+`tv_by_segment` group instead of once over every index combined. A user trading more than one
+index is counted in each index's `Users`, so the indexes' `Users` figures can sum to more than
+the account's true distinct-user count; `Orders` always sums exactly across indexes, since no
+order belongs to more than one. The workbook's **`Index Totals`** sheet carries the same four
+figures per index as a plain table, for checking the KPI cards against the data directly.
 
 ## 1.9 Strikes traded (`Strikes` sheet + dashboard + DOR.html)
 
